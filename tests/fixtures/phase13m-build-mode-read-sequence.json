@@ -1,0 +1,26 @@
+{
+  "description": "Reduced read-only sequence extracted from the pathological Build-mode session. The historical run continued far beyond these useful reads before the exact-repeat backstop fired.",
+  "historicalPotentialToolCalls": 19,
+  "file": "crypto.py",
+  "actions": [
+    {"path": "crypto.py"},
+    {"path": "bot_data.json"},
+    {"path": "crypto.py", "startLine": 1, "endLine": 200},
+    {"path": "crypto.py", "startLine": 200, "endLine": 400},
+    {"path": "crypto.py", "startLine": 400, "endLine": 600},
+    {"path": "crypto.py", "startLine": 600, "endLine": 800},
+    {"path": "crypto.py", "startLine": 800, "endLine": 1000},
+    {"path": "crypto.py", "startLine": 200, "endLine": 400},
+    {"path": "crypto.py", "startLine": 1, "endLine": 200},
+    {"path": "crypto.py", "startLine": 200, "endLine": 400},
+    {"path": "crypto.py", "startLine": 200, "endLine": 600},
+    {"path": "crypto.py", "startLine": 1, "endLine": 300},
+    {"path": "crypto.py", "startLine": 1, "endLine": 300},
+    {"path": "crypto.py", "startLine": 1, "endLine": 300},
+    {"path": "crypto.py", "startLine": 1, "endLine": 300},
+    {"path": "crypto.py", "startLine": 100, "endLine": 400},
+    {"path": "crypto.py", "startLine": 1, "endLine": 300},
+    {"path": "crypto.py", "startLine": 1, "endLine": 300},
+    {"path": "crypto.py", "startLine": 1, "endLine": 300}
+  ]
+}

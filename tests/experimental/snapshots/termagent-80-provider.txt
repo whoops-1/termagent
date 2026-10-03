@@ -1,0 +1,18 @@
+  ╭ Provider manager ────────────────────────────────────────────────────────╮  
+  │Manage saved provider profiles.                                         │    
+  │                                                                        │    
+  │Active: openai-primary · openai · gpt-5                                 │    
+  │                                                                        │    
+  │› [1] Set provider      Choose the active saved provider.               │    
+  │  [2] Edit provider     Change model, URL, or key.                      │    
+  │  [3] Add provider      Create a new profile.                           │    
+  │  [4] Remove provider   Delete a saved profile.                         │    
+  │  [5] Done              Return to chat.                                 │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │↑↓ select · Enter choose · Esc back                                     │    
+  ╰──────────────────────────────────────────────────────────────────────────╯  

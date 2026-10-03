@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target":"ES2022",
+    "module":"NodeNext",
+    "moduleResolution":"NodeNext",
+    "strict":true,
+    "skipLibCheck":true,
+    "declaration":false,
+    "rootDir":"src",
+    "outDir":"dist/preview"
+  },
+  "include":["src/design-system/**/*.ts","src/demo.ts","src/demo-scenes.ts"]
+}

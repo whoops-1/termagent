@@ -1,0 +1,48 @@
+{
+  "name": "termagent",
+  "version": "1.18.0",
+  "description": "A lightweight, ARMv7-friendly coding agent for Termux and Node.js.",
+  "type": "module",
+  "bin": {
+    "termagent": "./dist/index.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol/index.d.ts",
+      "import": "./dist/protocol/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CODE_OF_CONDUCT.md",
+    "docs",
+    "scripts/device-smoke.mjs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "check": "npm run build && npm test",
+    "clean": "rm -rf dist",
+    "release:build": "node scripts/release.mjs",
+    "device:smoke": "node scripts/device-smoke.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["ai", "coding-agent", "cli", "termux", "android", "armv7", "llm", "developer-tools"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

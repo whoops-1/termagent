@@ -1,0 +1,8 @@
+╭─ src/cli/ui.ts ──────────────────────────────────────────╮
+│   1 @ @@ prompt footer @@│                                
+│   2 - const color = BLUE│                                 
+│   3 - return `${BG2}${content}${RESET}`│                  
+│   4 + const color = theme.text│                           
+│   5 + return paint(content, { bg: theme.panel })│         
+│   6   scheduleRender()│                                   
+╰──────────────────────────────────────────────────────────╯

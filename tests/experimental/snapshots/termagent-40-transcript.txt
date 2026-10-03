@@ -1,0 +1,15 @@
+◆ You                                   
+  Explain the terminal UI hierarchy.    
+                                        
+◆ TermAgent                             
+  ∴ Reasoning available · 40 chars · Ct…
+  The transcript separates the user,    
+  assistant, tools, reasoning, and      
+  system states.                        
+                                        
+  → bash npm test · running             
+                                        
+  ✓ write_file src/cli… · completed · 1…
+                                        
+  • Session ready.                      
+                                        

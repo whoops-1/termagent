@@ -1,0 +1,7 @@
+{
+  "name": "example-review",
+  "version": "1.0.0",
+  "description": "A small review plugin for TermAgent authoring examples.",
+  "commands": "./commands",
+  "skills": "./skills"
+}

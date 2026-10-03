@@ -1,0 +1,12 @@
+╭─ Command palette ────────────────────╮
+│ Search: theme                         
+│ ────────────────────────────────────  
+│   /provider Command                  │
+│   /plugins Command                   │
+│   /skills Command                    │
+│ › /doctor Open diagno…               │
+│   /checkpoint Command                │
+│   /undo Command                      │
+│   ↑ more  5-10 of 12   filter: theme …
+│ ↑↓ select · Enter run · Esc close     
+╰──────────────────────────────────────╯

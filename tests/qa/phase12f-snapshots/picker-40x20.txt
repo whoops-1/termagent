@@ -1,0 +1,20 @@
+>_ TermAgent v1.18.0                    
+                                        
+                                        
+│  You                                  
+│  Open the command picker.             
+╭─ Command palette ────────────────╮    
+│ Type to search                        
+│ ────────────────────────────────      
+│     /command-11                  │    
+│   › /command-12                  │    
+│     /command-13                  │    
+│   ↑ more  12-14 of 15  ↓ more    │    
+│ ↑↓ select · Enter run · Esc clo…      
+╰──────────────────────────────────╯    
+╭─ ● Ready  ctx 0/12k──────────────────╮
+│                                    │  
+│ Build · mock provider│                
+╰──────────────────────────────────────╯
+esc ↑↓ select   Enter choose   Esc close
+/workspace/project                      

@@ -1,0 +1,18 @@
+  ╭ Question 1/2 ────────────────────────────────────────────────────────────╮  
+  │Choose an option or enter a custom response.                            │    
+  │                                                                        │    
+  │Which output format should be used?                                     │    
+  │                                                                        │    
+  │› Markdown                                                              │    
+  │  Plain text                                                            │    
+  │  JSON                                                                  │    
+  │  Type your own answer                                                  │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │↑↓ select · Enter choose · Space toggle · Esc dismiss                   │    
+  ╰──────────────────────────────────────────────────────────────────────────╯  

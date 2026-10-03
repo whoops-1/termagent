@@ -1,0 +1,18 @@
+  ╭ ◆ Reasoning ─────────────────────────────────────────────────────────────╮  
+  │Full streamed reasoning · read-only inspector                           │    
+  │                                                                        │    
+  │1,248 characters                                                        │    
+  │                                                                        │    
+  │I am checking the current transcript structure before choosing how to p…│    
+  │The final answer should remain compact while keeping the reasoning avai…│    
+  │                                                                        │    
+  │Ctrl+E closes this inspector and returns to the transcript.             │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │↑↓ scroll · PgUp/PgDn page · Esc close                                  │    
+  ╰──────────────────────────────────────────────────────────────────────────╯  

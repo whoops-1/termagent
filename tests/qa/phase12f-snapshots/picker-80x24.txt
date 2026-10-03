@@ -1,0 +1,24 @@
+>_ TermAgent v1.18.0                                                            
+                                                                                
+│  You                                                                          
+│  Open the command picker.                                                     
+╭─ Command palette ────────────────────────────────────────╮                    
+│ Type to search                                                                
+│ ────────────────────────────────────────────────────────                      
+│     /command-7                                           │                    
+│     /command-8                                           │                    
+│     /command-9                                           │                    
+│     /command-10                                          │                    
+│     /command-11                                          │                    
+│   › /command-12                                          │                    
+│     /command-13                                          │                    
+│     /command-14                                          │                    
+│   ↑ more  8-15 of 15                                     │                    
+│ ↑↓ select · Enter run · Esc close                                             
+╰──────────────────────────────────────────────────────────╯                    
+╭─ ● Ready  provider/mock  ctx 0/12k───────────────────────────────────────────╮
+│                                                                            │  
+│ Build · mock provider Tip: ↑↓ history · Ctrl+P commands · ↵ send│             
+╰──────────────────────────────────────────────────────────────────────────────╯
+esc                                         ↑↓ select   Enter choose   Esc close
+/workspace/project                                                              

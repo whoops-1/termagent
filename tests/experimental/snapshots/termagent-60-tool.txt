@@ -1,0 +1,18 @@
+  ╭ ◆ Tool details · bash ───────────────────────────────╮  
+  │1/3 · ↑↓ scroll · ←→ previous/next tool             │    
+  │                                                    │    
+  │bash  running · 1.8s                                │    
+  │                                                    │    
+  │Arguments                                           │    
+  │  $ npm test                                        │    
+  │                                                    │    
+  │Output                                              │    
+  │  TAP version 13                                    │    
+  │  tests 325                                         │    
+  │  pass 325                                          │    
+  │                                                    │    
+  │Changes  src/cli/ui.ts  +12 -4                      │    
+  │                                                    │    
+  │                                                    │    
+  │↑↓ scroll · ←→ tool · d diff · Esc close            │    
+  ╰──────────────────────────────────────────────────────╯  

@@ -1,0 +1,22 @@
+Response formatting                     
+───────────────────                     
+                                        
+Headings, strong text, emphasis, inline 
+code, links, lists and blockquotes.     
+                                        
+• First item                            
+• Second item                           
+                                        
+▎ This is a blockquote with a restrained
+▎ visual bar.                           
+                                        
+╭─ ts ─────────────────────────────────╮
+│   1 const answer = 42│                
+│   2 console.log(answer)│              
+╰──────────────────────────────────────╯
+                                        
+Feature: Markdown                       
+State: Ready                            
+  ·                                     
+Feature: Tables                         
+State: Ready                            

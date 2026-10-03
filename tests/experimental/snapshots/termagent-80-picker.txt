@@ -1,0 +1,14 @@
+╭─ Command palette ────────────────────────────────────────╮                    
+│ Search: theme                                                                 
+│ ────────────────────────────────────────────────────────                      
+│   /theme light Command                                   │                    
+│   /provider Command                                      │                    
+│   /plugins Command                                       │                    
+│   /skills Command                                        │                    
+│ › /doctor Open diagnostics                               │                    
+│   /checkpoint Command                                    │                    
+│   /undo Command                                          │                    
+│   /redo Command                                          │                    
+│   ↑ more  4-11 of 12   filter: theme  ↓ more               │                  
+│ ↑↓ select · Enter run · Esc close                                             
+╰──────────────────────────────────────────────────────────╯                    

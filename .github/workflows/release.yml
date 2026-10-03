@@ -1,0 +1,78 @@
+name: TermAgent release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build production TypeScript
+        run: npm exec --yes --package typescript@5.8.3 -- tsc -p tsconfig.json
+
+      - name: Verify tag matches package version
+        run: |
+          test "${GITHUB_REF_NAME#v}" = "$(node -p 'require("./package.json").version')"
+
+      - name: Verify release surfaces
+        run: |
+          node --test tests/phase13n-j-release.test.mjs
+          node --check dist/index.js
+          npm pack --dry-run
+
+      - name: Build target bundles
+        run: node scripts/release.mjs
+
+      - name: Upload production dist for ARM smoke
+        uses: actions/upload-artifact@v4
+        with:
+          name: termagent-dist
+          path: dist
+          if-no-files-found: error
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/*.tar.gz release/SHA256SUMS release/release-manifest.json --generate-notes
+
+  armv7-linux-smoke:
+    runs-on: ubuntu-24.04
+    needs: build-release
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Download production dist
+        uses: actions/download-artifact@v4
+        with:
+          name: termagent-dist
+          path: dist
+
+      - name: Run ARMv7 userspace smoke under QEMU
+        uses: uraimo/run-on-arch-action@v3.1.0
+        with:
+          arch: armv7
+          distro: ubuntu24.04
+          githubToken: ${{ github.token }}
+          dockerRunArgs: |
+            --volume "${{ github.workspace }}:/workspace"
+          run: |
+            cd /workspace
+            node --version
+            test -s dist/index.js
+            TERMAGENT_ALLOW_NON_ANDROID=1 node scripts/device-smoke.mjs
+            test "$(node -p 'process.arch')" = "arm"

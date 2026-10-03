@@ -1,0 +1,14 @@
+╭─ Commands ───────────────────────────────────────╮
+│ Type to search                                    
+│ ────────────────────────────────────────────────  
+│     /help                   Show available co…   │
+│     /model                  Show the current …   │
+│     /provider               Switch provider p…   │
+│   › /agent                  Choose an agent m…   │
+│     /agents                 List available ag…   │
+│     /commands               List custom comma…   │
+│     /plan                   Switch to read-on…   │
+│     /build                  Switch to develop…   │
+│           1-8 of 13  ↓ more                      │
+│ ↑↓ select · Enter run · Esc close                 
+╰──────────────────────────────────────────────────╯

@@ -1,0 +1,18 @@
+  ╭ Permission required ─────────────────────────────────╮  
+  │The agent is waiting for your approval.             │    
+  │                                                    │    
+  │Run shell command?                                  │    
+  │$ npm test                                          │    
+  │                                                    │    
+  │Proposed changes                                    │    
+  │src/cli/ui.ts  +12 -4                               │    
+  │                                                    │    
+  │› [1] Allow once                                    │    
+  │  [2] Always allow                                  │    
+  │  [3] Reject                                        │    
+  │                                                    │    
+  │                                                    │    
+  │                                                    │    
+  │                                                    │    
+  │↑↓ select · Enter confirm · y once · a always · n r…│    
+  ╰──────────────────────────────────────────────────────╯  

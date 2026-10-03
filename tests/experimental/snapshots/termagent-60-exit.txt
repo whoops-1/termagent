@@ -1,0 +1,4 @@
+✓ Session ended                                             
+  Thanks for using TermAgent.                               
+  Resume your session with:                                 
+  termagent --resume 9c306fe9-ef78-4768-a363-e1e020a6e94e   

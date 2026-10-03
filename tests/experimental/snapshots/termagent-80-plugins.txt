@@ -1,0 +1,18 @@
+  ╭ Plugin manager ──────────────────────────────────────────────────────────╮  
+  │Installed components and activation state.                              │    
+  │                                                                        │    
+  │3 installed · 2 enabled · 1 disabled                                    │    
+  │                                                                        │    
+  │› formatter             enabled · v1.4.0 · 2c 0a 3s                     │    
+  │  git-tools             enabled · v2.0.1 · 4c 1a 0s                     │    
+  │  experimental-search   disabled · v0.8.2 · 1c 0a 2s                    │    
+  │                                                                        │    
+  │Use Enter to inspect component details.                                 │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │                                                                        │    
+  │↑↓ select · Enter inspect · Tab switch view · Esc close                 │    
+  ╰──────────────────────────────────────────────────────────────────────────╯  

@@ -1,0 +1,20 @@
+>_ TermAgent v1.18.0                            
+                                                
+                                                
+                                                
+                                                
+                                                
+  … waiting for response                        
+                                                
+ ╭─ Permission required · bash ───────────────╮ 
+ │ Run shell command?                         │ 
+ │ $ echo phase12f permission                 │ 
+ │ › [1] Allow once    [2] Always allow       │ 
+ │ ↑↓ select · Enter confirm · 1/2/3 quick s… │ 
+ ╰────────────────────────────────────────────╯ 
+╭─ ! Permission  ctx 0/12k─────────────────────╮
+│                                            │  
+│ Build · mock provider│                        
+╰──────────────────────────────────────────────╯
+esc interrupt ↑↓ select   Enter confirm   Esc ca
+/workspace/project                              

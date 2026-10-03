@@ -1,0 +1,30 @@
+>_ TermAgent v1.18.0                                                                                
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+│  You                                                                                              
+│  Answer the responsive question.                                                                  
+  … waiting for response                                                                            
+                                                                                                    
+  ╭─ Question ───────────────────────────────────────────────────────────────────────────────────╮  
+  │ Which responsive layout should be preserved?                                                 │  
+  │ choose one                                                                                   │  
+  │ › 1. bounded                                                                                 │  
+  │   2. stacked                                                                                 │  
+  │   3. wide                                                                                    │  
+  │   4. adaptive                                                                                │  
+  │ … showing 1-4 of 5                                                                           │  
+  │ ↑↓ select · Enter choose · Esc dismiss                                                       │  
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────╯  
+╭─ ? Needs your answer  provider/mock  ctx 0/12k───────────────────────────────────────────────────╮
+│                                                                                                │  
+│ Build · mock provider /workspace/project Tip: ↑↓ history · Ctrl+P commands · ↵ send│              
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+esc interrupt                                                 ↑↓ select   Enter confirm   Esc cancel
+/workspace/project                                                                                  

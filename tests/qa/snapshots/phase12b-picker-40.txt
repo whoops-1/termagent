@@ -1,0 +1,14 @@
+╭─ Commands ───────────────────────╮
+│ Type to search                    
+│ ────────────────────────────────  
+│     /model                       │
+│     Show the current model       │
+│     /provider                    │
+│     Switch provider profile      │
+│   › /agent                       │
+│     Choose an agent mode         │
+│     /agents                      │
+│     List available agents        │
+│   ↑ more  2-5 of 13  ↓ more      │
+│ ↑↓ select · Enter run · Esc clo…  
+╰──────────────────────────────────╯

@@ -1,0 +1,24 @@
+>_ TermAgent v1.18.0                                                            
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+│  You                                                                          
+│  USER: Preserve this transcript identity without repeated speaker badges.     
+  ASSISTANT: A responsive transcript must keep content primary. ASSISTANT: A    
+  responsive transcript must keep content primary. ASSISTANT: A responsive      
+  transcript must keep content primary.                                         
+                                                                                
+  ⠋ writing response                                                            
+╭─ ● Ready  provider/mock  ctx 0/12k───────────────────────────────────────────╮
+│                                                                            │  
+│ Build · mock provider Tip: ↑↓ history · Ctrl+P commands · ↵ send│             
+╰──────────────────────────────────────────────────────────────────────────────╯
+esc                               Ctrl+E reasoning   Ctrl+O details   Tab agents
+/workspace/project                                                              

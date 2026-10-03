@@ -1,0 +1,14 @@
+╭─ Commands ───────────────────────────────────────────────╮
+│ Type to search                                            
+│ ────────────────────────────────────────────────────────  
+│     /help                   Show available commands      │
+│     /model                  Show the current model       │
+│     /provider               Switch provider profile      │
+│   › /agent                  Choose an agent mode         │
+│     /agents                 List available agents        │
+│     /commands               List custom commands         │
+│     /plan                   Switch to read-only plann…   │
+│     /build                  Switch to development mode   │
+│           1-8 of 13  ↓ more                              │
+│ ↑↓ select · Enter run · Esc close                         
+╰──────────────────────────────────────────────────────────╯

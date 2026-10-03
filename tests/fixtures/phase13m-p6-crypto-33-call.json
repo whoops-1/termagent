@@ -1,0 +1,201 @@
+{
+  "description": "Deterministic 33-call-shaped exploration workload: five useful ranges followed by twenty-eight syntactically varied rereads of an already covered range.",
+  "totalPotentialToolCalls": 33,
+  "file": "crypto.py",
+  "totalLines": 1372,
+  "actions": [
+    {
+      "path": "crypto.py",
+      "startLine": 1,
+      "endLine": 200
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 401,
+      "endLine": 600
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 601,
+      "endLine": 800
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 801,
+      "endLine": 1000
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 1
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 2
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 3
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 4
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 5
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 6
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 7
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 8
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 9
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 10
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 11
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 12
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 13
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 14
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 15
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 16
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 17
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 18
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 19
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 20
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 21
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 22
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 23
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 24
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 25
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 26
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 27
+    },
+    {
+      "path": "crypto.py",
+      "startLine": 201,
+      "endLine": 400,
+      "probe": 28
+    }
+  ]
+}
