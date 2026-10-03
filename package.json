@@ -25,7 +25,6 @@
     "CONTRIBUTING.md",
     "SECURITY.md",
     "CODE_OF_CONDUCT.md",
-    "docs",
     "scripts/device-smoke.mjs"
   ],
   "scripts": {
@@ -35,7 +34,7 @@
     "clean": "rm -rf dist",
     "release:build": "node scripts/release.mjs",
     "device:smoke": "node scripts/device-smoke.mjs",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "node scripts/verify-dist.mjs"
   },
   "keywords": ["ai", "coding-agent", "cli", "termux", "android", "armv7", "llm", "developer-tools"],
   "publishConfig": {
