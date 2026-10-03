@@ -1,10 +1,10 @@
 {
-  "name": "termagent",
+  "name": "@whoops-1/termagent",
   "version": "1.18.0",
   "description": "A lightweight, ARMv7-friendly coding agent for Termux and Node.js.",
   "type": "module",
   "bin": {
-    "termagent": "./dist/index.js"
+    "termagent": "dist/index.js"
   },
   "exports": {
     ".": "./dist/index.js",
@@ -36,7 +36,16 @@
     "device:smoke": "node scripts/device-smoke.mjs",
     "prepublishOnly": "node scripts/verify-dist.mjs"
   },
-  "keywords": ["ai", "coding-agent", "cli", "termux", "android", "armv7", "llm", "developer-tools"],
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "cli",
+    "termux",
+    "android",
+    "armv7",
+    "llm",
+    "developer-tools"
+  ],
   "publishConfig": {
     "access": "public"
   },

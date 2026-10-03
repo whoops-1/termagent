@@ -14,7 +14,7 @@ especially Termux on older Android devices.
 ### npm
 
 ```sh
-npm install -g termagent@latest
+npm install -g @whoops-1/termagent
 termagent
 ```
 
