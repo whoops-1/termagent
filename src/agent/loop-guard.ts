@@ -148,6 +148,18 @@ export class ToolLoopGuard {
     return { blocked: false, count: this.repeatedCount }
   }
 
+  /**
+   * Start a fresh semantic no-progress streak without clearing the broader
+   * exact-call safety guard. Operational rounds such as shell execution are
+   * allowed to reset exploration-specific stagnation because execution state
+   * is not itself repository evidence.
+   */
+  resetSemanticNoProgress(): void {
+    this.lastRoundFingerprint = undefined
+    this.semanticRepeatCount = 0
+    this.constrainedActions.clear()
+  }
+
   allowRepeat(): void {
     this.blocked = false
     this.repeatedCount = 0

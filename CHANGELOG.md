@@ -1,6 +1,28 @@
 # Changelog
+## 2026-10-04
+
+### Phase 14B — reconnect-safe session events
+
+- Added a runtime-owned session event wakeup bus backed by durable SessionStore sequence reads.
+- Replaced durable-event SSE polling with replay-then-tail semantics and explicit connection/heartbeat frames.
+- Added reconnect-safe cursor handling and an authoritative session snapshot endpoint.
+
+### Phase 14B — Event streaming
+
+- Added a runtime-owned durable session event publisher/subscriber boundary.
+- Replaced durable-event SSE polling with replay-then-tail wakeups keyed by persisted sequence.
+- Added explicit ready/cursor semantics and a session snapshot reconciliation endpoint.
+
 
 ## Unreleased
+
+### 13N-J-C shell service/process semantics
+
+- Scoped semantic no-progress detection away from operational shell/write rounds so unrelated command execution cannot inherit an exploration stagnation streak.
+- Preserved intentional shell background descendants after a successful shell-leader exit while keeping process-group cleanup for ordinary foreground commands and cancellation/timeout paths.
+- Added durable `backgroundChildrenPreserved` task/result metadata for the shell lifecycle.
+- Added structured `EADDRINUSE` detection and model-facing guidance to inspect/reuse an existing endpoint before another launch.
+- Strengthened shell guidance to use durable background execution for persistent servers and watchers.
 
 ### 13N-J mobile runtime and release hardening
 
@@ -14,7 +36,9 @@
 - Added a runtime-owned durable prompt queue with queued/executing/completed/cancelled/failed states, edit/cancel/reorder operations, and automatic draining.
 - Kept the composer interactive during live turns and made ordinary input/mouse activity non-cancelling.
 - Added the richer semantic theme, banner, motion, and Exploration HUD system from the Complete Visual System + HUD snapshot.
-- Added a narrow compatibility bridge for providers that leak XML-style tool-call markup into assistant text, while preserving the existing tool executor and loop guards.
+- Replaced the post-hoc XML regex/gate compatibility path with a bounded incremental text-tool protocol parser that runs before transcript projection.
+- Added split-stream handling, wrapperless calls, multiple calls, parameter variants, JSON wrappers, schema-aware registry resolution, finish-time reconciliation, and a compatibility mapping from model `shell` to TermAgent `bash`.
+- Routed XML-recovered calls into the existing semantic tool-call, permission, loop-guard, lifecycle, and result pipeline; the renderer never receives internal tool-call XML.
 - Fixed interactive shutdown so the terminal goodbye always includes the exact `termagent --resume <session-id>` command.
 - Refreshed the public documentation and design notes so they describe current TermAgent behavior directly.
 - Removed historical source/provenance wording from public documentation, design notes, tests, and generated output; the repository now describes its own architecture and behavior directly.
@@ -24,6 +48,7 @@
 - 13N-J-B release suite: **10/10 PASS**.
 - Combined focused 13N-J-A + 13N-I regression gate: **75/75 PASS** before the final shutdown-only patch.
 - Shutdown regression: **1/1 PASS** after passing the active session ID to `TerminalUI.leave()`.
+- XML text-tool compatibility suite: **15/15 PASS**; broader provider/tool/agent gate: **127/127 PASS**.
 - `npm run build` — **PASS**.
 - `npm pack --dry-run` — **PASS**.
 - Repository-wide aggregate test remains a separate gate because the known provider-manager test process does not terminate.
@@ -290,3 +315,11 @@ Phase gate: build, full test suite, package dry-run, source-hygiene scan, and ex
 - Streaming interruption and session status reporting.
 - Unicode-safe terminal editing and output sizing.
 - Atomic persistence for draft, task, and session-related state.
+
+## Unreleased
+
+### Loop-safety correction
+
+- Fixed the semantic no-progress guard incorrectly treating shell/task execution metadata (`taskId`) as semantic progress state.
+- Distinct shell verification commands no longer terminate a normal turn after three executions merely because they did not change repository state.
+- Existing identical-call and exploration no-progress protections remain in place.

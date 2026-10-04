@@ -29,12 +29,14 @@ import { parallelAgentTool } from '../tools/parallel.js'
 import { loadCustomAgents, loadCustomCommands } from '../agent/custom.js'
 import { loadInstalledPluginComponents } from '../plugins/components.js'
 import { PluginHookManager } from '../plugins/hooks.js'
+import { SessionEventBus } from '../session/event-bus.js'
 
 export type Runtime = Awaited<ReturnType<typeof createRuntime>>
 
 export async function createRuntime(cwd:string) {
   const cfg=await loadConfig(cwd)
-  const store=new SessionStore()
+  const events=new SessionEventBus()
+  const store=new SessionStore(undefined,events)
   const gate=new PermissionGate(cfg.approvals, process.stdin, process.stdout, cfg.permissionRules || [], store)
   const registry=new ToolRegistry(gate)
   builtinTools({timeout:cfg.shellTimeoutMs,maxOutput:cfg.maxOutputBytes,toolOutputMaxLines:cfg.toolOutputMaxLines,toolOutputMaxBytes:cfg.toolOutputMaxBytes,toolOutputRetentionDays:cfg.toolOutputRetentionDays}).forEach(t=>registry.add(t)); registry.add(questionTool(store))
@@ -70,7 +72,7 @@ export async function createRuntime(cwd:string) {
   const activeControllers=new Map<string,AbortController>()
   let repositoryMap=await buildRepositoryMap(cwd)
   return {
-    cwd,cfg,store,registry,tasks,mcp,instructions,skills,customAgents,customCommands,getProvider:()=>provider,getProviderCfg:()=>providerCfg,
+    cwd,cfg,store,events,registry,tasks,mcp,instructions,skills,customAgents,customCommands,getProvider:()=>provider,getProviderCfg:()=>providerCfg,
     getMode:()=>agentMode,setMode:(m:string)=>{agentMode=m;selectedCustom=undefined},getCustom:()=>selectedCustom,
     setCustom:(a:any)=>{selectedCustom=a},getRepository:()=>repositoryMap,
     async refresh(){ repositoryMap=await buildRepositoryMap(cwd); return repositoryMap },

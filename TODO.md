@@ -677,10 +677,19 @@ A complete review of the implementation `0.10.0`  surfaced several practical pat
 - [verified] User messages use a separate semantic surface from the composer.
 - [verified] Session-changing commands cannot race an active turn.
 - [verified] Legacy experimental Markdown test now exercises the current renderer rather than the obsolete preview build.
-- [verified] Recover recognized text-encoded tool calls through the canonical Agent/tool lifecycle without creating a second executor.
-- [verified] Suppress leaked tool protocol markup from live/final terminal output and fail closed when tools are disabled.
+- [verified] Parse text-encoded tool calls before transcript projection using incremental protocol framing rather than renderer masking.
+- [verified] Reconcile split/incomplete XML, resolve names against the live tool registry, and route recovered calls through the existing permission/lifecycle executor.
+- [verified] Keep native provider calls and text-recovered calls in one semantic call stream with no protocol markup leakage.
 
 **13N-I status:** `[verified]` for the Terminal UI presentation layer and provider text-tool compatibility hardening. Themes, banner variants, bounded effects, motion modes, exploration HUD, semantic interaction, visual fallbacks, and text-tool protocol recovery are implemented and covered by focused regression tests. The future Web renderer remains a Phase 14 concern. Detailed notes: `docs/research/PHASE13N-I-SEMANTIC-UI-VISUAL-SYSTEM.md`.
+
+### 13N-J-C — Shell service/process semantics
+
+- [test] Keep semantic no-progress detection scoped away from operational shell/write rounds so distinct command attempts do not inherit an exploration stagnation streak.
+- [test] Preserve descendants intentionally launched with an unquoted shell `&` after the shell leader exits, while retaining cleanup for unintended descendants and termination paths.
+- [test] Surface EADDRINUSE as structured shell metadata plus model-facing guidance to inspect or reuse the existing service instead of launching another copy.
+
+**13N-J-C status:** `[test]` after focused agent/process/shell regressions and a clean TypeScript build. Physical Termux/ARMv7 behavior remains unverified on the x86_64 host.
 
 ### 13N-J — Mobile process/release hardening
 
@@ -719,14 +728,16 @@ Web View is a first-class client of TermAgent's canonical runtime. It is not an 
 
 ### 14B — Event bus and reconnect-safe streaming
 
-- [ ] Add a runtime-owned session event publisher/subscriber boundary.
-- [ ] Replace the current 250 ms JSONL polling SSE implementation with race-free replay-then-tail semantics.
-- [ ] Replay durable events after a supplied sequence cursor, then subscribe to newly committed durable events without gaps.
-- [ ] Send a connection/ready frame that identifies the current durable sequence.
-- [ ] Preserve heartbeat and explicit connection-state semantics.
-- [ ] Ensure transport disconnects do not mutate session truth.
-- [ ] Add authoritative snapshot/context endpoints for reconciliation after missed live-only events.
-- [ ] Add reconnect tests at every event boundary.
+- [verified] Add a runtime-owned session event publisher/subscriber boundary.
+- [verified] Replace the current 250 ms JSONL polling SSE implementation with race-free replay-then-tail semantics.
+- [verified] Replay durable events after a supplied sequence cursor, then subscribe to newly committed durable events without gaps.
+- [verified] Send a connection/ready frame that identifies the current durable sequence.
+- [verified] Preserve heartbeat and explicit connection-state semantics.
+- [verified] Ensure transport disconnects do not mutate session truth.
+- [verified] Add an authoritative session snapshot endpoint for reconciliation after missed live-only events, alongside the existing context endpoint.
+- [verified] Add reconnect/race regression coverage at the replay→tail handoff, cursor validation, and subscriber cleanup boundaries.
+
+**14B status:** `[verified]` runtime publisher/subscriber, replay→tail handoff, heartbeat/connection frames, cursor validation, snapshot reconciliation, reconnect behavior, and subscriber cleanup are covered by the focused 14A/14B/server regression set. The overall Phase 14 gate remains open because 14C+ and the separate 13N rollout/platform gates are not complete.
 
 ### 14C — HTTP API and dependency-free client SDK
 
@@ -931,3 +942,9 @@ The 1.7 execution-safety, semantic loop detection, completion gate, provider man
 # Phase gate rule
 
 A phase is not marked complete until its implementation, focused regression tests, full suite, build, package dry-run, source-hygiene scan, extracted-artifact smoke test, and all phase-specific recovery/concurrency/replay checks pass. After a passing phase, stop and propose the next phase rather than silently starting it.
+
+
+### XML / loop-safety follow-up
+
+- [x] Prevent task execution metadata (`taskId`) from activating semantic exploration no-progress detection.
+- [x] Regression-test three distinct `bash` verification calls followed by a fourth model response.

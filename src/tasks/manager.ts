@@ -19,7 +19,7 @@ export interface TaskRecord {
   usage?:{inputTokens:number;outputTokens:number;totalTokens:number;estimated:boolean};
   workerToken?:string;
   processIdentity?:{command:string;cwd:string;startTime?:string};
-  scopePaths?:string[]; outputPath?:string; outputBytes?:number; outputTruncated?:boolean; timeoutMs?:number; backgrounded?:boolean; signal?:any; termination?:'completed'|'nonzero'|'timeout'|'cancelled'|'signal'|'output-limit'|'stdin-timeout'|'spawn-error';
+  scopePaths?:string[]; outputPath?:string; outputBytes?:number; outputTruncated?:boolean; timeoutMs?:number; backgrounded?:boolean; backgroundChildrenPreserved?:boolean; signal?:any; termination?:'completed'|'nonzero'|'timeout'|'cancelled'|'signal'|'output-limit'|'stdin-timeout'|'spawn-error';
 }
 
 export class TaskManager {

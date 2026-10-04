@@ -83,6 +83,7 @@ export class TermAgentClient {
   }
   getSessionStatus(id: string) { return this.request<any>(`/api/v1/sessions/${encodeURIComponent(id)}/status`) }
   getContext(id: string) { return this.request<any>(`/api/v1/sessions/${encodeURIComponent(id)}/context`) }
+  getSnapshot(id: string) { return this.request<any>(`/api/v1/sessions/${encodeURIComponent(id)}/snapshot`) }
   undo(id: string) { return this.request<any>(`/api/v1/sessions/${encodeURIComponent(id)}/undo`, { method: 'POST' }) }
   redo(id: string) { return this.request<any>(`/api/v1/sessions/${encodeURIComponent(id)}/redo`, { method: 'POST' }) }
   fork(id: string, at?: number) { return this.request<any>(`/api/v1/sessions/${encodeURIComponent(id)}/fork`, { method: 'POST', body: JSON.stringify({ at }), headers: { 'content-type': 'application/json' } }) }

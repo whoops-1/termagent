@@ -306,6 +306,31 @@ Themes use grouped `ThemeTokens` plus banner and motion metadata. User/project t
 
 The Exploring HUD is derived from existing `ExplorationStateSnapshot` and `ExplorationTelemetrySnapshot`; it does not create a second coverage or discovery store. Disjoint coverage is preserved as disjoint evidence instead of being flattened into a misleading range. This is deliberate preparation for Phase 14, where the same semantic state can be projected into a Web View.
 
+### Text-encoded tool-call protocol boundary
+
+Providers may encode tool requests inside streamed text instead of emitting native tool-call events. TermAgent treats that text as a provider protocol, not as assistant prose. `XmlToolCallStreamParser` runs before `Agent` calls the transcript `onText` sink and splits the input into two semantic outputs: visible assistant text and recovered `ToolCall` values.
+
+The parser uses incremental, bounded state so partial `<tool_call>`, `<function=...>`, parameter, and closing tags remain buffered across arbitrary stream chunk boundaries. Resolved calls are checked against the live `ToolDefinition` registry, then appended to the same semantic call collection as provider-native calls. The parser never executes tools and never bypasses `PermissionGate`; all calls continue through the existing lifecycle, loop guard, tool registry, result persistence, and UI projection.
+
+Finish-time reconciliation can promote an otherwise unambiguous incomplete frame, while unknown tools, malformed structures, fenced examples, and unrecognized XML-like prose stay out of the execution path. The transcript renderer therefore has no special XML-hiding responsibility because internal protocol markup never reaches it.
+
+```text
+provider stream
+     |
+     v
+text/native normalization
+     |
+     +--> assistant text --------------------+
+     |                                       |
+     +--> semantic ToolCall -----------------+--> Agent lifecycle
+                                                 |
+                                      ToolRegistry + PermissionGate
+                                                 |
+                                      durable tool.call / result events
+                                                 |
+                                      Terminal / future Web projections
+```
+
 ## Future Web View / multi-client presentation architecture
 
 Web View is a planned first-class client surface. It is not a second UI implementation of the terminal and must not be built by mirroring rendered ANSI output. The source of truth is the semantic runtime/session state and event stream; TerminalUI, Web View, and a future VS Code extension are independent projections of that state.
@@ -431,6 +456,14 @@ plugin/MCP/skill activity and provenance
 ```
 
 TerminalUI continues to own ANSI/VT layout, raw input, picker geometry, and terminal-specific focus. Web View may render the same semantics using richer cards, panels, syntax highlighting, diff views, file trees, progress indicators, and responsive layouts. VS Code can reuse that browser-grade presentation inside a Webview while using the same runtime protocol.
+
+### Shell lifecycle semantics
+
+The `bash` tool is a one-shot managed-shell boundary backed by `TaskManager`; persistent work should use the durable background task path. The shell runner treats an explicit, unquoted `&` as intentional child-process lifetime syntax. When the shell leader exits successfully while such a child remains in the same process group, the runner records `backgroundChildrenPreserved` and does not classify that child as an orphan to clean up.
+
+This distinction is deliberately separate from cancellation, timeout, output-limit, and stdin-timeout handling. Those termination paths still signal the managed process group so a command cannot escape cleanup merely by containing shell syntax. An `EADDRINUSE` result is represented as shell metadata so clients can reason about endpoint ownership without scraping human-readable terminal output.
+
+Loop-safety semantics are likewise separated: exact repeated-call protection is keyed by tool identity plus input, while semantic no-progress detection is reserved for exploration/state-reasoning rounds. Operational shell/write rounds reset the semantic stagnation streak rather than being counted as repository-evidence rounds.
 
 ### API and transport requirements
 
@@ -688,3 +721,13 @@ Specialist roles are `general`, `researcher`, `planner`, `coder`, `reviewer`, an
 
 Task linkage stores `parentTaskId`, `delegationDepth`, `specialistRole`, permission policy, workspace scope, and estimated token usage. Parent cancellation recursively cancels tracked descendants. Central concurrency and depth limits prevent unbounded delegation even when tasks are created through different entry points.
 
+
+### Semantic loop-safety boundary
+
+TermAgent keeps execution bookkeeping separate from semantic progress. Shell/task metadata such as `taskId` identifies a runtime task but does not itself mean the agent changed repository state, advanced a todo state, or produced exploration evidence. The semantic no-progress detector therefore only activates from true semantic metadata (`mutation`, `todo`), workflow state, or exploration observations. This prevents ordinary verification commands from being mistaken for repeated semantic exploration just because their durable task records contain stable bookkeeping fields.
+
+## Phase 14B — Session event streaming
+
+The server exposes durable session events through a runtime-owned `SessionEventBus` plus `SessionStore` durable sequence reads. The bus is a bounded wakeup mechanism, not an event store: subscribers register before historical replay, durable commits mark the session dirty, and the stream re-queries persisted rows after each wake by sequence. This gives replay-then-tail handoff without a replay/sleep race while keeping durable storage authoritative.
+
+The event stream emits renderer-neutral durable envelopes and a `ready` frame containing the current durable sequence. A cursor ahead of the authoritative sequence is rejected explicitly. The `/snapshot` endpoint provides a reconstructible session/meta/message/interaction/context view for clients that need authoritative reconciliation after live-only data is missed.

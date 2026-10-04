@@ -31,7 +31,7 @@ test('13N-J-A kills descendants left behind by a completed foreground shell', as
     const marker = path.join(root, 'child.pid')
     const handle = await startManagedShell(manager, {
       shell: 'sh',
-      command: `sleep 20 & echo $! > ${JSON.stringify(marker)}; exit 0`,
+      command: `node -e ${JSON.stringify(`const {spawn}=require('child_process');const fs=require('fs');const p=spawn('sleep',['20'],{stdio:'ignore'});p.unref();fs.writeFileSync(${JSON.stringify(marker)},String(p.pid));`)}`,
       cwd: root,
       timeout: 5000,
       maxPreviewBytes: 1000,
@@ -183,6 +183,115 @@ test('13N-J-A cancellation refuses to signal a mismatched stored process identit
     assert.match(result.output, /did not signal the stored PID/i)
     assert.equal(alive(process.pid), true)
   } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('13N-J-A intentional shell background syntax preserves the descendant after leader exit', async () => {
+  const root = await temp()
+  try {
+    const { TaskManager, startManagedShell, hasShellBackgroundOperator } = await load()
+    assert.equal(hasShellBackgroundOperator('sleep 1 &'), true)
+    assert.equal(hasShellBackgroundOperator('sleep 1 && echo ok'), false)
+    assert.equal(hasShellBackgroundOperator("printf '&'"), false)
+    assert.equal(hasShellBackgroundOperator("printf \"&\""), false)
+
+    const manager = new TaskManager(path.join(root, 'tasks'), false)
+    const marker = path.join(root, 'child.pid')
+    const handle = await startManagedShell(manager, {
+      shell: 'sh',
+      command: `sleep 2 & echo $! > ${JSON.stringify(marker)}`,
+      cwd: root,
+      timeout: 5000,
+      maxPreviewBytes: 1000,
+      detached: true,
+    })
+    const result = await handle.result
+    assert.equal(result.termination, 'completed')
+    assert.equal(result.backgroundChildrenPreserved, true)
+    const pid = Number((await readFile(marker, 'utf8')).trim())
+    assert.ok(pid > 0)
+    assert.equal(alive(pid), true)
+    const events = await manager.history(handle.task.id)
+    assert.ok(events.some(event => event.type === 'background_children_preserved'))
+    try { process.kill(pid, 'SIGKILL') } catch {}
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('13N-J-A shell results surface an actionable EADDRINUSE diagnostic', async () => {
+  const root = await temp()
+  let server
+  try {
+    const { createServer } = await import('node:net')
+    server = createServer()
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', resolve)
+    })
+    const port = server.address().port
+    process.env.TERMAGENT_TASK_ROOT = path.join(root, 'tasks')
+    const { builtinTools } = await import('../dist/tools/builtin.js')
+    const bash = builtinTools({ timeout: 5000, maxOutput: 2000 }).find(tool => tool.name === 'bash')
+    assert.ok(bash, 'missing bash tool')
+    const result = await bash.execute({
+      command: `node -e 'require("net").createServer().listen(${port}, "127.0.0.1")'`,
+      timeout: 1000,
+    }, { sessionID: '13nj-eaddr', agent: 'build', cwd: root, abort: new AbortController().signal })
+    assert.equal(result.metadata.shell.addressInUse, true)
+    assert.match(result.output, /EADDRINUSE|already owns the requested address\/port/i)
+    assert.match(result.output, /Do not launch another instance/i)
+  } finally {
+    server?.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('13N-J-C real bash lifecycle keeps an intentionally backgrounded server alive and diagnoses a second launch', async () => {
+  const root = await temp()
+  let pid = 0
+  try {
+    const { createServer } = await import('node:net')
+    const probe = createServer()
+    await new Promise((resolve, reject) => {
+      probe.once('error', reject)
+      probe.listen(0, '127.0.0.1', resolve)
+    })
+    const port = probe.address().port
+    await new Promise(resolve => probe.close(resolve))
+
+    await writeFile(path.join(root, 'server.mjs'), `import http from 'node:http'\nconst port=Number(process.env.PORT)\nhttp.createServer((req,res)=>{if(req.url==='/health'){res.end('healthy\\n');return}res.statusCode=404;res.end('not-found\\n')}).listen(port,'127.0.0.1',()=>console.log('server-ready:'+port))\n`)
+
+    process.env.TERMAGENT_TASK_ROOT = path.join(root, 'tasks')
+    const { builtinTools } = await import('../dist/tools/builtin.js')
+    const tools = builtinTools({ timeout: 5000, maxOutput: 2000 })
+    const bash = tools.find(tool => tool.name === 'bash')
+    assert.ok(bash, 'missing bash tool')
+    const context = { sessionID: '13nj-real-bash', agent: 'build', cwd: root, abort: new AbortController().signal }
+
+    const started = await bash.execute({
+      command: `PORT=${port} node server.mjs > server.log 2>&1 & echo $! > server.pid; sleep 0.25; curl -fsS http://127.0.0.1:${port}/health`,
+    }, context)
+    assert.equal(started.metadata.shell.status, 'completed')
+    assert.equal(started.metadata.shell.backgroundChildrenPreserved, true)
+    assert.match(started.output, /healthy/) 
+    pid = Number((await readFile(path.join(root, 'server.pid'), 'utf8')).trim())
+    assert.ok(pid > 0)
+    assert.equal(alive(pid), true)
+
+    const reused = await bash.execute({ command: `curl -fsS http://127.0.0.1:${port}/health` }, context)
+    assert.equal(reused.metadata.shell.status, 'completed')
+    assert.match(reused.output, /healthy/)
+
+    const duplicate = await bash.execute({ command: `PORT=${port} node server.mjs`, timeout: 1000 }, context)
+    assert.equal(duplicate.metadata.shell.addressInUse, true)
+    assert.match(duplicate.output, /EADDRINUSE|already owns the requested address\/port/i)
+    assert.match(duplicate.output, /Do not launch another instance/i)
+  } finally {
+    if (pid > 0) {
+      try { process.kill(pid, 'SIGTERM') } catch {}
+    }
     await rm(root, { recursive: true, force: true })
   }
 })

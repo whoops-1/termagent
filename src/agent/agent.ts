@@ -17,7 +17,8 @@ import { ToolLoopGuard } from './loop-guard.js'
 import type { PluginHookManager } from '../plugins/hooks.js'
 import { FileReadStateCache, rehydrateReadCoverageEvidence } from '../tools/file-state.js'
 import { ExplorationState } from '../context/exploration.js'
-import { ToolCallLifecycle, TextToolCallStreamGate, classifyToolError, normalizeToolCalls, parseToolArguments, recoverTextToolCalls } from './tool-call-lifecycle.js'
+import { ToolCallLifecycle, classifyToolError, normalizeToolCalls, parseToolArguments } from './tool-call-lifecycle.js'
+import { XmlToolCallStreamParser } from './text-tool-call-parser.js'
 import type { QuestionResponse } from '../tools/types.js'
 import { machineStateFromRuntime, renderMachineState, type ContextMachineState } from '../context/state.js'
 import { semanticProgressFingerprint } from './progress.js'
@@ -108,7 +109,11 @@ function redactCompletedTodoToolMessages(messages: ChatMessage[]) {
   }
 }
 
-const SEMANTIC_METADATA_KEYS = new Set(['taskId', 'taskID', 'taskIds', 'mutation', 'todo'])
+// Only metadata that changes semantic session state may activate the
+// exploration no-progress guard. Execution bookkeeping such as task IDs is
+// deliberately excluded: a shell/task completion can be useful work even
+// when repository state is unchanged.
+const SEMANTIC_METADATA_KEYS = new Set(['mutation', 'todo'])
 
 function containsSemanticMetadata(value: unknown): boolean {
   if (!value || typeof value !== 'object') return false
@@ -476,21 +481,27 @@ export class Agent {
           }
         }
         let text='';let reasoning='';const calls:any[]=[]
-        let streamedText=''
-        const textToolCallGate=new TextToolCallStreamGate()
+        const textEncodedCalls:any[]=[]
+        const parserTools: ReturnType<ToolRegistry['list']> = finalStep
+          ? this.tools.list()
+          : requestTools.flatMap(tool => {
+              const definition = this.tools.get(String(tool.function?.name || ''))
+              return definition ? [definition] : []
+            })
+        const textToolCallParser = new XmlToolCallStreamParser(parserTools)
         const providerCalls=new Map<string,{providerExecuted:boolean;providerMetadata?:unknown}>()
         const providerResults=new Map<string,{output:string;error?:string;providerMetadata?:unknown}>()
         this.provider.setRole?.(phase?roleForPhase(phase):mode)
         await appendProviderTurn(round,'started',{startedAt:Date.now()})
         try {
           await withRetry(async()=>{
-            text='';reasoning='';calls.length=0;providerCalls.clear();providerResults.clear();streamedText='';textToolCallGate.reset()
+            text='';reasoning='';calls.length=0;textEncodedCalls.length=0;providerCalls.clear();providerResults.clear();textToolCallParser.reset()
             for await(const ev of this.provider.stream(requestMessages,requestTools,controller.signal)){
               if(ev.type==='reasoning'){reasoning+=ev.delta;input.onReasoning?.(ev.delta)}
               if(ev.type==='text'){
-                text+=ev.delta
-                const visible=textToolCallGate.push(ev.delta)
-                if(visible){streamedText+=visible;input.onText?.(visible)}
+                const parsedText=textToolCallParser.feed(ev.delta)
+                if(parsedText.text){text+=parsedText.text;input.onText?.(parsedText.text)}
+                if(parsedText.calls.length){ calls.push(...parsedText.calls); textEncodedCalls.push(...parsedText.calls) }
               }
               if(ev.type==='tool_call'){
                 calls.push(ev.call)
@@ -500,15 +511,9 @@ export class Agent {
                 providerResults.set(String(ev.call.id||''),{output:ev.output,error:ev.error,...(ev.providerMetadata!==undefined?{providerMetadata:ev.providerMetadata}: {})})
               }
             }
-            const withheld=textToolCallGate.finish()
-            if(withheld){
-              const recoveryToolNames=finalStep ? this.tools.list().map(tool=>tool.name) : availableToolNames
-              const recovery=recoverTextToolCalls(text,recoveryToolNames)
-              if(!recovery.recovered){
-                streamedText+=withheld
-                input.onText?.(withheld)
-              }
-            }
+            const finishedText=textToolCallParser.finish()
+            if(finishedText.text){text+=finishedText.text;input.onText?.(finishedText.text)}
+            if(finishedText.calls.length){ calls.push(...finishedText.calls); textEncodedCalls.push(...finishedText.calls) }
             if(!text.trim()&&!calls.length)throw new Error('Provider returned an empty model response')
           },{max:this.retryMax,signal:controller.signal,onRetry:x=>this.onStatus?.(`retry ${x.attempt}/${this.retryMax} in ${Math.ceil(x.delay/1000)}s: ${x.message}`)})
         } catch(error) {
@@ -518,21 +523,14 @@ export class Agent {
           throw error
         }
         try {
-          const recoveryToolNames=finalStep ? this.tools.list().map(tool=>tool.name) : availableToolNames
-          const textualRecovery=recoverTextToolCalls(text,recoveryToolNames)
-          if(textualRecovery.recovered){
-            const tail=textualRecovery.text.startsWith(streamedText) ? textualRecovery.text.slice(streamedText.length) : textualRecovery.text
-            if(tail && !finalStep){streamedText+=tail;input.onText?.(tail)}
-            text=textualRecovery.text
-            if(!finalStep){
-              calls.push(...textualRecovery.calls)
-              this.onStatus?.(`recovered ${textualRecovery.calls.length} text-encoded tool call${textualRecovery.calls.length===1?'':'s'} from provider output`)
-            } else {
-              this.onStatus?.(`ignored ${textualRecovery.calls.length} text-encoded tool call${textualRecovery.calls.length===1?'':'s'} because tool execution is disabled for this turn`)
-              if(!text.trim()){
-                text=loopStopReason ? `Turn stopped before another tool call: ${loopStopReason}.` : 'Tool execution is no longer available in this turn.'
-                input.onText?.(text)
-              }
+          const xmlCallsThisRound = textEncodedCalls
+          if(xmlCallsThisRound.length && !finalStep){
+            this.onStatus?.(`recovered ${xmlCallsThisRound.length} text-encoded tool call${xmlCallsThisRound.length===1?'':'s'} from provider output`)
+          } else if(xmlCallsThisRound.length && finalStep){
+            this.onStatus?.(`ignored ${xmlCallsThisRound.length} text-encoded tool call${xmlCallsThisRound.length===1?'':'s'} because tool execution is disabled for this turn`)
+            if(!text.trim()){
+              text=loopStopReason ? `Turn stopped before another tool call: ${loopStopReason}.` : 'Tool execution is no longer available in this turn.'
+              input.onText?.(text)
             }
           }
           const normalized=normalizeToolCalls(this.provider.id,turn.id,calls)
@@ -868,22 +866,35 @@ export class Agent {
           }
         }
 
-        if(!loopStopReason && semanticTrackingActive){
-          const semanticFingerprint=semanticProgressFingerprint({
-            exploration:explorationState.snapshot(),
-            todos:currentTodoItems,
-            mutations:mutationEvidenceFromLifecycle(toolLifecycle.snapshot()),
-            toolLifecycle:toolLifecycle.snapshot(),
-            workflow:workflow?.state,
-          })
-          const semanticProgress=semanticFingerprint!==lastSemanticProgressFingerprint
-          if(semanticProgress) meaningfulProgress=true
+        const semanticFingerprint=semanticProgressFingerprint({
+          exploration:explorationState.snapshot(),
+          todos:currentTodoItems,
+          mutations:mutationEvidenceFromLifecycle(toolLifecycle.snapshot()),
+          toolLifecycle:toolLifecycle.snapshot(),
+          workflow:workflow?.state,
+        })
+        const semanticProgress=lastSemanticProgressFingerprint !== undefined && semanticFingerprint!==lastSemanticProgressFingerprint
+        if(semanticProgress) meaningfulProgress=true
+        lastSemanticProgressFingerprint=semanticFingerprint
+
+        // Semantic no-progress is an exploration/state-reasoning guard, not a
+        // generic command-attempt limiter. Once exploration tracking has been
+        // activated earlier in the turn, a later run of distinct shell/write
+        // operations must not inherit the exploration stagnation streak.
+        // OpenCode similarly keys its repeated-call safety on the actual tool
+        // + input, rather than treating unrelated operational calls as one
+        // repeated action.
+        const operationalRound=calls.some((call:any)=>{
+          const name=String(call.function?.name||'')
+          if(WRITE_TOOLS.has(name)) return true
+          return this.tools.get(name)?.risk==='shell'
+        })
+        if(!loopStopReason && semanticTrackingActive && !operationalRound){
           const semanticCheck=loopGuard.observeNoProgressRound(
             semanticFingerprint,
             semanticProgress,
             explorationInterventionToolActions(explorationRoundActions),
           )
-          lastSemanticProgressFingerprint=semanticFingerprint
           if(semanticCheck.intervention){
             const intervention=semanticCheck.intervention
             const notice=explorationInterventionMessage(
@@ -905,6 +916,11 @@ export class Agent {
             if(workflow) workflow.state={...workflow.state,phase:'blocked',lastProgress:semanticCheck.reason}
             this.onStatus?.(`loop guard: ${semanticCheck.reason}`)
           }
+        } else if(!loopStopReason && semanticTrackingActive && operationalRound){
+          // Execution/tooling rounds do not count toward the exploration
+          // stagnation streak. Preserve the fingerprint so the next eligible
+          // round can still tell whether the repository state actually changed.
+          loopGuard.resetSemanticNoProgress()
         }
 
         if(completionRequested && !loopStopReason) this.onStatus?.(`completion gate: ${completionRequested}`)
@@ -992,7 +1008,7 @@ export class Agent {
     const modeText=mode==='plan'?'PLAN MODE: You may inspect and reason, but must not modify files or run shell commands. Produce a concrete implementation plan and verification strategy.':mode==='explore'?'EXPLORE MODE: Focus on fast read-only repository discovery. Prefer grep/glob to locate candidates, then read the smallest useful contiguous ranges. Batch independent inspection tool calls in one response when possible. Locate relevant files and explain how they connect. Do not modify files or run shell commands.':'BUILD MODE: You may modify files and run verification commands according to permissions.'
     const nowUtc=new Date().toISOString()
     const postEditText=this.postEditVerificationConfig?.enabled ? '\nAUTOMATIC POST-EDIT VERIFICATION: After a successful file mutation, the runtime may run the configured verification command automatically. Treat that result as authoritative for the current mutation batch. Do not call verify_project again for the same batch unless the user explicitly requests a rerun; then set force=true.' : ''
-    const core=`You are TermAgent, a careful coding agent running in a terminal.\nWorking directory: ${cwd}\nCurrent UTC time: ${nowUtc}\nUse tools for facts and edits. Never claim a file changed unless the tool succeeded. Prefer small, verifiable edits. Run tests after meaningful changes. Do not expose secrets. When writing timestamps or dates, use the current UTC time above or verify a fresh time through an available tool; never invent timestamps.\nUse the provided native function tools when available. Never print XML/tool-call wrappers such as <tool_call>, <function=...>, or <parameter=...> as part of the visible answer; those are protocol syntax, not user-facing content. If a provider exposes a textual tool-call format, the runtime may recover it, but native tool calls are preferred.\n${modeText}${autonomousText}${postEditText}\nTreat retrieved repository context as hints, not proof; verify facts with tools before editing.`
+    const core=`You are TermAgent, a careful coding agent running in a terminal.\nWorking directory: ${cwd}\nCurrent UTC time: ${nowUtc}\nUse tools for facts and edits. Never claim a file changed unless the tool succeeded. Prefer small, verifiable edits. Run tests after meaningful changes. Do not expose secrets. When writing timestamps or dates, use the current UTC time above or verify a fresh time through an available tool; never invent timestamps.\nUse the provided native function tools when available. Never print XML/tool-call wrappers such as <tool_call>, <function=...>, or <parameter=...> as part of the visible answer; those are protocol syntax, not user-facing content. If a provider exposes a textual tool-call format, the runtime may recover it, but native tool calls are preferred. For persistent servers/watchers, prefer the bash tool's run_in_background=true or the durable background tool. If a shell result says EADDRINUSE/address already in use, treat that as evidence that another process already owns the endpoint and inspect/reuse it before attempting another launch.\n${modeText}${autonomousText}${postEditText}\nTreat retrieved repository context as hints, not proof; verify facts with tools before editing.`
     const sectionBudget=Math.max(128,Math.floor(messageBudget-estimateTokens(core)))
     const sections=allocateContextSections(sectionBudget,{explicitSkill:Boolean(explicitSkill)})
     const instructionText=truncateToTokenBudget(instructions||'(none)',sections.instructions)

@@ -391,7 +391,7 @@ export function builtinTools(opts: { timeout: number; maxOutput: number; toolOut
   const shellQuote = (value:string) => `'${value.replaceAll("'","'\"'\"'")}'`
   const bash: ToolDefinition = {
     name:'bash', risk:'shell',
-    description:'Run a shell command in the project. Long-running commands may be promoted to a durable background task after 15 seconds; set run_in_background=true to background immediately.',
+    description:'Run a shell command in the project. Long-running commands may be promoted to a durable background task after 15 seconds; set run_in_background=true to background immediately. For persistent servers/watchers, prefer run_in_background=true instead of relying on shell `&`. If the shell command itself uses `&`, TermAgent preserves the intentional background child even after the shell task completes; do not infer that the child stopped. After a successful startup or an EADDRINUSE error, verify/reuse the existing service rather than launching another copy.',
     schema:{type:'object',properties:{command:{type:'string'},timeout:{type:'integer',minimum:0,description:'Maximum foreground runtime in milliseconds.'},run_in_background:{type:'boolean',description:'Run immediately as a durable background task and return a task id.'}},required:['command']},
     async execute(a,c){
       const command=String(a.command??'').trim()
@@ -405,8 +405,18 @@ export function builtinTools(opts: { timeout: number; maxOutput: number; toolOut
         return {title:`background task ${handle.task.id}`,output:`Started background task ${handle.task.id}. Use task_status with id ${handle.task.id} to observe it. Full output: ${current.outputPath}`,metadata:{shell:{taskId:handle.task.id,status:'running',background:true,outputPath:current.outputPath,interactiveLikely:looksInteractiveLikely(command)}}}
       }
       const result=await handle.result
+      const outputText=shellPreview(result.outputPreview)
+      const addressInUse=/\bEADDRINUSE\b|address already in use/i.test(result.outputPreview)
       const label=result.backgrounded ? `Command moved to background as task ${handle.task.id}.` : `Command ${result.termination}.`
-      return {title:result.backgrounded?`background task ${handle.task.id}`:command,output:`${label}${result.outputPreview ? `\n${shellPreview(result.outputPreview)}` : ''}${result.outputTruncated ? `\n[Full output: ${result.outputPath}]` : ''}`,metadata:{shell:{taskId:handle.task.id,command,status:result.termination,exitCode:result.code,signal:result.signal,durationMs:result.durationMs,outputPath:result.outputPath,outputBytes:result.outputBytes,outputTruncated:result.outputTruncated,background:result.backgrounded,interactiveLikely:result.interactiveLikely}}}
+      const backgroundNotice=result.backgrounded
+        ? `\nThe command is still running as background task ${handle.task.id}. Do not start another copy unless you have verified that the existing process is not the service you need. Use task_status to inspect the task.`
+        : result.backgroundChildrenPreserved
+          ? '\nThe shell exited, but it intentionally left one or more background child processes running via `&`. Do not assume the child stopped just because this bash command completed; verify the service/process before starting another copy.'
+          : ''
+      const addressNotice=addressInUse
+        ? '\nA process already owns the requested address/port (EADDRINUSE). Do not launch another instance; inspect or reuse the existing service, or stop it before retrying.'
+        : ''
+      return {title:result.backgrounded?`background task ${handle.task.id}`:command,output:`${label}${outputText ? `\n${outputText}` : ''}${result.outputTruncated ? `\n[Full output: ${result.outputPath}]` : ''}${backgroundNotice}${addressNotice}`,metadata:{shell:{taskId:handle.task.id,command,status:result.termination,exitCode:result.code,signal:result.signal,durationMs:result.durationMs,outputPath:result.outputPath,outputBytes:result.outputBytes,outputTruncated:result.outputTruncated,background:result.backgrounded,backgroundChildrenPreserved:result.backgroundChildrenPreserved,addressInUse,interactiveLikely:result.interactiveLikely}}}
     }
   }
   const git: ToolDefinition = {

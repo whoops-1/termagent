@@ -798,13 +798,15 @@ Checkpoint references support exact IDs, unique prefixes, and the `#N` index sho
 - Aggregate repository `npm test` remains a separate blocked gate: the run reached 478 passing tests before hanging in the existing provider-manager long-lived process test.
 - Two older expectation mismatches also remain documented outside the H scope: the 13B tiny-budget compaction expectation and the legacy 13L timeout expectation.
 - Physical ARMv7/Termux execution remains unavailable on the verification host.
-## 2026-10-03 — Phase 13N-I provider text-tool-call recovery
+## 2026-10-03 — Phase 13N-I XML tool-call pipeline hardening
 
-A Termux screenshot and trace exposed a provider compatibility failure: after the semantic loop guard blocked a repeated `read_file` call, the provider emitted the next tool request as XML-like assistant text. The UI therefore showed `<tool_call>...</tool_call>` instead of executing a tool or ending with clean user-facing text.
+The first compatibility attempt was not sufficient. The uploaded trace showed the provider emitting the complete XML request as assistant text, while the old streaming gate withheld it and the late recovery path rejected the concrete `shell` spelling because the real registry exposes `bash`. When recovery failed, the old finish path re-injected the held XML through `onText`, which is why the terminal rendered the protocol markup.
 
-The fix is intentionally narrow. Native structured tool events remain canonical. A streaming gate suppresses candidate XML protocol blocks, `recoverTextToolCalls()` recognizes only the supported dialect, verifies that the function is currently offered, coerces parameter values, and feeds the resulting call into the normal Agent/tool lifecycle. Final tool-disabled steps may suppress the markup but never execute it. Unknown or malformed functions are not executed.
+Replaced that path with `XmlToolCallStreamParser`, an incremental protocol adapter that sits directly on provider text deltas before assistant transcript emission. It keeps partial XML framing in bounded buffers, resolves tool names against the live `ToolRegistry`, supports the observed `shell` → `bash` compatibility spelling, parses structured parameters/JSON wrappers, reconciles incomplete frames at finish, and feeds recovered calls into the same `calls` collection used by native provider tool calls. No alternate executor was introduced.
 
-Verification: `npm run build` PASS; focused compatibility + agent/UI regression selection **70/70 PASS**; generated JavaScript syntax PASS. The repository-wide aggregate runner remains non-terminating because of the documented provider-manager long-lived test process.
+Upstream research confirmed the split between protocol parsing and rendering: mature reference implementations normalize provider output into semantic text/tool events before session projection, keep assistant content separate from tool calls, and use stateful XML framing with explicit argument and finish-time reconciliation.
+
+Verification: the exact screenshot-shaped reproduction now executes the registered `bash` tool once, produces a semantic tool-call lifecycle, and emits no `<tool_call>`, `<function=`, or `<parameter=` text to the assistant transcript. The focused XML compatibility suite is **15/15 PASS**; the broader provider/tool/agent regression selection is **127/127 PASS**; the Phase 4 release-hygiene file is **6/6 PASS**; and `npm run build` is **PASS**. The repository-level `npm test` gate was also exercised with a 125-second cap: it reached 324 passing tests, 2 unrelated expectation failures (`/auto` E2E and the documented tiny-budget 13B expectation), then stopped producing progress at test 326 without a final TAP summary. Physical Termux/ARMv7 execution remains unverified on this host.
 
 Detailed notes: `docs/research/PHASE13N-I-TEXT-TOOL-CALL-COMPAT.md`.
 
@@ -835,8 +837,37 @@ Detailed notes: `docs/research/PHASE13N-I-SEMANTIC-UI-VISUAL-SYSTEM.md`.
 Started from the repaired 13N-I tree and adapted the existing durable `TaskManager` / managed-shell runtime using the recorded process-group and bounded-process patterns. Added reusable POSIX process-group signalling/escalation and timed child-stdin writes, cleaned up descendant groups after foreground shell completion, kept explicitly backgrounded tasks cancellable, and made shell previews obey their UTF-8 byte budget including truncation markers.
 
 Verification: `npm run build` PASS; combined 13N-J-A + 13E + 13I process/task gate **32/32 PASS**. Physical ARMv7/Termux execution remains open on the x86_64 host. Release engineering is deferred to 13N-J-B.
+## 2026-10-04 — Phase 13N-J-C shell service/process semantics
+
+The uploaded Termux trace showed a second failure after the XML parser fix: the semantic no-progress guard remained active after earlier repository exploration and counted later bash rounds as stagnant execution, even when the commands differed. The guard is now scoped away from operational shell/write rounds, while the existing exact repeated-call protection remains intact.
+
+The same trace also exposed shell lifetime ambiguity around commands containing `&`. The managed shell path now detects intentional shell background syntax, preserves surviving descendants after a successful shell-leader exit, and records `backgroundChildrenPreserved` in task/result metadata. Ordinary unintended descendants and timeout/cancellation/output-limit paths still use process-group cleanup.
+
+Bash results now surface `EADDRINUSE` as structured metadata and include explicit model-facing guidance to reuse or inspect an already-running service rather than launching another copy. Persistent services are additionally directed toward TermAgent's durable background execution path.
+
+Verification: `npm run build` PASS; focused XML/tool-call + shell/process gate **41/41 PASS**. Full repository aggregation remains a separate gate and physical ARMv7/Termux smoke is still unverified on the x86_64 host.
+
 ## 2026-10-03 — Phase 13N-J-B Android/ARMv7 release engineering
 
 Added explicit release target metadata for `android-armv7`, `android-arm64`, `linux-armv7`, `linux-arm64`, and `linux-x64`; deterministic target-labeled bundle generation; `release-manifest.json`; `SHA256SUMS`; and a prebuilt-first Termux-aware installer with source-build fallback. Because TermAgent has no native runtime addon, the application bundle remains JavaScript and the target labels describe runtime/installer compatibility rather than a native TermAgent binary.
 
 Verification: `npm run build` PASS; release tests 10/10 PASS; combined 13N-J-A + 13N-I/provider/specialist/checkpoint gate 75/75 PASS; generated JavaScript syntax 145/145 PASS; `npm pack --dry-run` PASS; deterministic multi-target release bundles and SHA-256 manifest generation PASS; workflow YAML and installer syntax PASS. Physical Termux/ARMv7 smoke remains the final 13N-J platform gate.
+
+
+## 13N-N: shell loop-safety correction
+
+- Root cause confirmed from the uploaded session trace: the affected turn executed three distinct `bash` calls, while each shell result carried a `taskId` in execution metadata.
+- `containsSemanticMetadata()` treated `taskId` as semantic state, activating the exploration no-progress guard during ordinary shell execution.
+- The semantic fingerprint intentionally excludes tool-lifecycle bookkeeping, so the three shell rounds appeared identical and triggered the existing threshold of 3.
+- Corrected metadata classification so only `mutation` and `todo` state can activate that semantic guard.
+- Added an agent-level regression reproducing three distinct shell verification calls with task metadata and requiring the fourth provider response.
+
+
+## Phase 14B — Event bus and reconnect-safe streaming
+
+Implemented a runtime-owned durable session event bus, race-free replay-then-tail SSE handoff, explicit durable cursor validation, subscriber cleanup, and an authoritative session snapshot endpoint. The server no longer uses the previous 250 ms JSONL polling loop for durable session events. Focused 14B regressions cover replay/tail handoff and ahead-of-head cursor rejection; broader package/release verification remains a separate gate.
+
+
+## 2026-10-04 — Phase 14B implementation slice
+
+Implemented the runtime-owned session event bus and race-free replay→tail event stream, replacing 250 ms durable JSONL polling. Added explicit connection/ready/heartbeat frames, cursor validation, reconnect-safe durable replay, subscriber cleanup, and an authoritative `/snapshot` reconciliation endpoint plus client accessor. Focused Phase 14A/14B/server regressions pass 17/17; production TypeScript build passes. The overall Phase 14 gate remains open, and the separate 13N real-device/platform gate is still pending.

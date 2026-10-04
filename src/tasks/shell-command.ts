@@ -18,6 +18,8 @@ export interface ShellResult {
   outputTruncated:boolean
   interactiveLikely:boolean
   backgrounded:boolean
+  /** True when shell `&` syntax intentionally left a descendant alive after the shell exited. */
+  backgroundChildrenPreserved:boolean
 }
 
 export interface ManagedShellOptions {
@@ -44,6 +46,39 @@ const KILL_GRACE_MS = 1_500
 const INTERACTIVE_COMMANDS = new Set(['vi','vim','nvim','nano','emacs','less','more','top','htop','watch','ssh','sftp','telnet','ftp','mysql','psql','python','python3','node','irb','bash','sh','zsh','fish'])
 const INTERACTIVE_FLAGS = /(?:^|\s)(?:-it|--interactive|--tty|--stdin|--prompt)(?:\s|$)/i
 const PROMPT_OUTPUT = /(?:\(y\/n\)|\[y\/n\]|(?:do you|are you sure|continue|overwrite)\?.*$|press (?:enter|any key))/im
+
+/**
+ * Conservative shell-grammar probe for an unquoted background operator.
+ *
+ * We only care whether the command can intentionally leave descendants behind
+ * after the shell leader exits. `&&`, quoted ampersands, and bash `&>`/`&>>`
+ * redirections are not background operators. This is deliberately a lexical
+ * safety signal, not a shell parser, so the normal managed process path remains
+ * authoritative for execution.
+ */
+export function hasShellBackgroundOperator(command:string):boolean {
+  let quote:"single"|"double"|undefined
+  let escaped=false
+  for(let i=0;i<command.length;i++){
+    const ch=command[i]
+    if(escaped){ escaped=false; continue }
+    if(quote==="single"){ if(ch==="'") quote=undefined; continue }
+    if(quote==="double"){
+      if(ch==="\\") { escaped=true; continue }
+      if(ch==="\"") quote=undefined
+      continue
+    }
+    if(ch==="\\"){ escaped=true; continue }
+    if(ch==="'"){ quote="single"; continue }
+    if(ch==="\""){ quote="double"; continue }
+    if(ch==="&"){
+      const next=command[i+1]||""
+      if(next==="&" || next===">") { if(next==="&") i++; continue }
+      return true
+    }
+  }
+  return false
+}
 
 export function looksInteractiveLikely(command:string):boolean {
   const first = command.trim().split(/\s+/)[0]?.split('/').pop()?.toLowerCase() || ''
@@ -97,6 +132,7 @@ export interface ManagedShellHandle {
 
 export async function startManagedShell(manager:TaskManager,options:ManagedShellOptions,existingTask?:TaskRecord):Promise<ManagedShellHandle> {
   const task=existingTask || await manager.createShell(options.command,options.cwd,options.parentSessionId,options.scopePaths,{background:options.background,coordinated:options.coordinated,timeoutMs:options.timeout})
+  const shellMayLeaveBackgroundChildren = hasShellBackgroundOperator(options.command)
   if (task.timeoutMs !== options.timeout) { await manager.update(task.id,{timeoutMs:options.timeout}) }
   const outputPath=task.outputPath || manager.outputPath(task.id)
   await fs.mkdir(path.dirname(outputPath),{recursive:true})
@@ -115,6 +151,7 @@ export async function startManagedShell(manager:TaskManager,options:ManagedShell
   let outputLimit=false
   let stdinTimedOut=false
   let settled=false
+  let backgroundChildrenPreserved=false
   let resolveResult:(value:ShellResult)=>void=()=>{}
   const result=new Promise<ShellResult>(resolve=>{resolveResult=resolve})
   const started=Date.now()
@@ -134,7 +171,15 @@ export async function startManagedShell(manager:TaskManager,options:ManagedShell
     if(abortHandler) options.abort?.removeEventListener('abort',abortHandler)
     if (child.pid && !backgrounded && !cancelled && !timedOut && !outputLimit && !stdinTimedOut) {
       const lingering = processGroupAlive(child.pid)
-      if (lingering) {
+      if (lingering && shellMayLeaveBackgroundChildren) {
+        // Shell `&` is explicit process-lifetime syntax. Do not mistake a
+        // healthy background child for an orphan and kill it as part of the
+        // foreground shell cleanup. The command task itself still settles when
+        // its shell leader exits; durable long-lived ownership belongs to the
+        // explicit run_in_background/task process path.
+        backgroundChildrenPreserved=true
+        await manager.event(task.id, 'background_children_preserved', { command:options.command }).catch(()=>{})
+      } else if (lingering) {
         const cleanup = await terminateProcessGroup(child.pid, { graceMs: KILL_GRACE_MS, pollMs: 30 })
         await manager.event(task.id, 'descendant_cleanup', cleanup).catch(()=>{})
       }
@@ -147,9 +192,9 @@ export async function startManagedShell(manager:TaskManager,options:ManagedShell
     // Persist the terminal event before exposing the terminal task status.
     // Callers polling TaskManager use status as the settlement boundary; if the
     // state were written first, a cleanup could race the final event append.
-    await manager.event(task.id,termination==='completed'?'completed':'finished',{exitCode:finalCode,signal:signal||undefined,termination,outputPath,outputBytes:preview.bytes,backgrounded}).catch(()=>{})
-    await manager.finish(task.id,{status:finalStatus,exitCode:finalCode,signal:signal||undefined,termination,output:preview.text,outputPath,outputBytes:preview.bytes,outputTruncated:preview.truncated,backgrounded,timeoutMs:options.timeout}).catch(()=>{})
-    resolveResult({code:finalCode,signal,termination,interrupted:termination==='cancelled'||termination==='timeout'||termination==='signal'||termination==='stdin-timeout',durationMs:Date.now()-started,outputPath,outputBytes:preview.bytes,outputPreview:preview.text,outputTruncated:preview.truncated,interactiveLikely:looksInteractiveLikely(options.command)||PROMPT_OUTPUT.test(preview.text),backgrounded})
+    await manager.event(task.id,termination==='completed'?'completed':'finished',{exitCode:finalCode,signal:signal||undefined,termination,outputPath,outputBytes:preview.bytes,backgrounded,backgroundChildrenPreserved}).catch(()=>{})
+    await manager.finish(task.id,{status:finalStatus,exitCode:finalCode,signal:signal||undefined,termination,output:preview.text,outputPath,outputBytes:preview.bytes,outputTruncated:preview.truncated,backgrounded,backgroundChildrenPreserved,timeoutMs:options.timeout}).catch(()=>{})
+    resolveResult({code:finalCode,signal,termination,interrupted:termination==='cancelled'||termination==='timeout'||termination==='signal'||termination==='stdin-timeout',durationMs:Date.now()-started,outputPath,outputBytes:preview.bytes,outputPreview:preview.text,outputTruncated:preview.truncated,interactiveLikely:looksInteractiveLikely(options.command)||PROMPT_OUTPUT.test(preview.text),backgrounded,backgroundChildrenPreserved})
   }
 
   // Attach process listeners immediately after spawn. A fast command may exit
@@ -192,7 +237,7 @@ export async function startManagedShell(manager:TaskManager,options:ManagedShell
       await manager.update(task.id,{backgrounded:true}).catch(()=>{})
       await manager.event(task.id,'backgrounded',{reason:'auto-timeout',afterMs:options.autoBackgroundMs,outputPath}).catch(()=>{})
       const preview=await readPreview(outputPath,Math.max(1,options.maxPreviewBytes))
-      resolveResult({code:0,signal:null,termination:'completed',interrupted:false,durationMs:Date.now()-started,outputPath,outputBytes:preview.bytes,outputPreview:preview.text,outputTruncated:preview.truncated,interactiveLikely:looksInteractiveLikely(options.command)||PROMPT_OUTPUT.test(preview.text),backgrounded:true})
+      resolveResult({code:0,signal:null,termination:'completed',interrupted:false,durationMs:Date.now()-started,outputPath,outputBytes:preview.bytes,outputPreview:preview.text,outputTruncated:preview.truncated,interactiveLikely:looksInteractiveLikely(options.command)||PROMPT_OUTPUT.test(preview.text),backgrounded:true,backgroundChildrenPreserved:false})
       resolveResult=()=>{}
     },options.autoBackgroundMs); (autoBgId as any).unref?.()
   }

@@ -87,6 +87,16 @@ retry. The shell is terminated using the same process-group lifecycle.
 A new `stdin-timeout` termination state is persisted alongside the existing
 termination reasons.
 
+## 13N-J-C addendum — shell background ownership and semantic loop scope
+
+The 2026-10-03 Termux trace exposed two interactions at the service-start boundary. First, a successful `sh -lc '... & ...'` shell can finish while the intentionally backgrounded child remains alive. The managed runner therefore recognizes explicit shell background syntax and preserves that descendant after a successful shell-leader exit, matching the useful OpenCode process-group behavior observed in the pinned `cross-spawn-spawner.ts`: successful completion does not trigger group cleanup merely because descendants may still exist. Cleanup remains active for ordinary foreground completion, cancellation, timeout, output-limit, and stdin-timeout paths.
+
+Second, the trace showed that exploration no-progress state could remain active after earlier repository reads and then classify distinct later bash rounds as stagnant. TermAgent now keeps semantic no-progress accounting on exploration/state rounds and prevents operational shell/write rounds from inheriting that streak. This does not relax exact repeated-call safety.
+
+The shell result contract also carries `backgroundChildrenPreserved` and `addressInUse`. A detected `EADDRINUSE` is surfaced both as metadata and a model-facing instruction to inspect/reuse the endpoint before another launch.
+
+Upstream references studied for this correction: OpenCode `packages/core/src/tool/bash.ts` and `packages/core/src/cross-spawn-spawner.ts` at revision `7945de208964a49300d7f770d1a71d078db9a4c4`, plus LaudaCode `src/processes.rs` and `src/tools.rs` at revision `f8906ce9da3b11c83fca4b296e0a90f5c7d39110`.
+
 ## Verification
 
 - `npm run build` → **PASS**
@@ -94,6 +104,8 @@ termination reasons.
 - 13E shell/process regressions → **13/13 PASS**
 - 13I task regressions → **11/11 PASS**
 - Combined process/task gate → **32/32 PASS**
+
+Focused 13N-J-C regression coverage now includes the real bash/server lifecycle: an intentionally backgrounded service survives the shell boundary, a later health check can reuse it, and a duplicate launch returns structured `EADDRINUSE` guidance.
 
 The aggregate repository `npm test` command remains a separate known gate
 because the existing provider-manager test process can fail to terminate.

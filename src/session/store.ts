@@ -4,6 +4,7 @@ import crypto from 'node:crypto'
 import { ensureDir } from '../util/fs.js'
 import { SnapshotStore } from './snapshot.js'
 import { enrichStoredEvent, toDurableEventEnvelope, legacyEventKind, legacyEventCategory } from '../protocol/session-events.js'
+import { SessionEventBus } from './event-bus.js'
 import type { CommandReceipt, DurableEventEnvelope, EventCategory, EventKind, InteractionRequestState, PermissionRequestState, QuestionRequestState, PermissionResolution, QuestionResolution } from '../protocol/types.js'
 import { firstWriterWins } from '../protocol/types.js'
 import { canonicalJson } from '../util/canonical.js'
@@ -22,7 +23,8 @@ export class SessionStore {
   readonly root:string
   private snapshots = new Map<string, SnapshotStore>()
   private mutationDepth = new Map<string, number>()
-  constructor(root=path.join(process.env.HOME||process.cwd(),'.termagent','sessions')) { this.root=root }
+  readonly events?: SessionEventBus
+  constructor(root=path.join(process.env.HOME||process.cwd(),'.termagent','sessions'), eventBus?: SessionEventBus) { this.root=root; this.events=eventBus }
   private snapshotStore(cwd:string, id:string) {
     let store=this.snapshots.get(id)
     if(!store){ store=new SnapshotStore({root:cwd,storeRoot:path.join(path.dirname(this.root),'snapshots',id)}); this.snapshots.set(id,store) }
@@ -212,6 +214,7 @@ export class SessionStore {
     const sequence=await this.nextDurableSequence(id)
     const enriched=enrichStoredEvent(id,event,sequence)
     await fs.appendFile(this.file(id),JSON.stringify(enriched)+'\n')
+    this.events?.publishDurable(toDurableEventEnvelope(id,enriched,sequence))
     return enriched
   }
 

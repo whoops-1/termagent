@@ -3,6 +3,7 @@ import { URL } from 'node:url'
 import crypto from 'node:crypto'
 import type { Runtime } from './runtime.js'
 import { VERSION } from '../version.js'
+import { toLiveEventEnvelope } from '../protocol/session-events.js'
 
 function json(res:any,status:number,data:any){const body=JSON.stringify(data);res.statusCode=status;res.setHeader('Content-Type','application/json; charset=utf-8');res.setHeader('Content-Length',Buffer.byteLength(body));res.end(body)}
 function text(res:any,status:number,data:string,contentType='text/plain; charset=utf-8'){res.statusCode=status;res.setHeader('Content-Type',contentType);res.end(data)}
@@ -14,26 +15,81 @@ function errorStatus(error:unknown){return error instanceof Error && /^Session i
 
 async function streamSessionEvents(runtime:Runtime,id:string,res:any,after:number){
   sseHeaders(res)
-  let cursor=Math.max(0,Math.floor(after));
-  let closed=false
-  sse(res,'ready',{sessionId:id,offset:cursor})
-  const heartbeat=setInterval(()=>{if(!closed)sse(res,'heartbeat',{ts:Date.now()})},15000)
-  const poll=async()=>{
-    if(closed)return
-    try{
-      const snapshot=await runtime.store.load(id)
-      const events=snapshot.events
-      if(cursor>events.length)cursor=events.length
-      for(const event of events.slice(cursor)){sse(res,'event',{offset:cursor,event});cursor++}
-      if(!closed)setTimeout(poll,250)
-    }catch(error){
-      if(!closed){sse(res,'error',{message:(error as Error).message});res.end();closed=true}
-    }
+  const cursorInput=Number(after)
+  if(!Number.isSafeInteger(cursorInput) || cursorInput<0){
+    sse(res,'error',{version:1,sessionId:id,code:'invalid-cursor',message:'Invalid durable event cursor'})
+    res.end()
+    return
   }
-  const cleanup=()=>{closed=true;clearInterval(heartbeat)}
+
+  let cursor=cursorInput
+  let closed=false
+  let latestSequence=cursorInput
+  const subscription=runtime.events?.subscribe(id)
+  const heartbeat=setInterval(()=>{
+    if(closed)return
+    void runtime.store.currentSequence(id).then(sequence=>{
+      if(closed)return
+      latestSequence=sequence
+      sse(res,'heartbeat',{type:'heartbeat',version:1,sessionId:id,timestamp:Date.now(),currentSequence:sequence})
+    }).catch(()=>{})
+  },15000)
+  const cleanup=()=>{
+    if(closed)return
+    closed=true
+    subscription?.close()
+  }
   res.on('close',cleanup)
   res.on('error',cleanup)
-  void poll()
+
+  try{
+    const current=await runtime.store.currentSequence(id)
+    if(cursor>current){
+      sse(res,'error',{version:1,sessionId:id,code:'invalid-cursor',message:`Cursor ${cursor} is ahead of current durable sequence ${current}`})
+      res.end()
+      cleanup()
+      return
+    }
+
+    sse(res,'connection',toLiveEventEnvelope(id,`conn_${crypto.randomBytes(8).toString('hex')}`,'runtime.connection.changed',{state:'connected'}))
+    sse(res,'ready',{
+      type:'ready',
+      version:1,
+      sessionId:id,
+      currentSequence:current,
+      replayAfter:cursor,
+      snapshotRequired:false,
+    })
+
+    const replay=async()=>{
+      while(!closed){
+        const page=await runtime.store.durableEvents(id,cursor,100)
+        for(const event of page.events){
+          if(closed)return
+          sse(res,'event',event)
+          cursor=event.sequence
+          latestSequence=event.sequence
+        }
+        if(!page.hasMore)return
+      }
+    }
+
+    await replay()
+    while(!closed){
+      // The subscription is installed before replay begins. A commit racing
+      // historical reads therefore sets the dirty bit and cannot fall into a
+      // replay→sleep gap. The wake carries no event payload: durable storage
+      // is queried again by sequence, so coalescing remains lossless.
+      await (subscription?.waitForChange() ?? new Promise(resolve=>setTimeout(resolve,30000)))
+      await replay()
+    }
+  }catch(error){
+    if(!closed)sse(res,'error',{version:1,sessionId:id,code:'server-error',message:(error as Error).message})
+    if(!closed)res.end()
+  }finally{
+    clearInterval(heartbeat)
+    cleanup()
+  }
 }
 
 export async function startServer(runtime:Runtime,opts:{host:string;port:number;token?:string}):Promise<any>{
@@ -62,6 +118,7 @@ export async function startServer(runtime:Runtime,opts:{host:string;port:number;
         if(req.method==='GET'&&parts[4]==='diff'){const diff=await (await import('../diff/render.js')).renderGitDiff(runtime.cwd,{staged:u.searchParams.get('staged')==='1',color:false,maxBytes:runtime.cfg.maxOutputBytes});return json(res,200,diff)}
         if(req.method==='POST'&&(parts[4]==='interrupt'||parts[4]==='abort')){const interrupted=runtime.interrupt(id);return json(res,interrupted?202:409,{sessionId:id,interrupted})}
         if(req.method==='GET'&&parts[4]==='context')return json(res,200,await runtime.contextSnapshot(id))
+        if(req.method==='GET'&&parts[4]==='snapshot'){const x=await runtime.store.load(id);return json(res,200,{version:1,sessionId:id,sequence:await runtime.store.currentSequence(id),revision:await runtime.store.revision(id),capturedAt:Date.now(),state:{meta:x.meta,messages:x.messages,pendingInteractions:await runtime.store.pendingInteractions(id),context:await runtime.contextSnapshot(id)}})}
         if(req.method==='GET'&&parts[4]==='checkpoints')return json(res,200,{checkpoints:await runtime.store.listCheckpoints(id)})
         if(req.method==='POST'&&parts[4]==='checkpoints'&&parts[5]&&parts[6]==='restore')return json(res,200,await runtime.store.restoreCheckpoint(id,decodeURIComponent(parts[5])))
         if(req.method==='POST'&&parts[4]==='checkpoints'&&parts[5]&&parts[6]==='branch'){const b=await body(req);return json(res,201,await runtime.store.forkFromCheckpoint(id,decodeURIComponent(parts[5]),{restoreWorkspace:Boolean(b.restoreWorkspace)}))}
