@@ -10,10 +10,10 @@ import { IGNORED_DIRECTORIES } from '../tools/filesystem-search.js'
 const DEFAULT_IGNORES = new Set([...IGNORED_DIRECTORIES, 'coverage', '.turbo', '.termagent'])
 const TEXT_EXTENSIONS = new Set(['.ts','.tsx','.js','.jsx','.mjs','.cjs','.json','.jsonc','.md','.mdx','.txt','.yml','.yaml','.toml','.ini','.env','.sh','.bash','.zsh','.py','.pyi','.go','.rs','.java','.kt','.kts','.c','.h','.cc','.cpp','.hpp','.cs','.php','.rb','.swift','.sql','.html','.css','.scss','.sass','.vue','.svelte','.xml','.gradle','.properties'])
 const IMPORTANT_FILES = new Set(['package.json','tsconfig.json','vite.config.ts','vite.config.js','next.config.js','next.config.mjs','README.md','AGENTS.md','CLAUDE.md','TERMAGENT.md','Cargo.toml','pyproject.toml','go.mod','pom.xml','build.gradle','Makefile','.env.example'])
-const CACHE_VERSION=3
+const CACHE_VERSION=4
 
 type CachedEntry = RepoFile & { analysis:FileAnalysis }
-type CachePayload = { version:number; root:string; files:CachedEntry[]; savedAt:number }
+type CachePayload = { version:number; root:string; files:CachedEntry[]; savedAt:number; edges?:RepoEdge[]; ranks?:Record<string,number>; fingerprint?:string }
 
 export type RepoFile = { path:string; size:number; mtime:number; ctime:number; ext:string; kind:'source'|'config'|'doc'|'test'|'other'; structural:number; symbols:SymbolInfo[] }
 export type RepoEdge = { from:string; to:string; weight:number; symbols:string[] }
@@ -175,12 +175,25 @@ export async function buildRepositoryMap(root:string):Promise<RepositoryMap> {
       files.push({path:rel,size:st.size,mtime:st.mtimeMs,ctime:st.ctimeMs,ext,kind,structural:0,symbols:analysis.symbols,analysis})
     }catch{}
   }
-  files.sort((a,b)=>a.path.localeCompare(b.path));const edges=buildEdges(files);const ranks=structuralRank(files.map(f=>f.path),edges);for(const f of files)f.structural=ranks.get(f.path)||0
+  files.sort((a,b)=>a.path.localeCompare(b.path))
+  const fingerprint=files.map(f=>`${f.path}\0${f.size}\0${f.mtime}\0${f.ctime}`).join('\n')
+  const fullHit=files.length>0&&hit===paths.length
+  const reuseGraph=fullHit&&old?.version===CACHE_VERSION&&old.root===cwd&&Array.isArray(old.edges)&&old.fingerprint===fingerprint&&typeof old.ranks==='object'&&old.ranks!==null
+  let edges:RepoEdge[]
+  let ranks:Map<string,number>
+  if(reuseGraph){
+    edges=old.edges!
+    ranks=new Map(Object.entries(old.ranks!))
+  } else {
+    edges=buildEdges(files)
+    ranks=structuralRank(files.map(f=>f.path),edges)
+  }
+  for(const f of files)f.structural=ranks.get(f.path)||0
   const languages:Record<string,number>={};const important:string[]=[]
   for(const f of files){if(f.kind==='source'||f.kind==='test')languages[f.ext||'<no extension>']=(languages[f.ext||'<no extension>']||0)+1;if(IMPORTANT_FILES.has(path.basename(f.path))||IMPORTANT_FILES.has(f.path))important.push(f.path)}
   const status=await gitStatus(cwd);const topLang=Object.entries(languages).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>`${k}:${v}`).join(', ');const symbolCount=files.reduce((n,f)=>n+f.symbols.length,0)
   const summary=`${files.length} searchable files; ${symbolCount} symbols; ${edges.length} reference edges; ${topLang||'no recognized source files'}; ${status.length} git changes`
-  const payload:CachePayload={version:CACHE_VERSION,root:cwd,files:files.map(f=>({...f,analysis:f.analysis})),savedAt:Date.now()};await writeCache(cacheFile,payload).catch(()=>{})
+  const payload:CachePayload={version:CACHE_VERSION,root:cwd,files:files.map(f=>({...f,analysis:f.analysis})),savedAt:Date.now(),edges,ranks:Object.fromEntries(ranks),fingerprint};await writeCache(cacheFile,payload).catch(()=>{})
   return {root:cwd,generatedAt:Date.now(),files:files.map(f=>({path:f.path,size:f.size,mtime:f.mtime,ctime:f.ctime,ext:f.ext,kind:f.kind,structural:f.structural,symbols:f.symbols})),languages,important:[...new Set(important)].sort(),gitStatus:status,summary,edges,cache:{hit,miss,path:cacheFile}}
 }
 

@@ -1,6 +1,6 @@
 import path from 'node:path'
 
-export type SymbolKind = 'function'|'class'|'interface'|'type'|'enum'|'variable'|'method'
+export type SymbolKind = 'function'|'class'|'interface'|'type'|'enum'|'variable'|'method'|'heading'
 export type Reference = { name:string; line:number; kind:'import'|'call'|'usage' }
 export type SymbolInfo = { name:string; kind:SymbolKind; line:number; signature:string }
 export type FileAnalysis = {
@@ -113,10 +113,28 @@ function analyzePython(text:string):FileAnalysis {
   return {path:'',language:'python',symbols:symbols.slice(0,MAX_SYMBOLS_PER_FILE),references:references.slice(0,MAX_REFERENCES_PER_FILE),imports:imports.slice(0,MAX_IMPORTS_PER_FILE)}
 }
 
+function analyzeMarkdown(text:string):FileAnalysis {
+  const symbols:SymbolInfo[]=[]; const seen=new Set<string>()
+  const lines=text.split(/\r?\n/)
+  const headingRe=/^(#{1,6})\s+(.+?)\s*#*\s*$/
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i]
+    const heading=line.match(headingRe)
+    if(!heading) continue
+    const raw=heading[2]!.trim()
+    const name=raw.replace(/[*_`]/g,'').replace(/\s+/g,' ')
+    if(!name) continue
+    addSymbol(symbols,seen,{name,kind:'heading',line:i+1,signature:cleanSignature(`# ${name}`)})
+  }
+  return {path:'',language:'unknown',symbols:symbols.slice(0,MAX_SYMBOLS_PER_FILE),references:[],imports:[]}
+}
+
 export function analyzeSource(file:string,text:string):FileAnalysis {
   const language=languageFor(file)
   if(language==='typescript'||language==='javascript'){const result=analyzeJavaScript(text);result.path=file;result.language=language;return result}
   if(language==='python'){const result=analyzePython(text);result.path=file;return result}
+  const ext=path.extname(file).toLowerCase()
+  if(ext==='.md'||ext==='.mdx'){const result=analyzeMarkdown(text);result.path=file;return result}
   return {path:file,language,symbols:[],references:[],imports:[]}
 }
 

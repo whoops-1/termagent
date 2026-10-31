@@ -72,8 +72,32 @@ The Phase 16 gate (explicit decisions, no complexity-only degradation, canonical
 - `tests/tools.test.mjs`, `tests/phase13k-tool-architecture.test.mjs`, `tests/phase5-parity.test.mjs` (isolated), `tests/server.test.mjs`: PASS.
 - Known pre-existing baseline failures unrelated to 16B remain as documented in `TODO.md` (e.g. `tests/phase3-execution.test.mjs` still asserts the legacy `status:'failed'` for a verification timeout, while the durable-task `verify` now reports `status:'timeout'`; `verify.ts` is unchanged by 16B).
 
+## 16D implementation
+
+### Changes
+
+- `src/context/repository.ts` — cache payload bumped to version 4 and now persists the computed reference `edges`, per-file `structural` ranks, and a deterministic file-set `fingerprint`. On a full cache hit (every listed file reused unchanged), the persisted graph is reused directly instead of recomputing edges and ranks; any single-file change invalidates only that file's analysis and rebuilds the graph in the normal bounded path. This gives dependency/reference graph persistence plus incremental invalidation for the common unchanged-tree case.
+- `src/context/symbols.ts` — new `heading` symbol kind; Markdown (`.md`/`.mdx`) files now produce heading symbols (ATX headings, emphasis stripped), so documentation structure participates in symbol scoring and repository-map output.
+
+### Tests
+
+`tests/phase16d-repository.test.mjs` (6 cases): cache payload persistence (version 4, edges, ranks, fingerprint), unchanged-tree warm path reuse with identical edges/structural values and zero misses, single-file-change reparse (miss 1) with correct rebuilt edges, invalidation cold rebuild, markdown heading symbols at exact lines, and `analyzeSource` markdown extraction.
+
+### Verification evidence
+
+- Production build: `tsc -p tsconfig.json` PASS.
+- `tests/phase16d-repository.test.mjs`: 6/6 PASS.
+- `tests/context.test.mjs` (7/7) and `tests/tools.test.mjs` PASS.
+- `tests/phase2-context.test.mjs`: 42/45 PASS; the 3 failures are pre-existing baseline issues (tests build `new ToolRegistry()` without a `PermissionGate`, so `ToolRegistry.selectSchemas` dereferences `gate.isStaticallyDenied` on undefined). The identical TypeError was reproduced against the pre-16D baseline (HEAD at the 16B commit), confirming they are not regressions from 16D.
+
+### Remaining 16D work
+
+- Recent-session evidence fusion into retrieval (currently lexical + structural + symbol + content + graph boosting).
+- Additional language coverage beyond TS/JS/Python and Markdown headings (e.g. JSON/YAML key symbols), and a generic fallback parser.
+- Agent-level use of exploration state to avoid redundant reads/searches (ties into the existing exploration guidance layer).
+
 ## Remaining Phase 16 work
 
 - 16B follow-ups: optional durable out-of-band retention of complete bodies (currently only bounded inline previews are kept), websearch response caching, and richer network result context projection.
 - 16A LSP, 16C notebook, 16E memory: deferred by explicit decision above (recorded prerequisites).
-- 16D structural intelligence and 16F provider maturity: incremental slices to be scheduled as the next Phase 16 sub-phases.
+- 16D follow-ups and 16F provider maturity: incremental slices as listed above; schedule them as the next Phase 16 sub-phases.

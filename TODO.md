@@ -882,11 +882,13 @@ Phase 16 is open. 16B (web tools) is implemented and regression-tested. Explicit
 
 ### 16D — Structural repository intelligence
 
-- [ ] Reassess the current symbol/reference graph against the latest internal implementation approaches.
-- [ ] Improve language coverage and parser fallbacks.
-- [ ] Add dependency/reference graph persistence and incremental invalidation.
-- [ ] Fuse lexical, structural, symbol, and recent-session evidence.
-- [ ] Use exploration state to avoid redundant reads/searches.
+- [verified] Reassess the current symbol/reference graph against the latest internal implementation approaches; decision recorded in `docs/research/PHASE16-START.md` (adapt incrementally from the existing cached graph).
+- [impl] Improve language coverage and parser fallbacks (Markdown heading symbols added; JSON/YAML/generic fallback still open).
+- [verified] Add dependency/reference graph persistence and incremental invalidation (cache v4 persists edges/ranks/fingerprint; unchanged-tree builds reuse the persisted graph).
+- [impl] Fuse lexical, structural, symbol, and recent-session evidence (lexical+structural+symbol+content+graph fusion exists; recent-session fusion still open).
+- [ ] Use exploration state to avoid redundant reads/searches (agent-level; deferred within 16D).
+
+**16D status:** Repository graph persistence/incremental invalidation and Markdown heading symbols are implemented and regression-tested. See `docs/research/PHASE16-START.md` for design, tests, and verification evidence.
 
 ### 16E — Memory and project knowledge
 
