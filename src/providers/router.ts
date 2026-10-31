@@ -1,4 +1,4 @@
-import type { Provider, ProviderConfig, StreamEvent } from './types.js'
+import { blankCapabilities, type Provider, type ProviderCapabilities, type ProviderConfig, type StreamEvent } from './types.js'
 import type { ChatMessage } from '../session/store.js'
 import type { ToolRegistry } from '../tools/registry.js'
 import { isRetryableError } from '../agent/retry.js'
@@ -11,6 +11,7 @@ export class ProviderRouter implements Provider {
   readonly id='router'
   readonly model:string
   readonly config:any
+  readonly capabilities: ProviderCapabilities
   private role='default'
   private turnNumber=0
   private decision:RoutingDecision|null=null
@@ -19,6 +20,7 @@ export class ProviderRouter implements Provider {
     if(!providers.length&&!Object.values(roles).some(x=>x?.length))throw new Error('No providers configured')
     const first=providers[0]||Object.values(roles).flat().find(Boolean)!
     this.model=first.model;this.config=first.config
+    this.capabilities=first.capabilities||blankCapabilities()
   }
   setRole(role:string){this.role=role||'default'}
   setTurnContext(input:{userText:string;turnNumber?:number;hasNonTextContent?:boolean}){

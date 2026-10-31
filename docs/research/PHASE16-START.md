@@ -96,8 +96,25 @@ The Phase 16 gate (explicit decisions, no complexity-only degradation, canonical
 - Additional language coverage beyond TS/JS/Python and Markdown headings (e.g. JSON/YAML key symbols), and a generic fallback parser.
 - Agent-level use of exploration state to avoid redundant reads/searches (ties into the existing exploration guidance layer).
 
+## 16F implementation
+
+### Changes
+
+- Provider capability metadata: `ProviderCapabilities` added to the `Provider` contract (`streaming`, `toolCalls`, `supportsToolCallIds`, `reasoning`, `structuredOutput`) with honest per-adapter values; `ProviderRouter` mirrors the primary candidate's capabilities; the server `/api/v1/info` endpoint exposes them. This gives downstream routing/UI a transport-neutral capability view without provider-specific branches.
+- Deterministic recorder/replay: `src/providers/recorder.ts` records any provider stream (deltas, tool calls, `done`, errors) to a JSONL fixture and replays it through a `replay` Provider. Static deterministic fixture: `tests/fixtures/provider-replay-sample.jsonl`.
+
+### Tests
+
+`tests/phase16f-provider.test.mjs` (5 cases): adapter/router capability metadata; record → file → replay round-trip determinism (byte-identical across runs); static fixture replay exactness; error capture/rethrow on replay; abort between events.
+
+### Reassessment notes
+
+- Streaming/retry/cancellation were already hardened in Phase 13N-F (typed HTTP errors, `Retry-After`, stream-idle watchdog, cancellation-aware retries).
+- Gemini function calls carry no stable id (`gemini_${Date.now()}`); `supportsToolCallIds=false` documents this honestly. A future fix could assign session-stable call ids inside the adapter.
+- WebSocket provider transport remains deferred with an explicit decision: it is only worth adding behind the provider-neutral contract where a real provider benefits from it, and no built-in provider currently requires it.
+
 ## Remaining Phase 16 work
 
 - 16B follow-ups: optional durable out-of-band retention of complete bodies (currently only bounded inline previews are kept), websearch response caching, and richer network result context projection.
 - 16A LSP, 16C notebook, 16E memory: deferred by explicit decision above (recorded prerequisites).
-- 16D follow-ups and 16F provider maturity: incremental slices as listed above; schedule them as the next Phase 16 sub-phases.
+- 16D follow-ups (recent-session evidence fusion; JSON/YAML/generic parser coverage) and optional WebSocket provider transport remain as later Phase 16 work.

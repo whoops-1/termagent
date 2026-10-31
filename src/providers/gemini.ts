@@ -4,7 +4,7 @@ import type { Provider, ProviderConfig, StreamEvent } from './types.js'
 import { ProviderHttpError, responseHeaders } from './errors.js'
 
 export class GeminiProvider implements Provider {
-  readonly id='gemini'; readonly model:string; readonly config:ProviderConfig
+  readonly id='gemini'; readonly model:string; readonly config:ProviderConfig; readonly capabilities={streaming:true,toolCalls:true,supportsToolCallIds:false,reasoning:true,structuredOutput:false}
   constructor(private cfg:ProviderConfig){this.model=cfg.model;this.config=cfg}
   async *stream(messages:ChatMessage[],tools:ReturnType<ToolRegistry['schemas']>,signal:AbortSignal):AsyncGenerator<StreamEvent>{
     if(!this.cfg.apiKey)throw new Error('No Gemini API key configured.')

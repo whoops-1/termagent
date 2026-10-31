@@ -5,7 +5,7 @@ import { sseLines } from './sse.js'
 import { ProviderHttpError, responseHeaders } from './errors.js'
 
 export class AnthropicProvider implements Provider {
-  readonly id='anthropic'; readonly model:string; readonly config:ProviderConfig
+  readonly id='anthropic'; readonly model:string; readonly config:ProviderConfig; readonly capabilities={streaming:true,toolCalls:true,supportsToolCallIds:true,reasoning:true,structuredOutput:false}
   constructor(private cfg:ProviderConfig){this.model=cfg.model;this.config=cfg}
   async *stream(messages:ChatMessage[],tools:ReturnType<ToolRegistry['schemas']>,signal:AbortSignal):AsyncGenerator<StreamEvent>{
     if(!this.cfg.apiKey)throw new Error('No Anthropic API key configured.')

@@ -900,10 +900,12 @@ Phase 16 is open. 16B (web tools) is implemented and regression-tested. Explicit
 
 ### 16F — Provider protocol maturity
 
-- [ ] Reassess streaming, retries, cancellation, structured outputs, tool-call IDs, and provider capability metadata against current design implementations.
-- [ ] Add transport-specific adapters only behind the provider-neutral contract.
-- [ ] Add deterministic recorder/replay fixtures for provider streams.
-- [ ] Revisit WebSocket provider transports where a real provider benefits from them.
+- [verified] Reassess streaming, retries, cancellation, structured outputs, tool-call IDs, and provider capability metadata against current design implementations; findings recorded in `docs/research/PHASE16-START.md` (13N-F hardened the streaming/retry/cancellation layer; Gemini's non-stable tool-call ids are now documented via `supportsToolCallIds=false`).
+- [verified] Keep transport-specific adapters behind the provider-neutral contract; provider capability metadata was added to the contract and exposed through the server info endpoint.
+- [verified] Add deterministic recorder/replay fixtures for provider streams (`src/providers/recorder.ts` + `tests/fixtures/provider-replay-sample.jsonl`).
+- [ ] Revisit WebSocket provider transports where a real provider benefits from them (explicitly deferred; no built-in provider requires it yet).
+
+**16F status:** Provider capability metadata and deterministic recorder/replay are implemented and regression-tested. See `docs/research/PHASE16-START.md` for design, tests, and verification evidence.
 
 ### Phase 16 gate
 

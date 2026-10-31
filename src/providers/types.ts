@@ -9,4 +9,17 @@ export type StreamEvent =
   | { type:'done'; finishReason?:string }
 
 export interface ProviderConfig { provider?:string; model:string; apiKey?:string; apiKeyEnv?:string; baseUrl:string; temperature?:number; maxTokens?:number; variant?:string; reasoningEffort?:'low'|'medium'|'high'|'max'; streamIdleTimeoutMs?:number; extra?:Record<string,unknown> }
-export interface Provider { readonly id:string; readonly model:string; readonly config?:ProviderConfig; setRole?(role:string):void; setTurnContext?(input:{userText:string;turnNumber?:number;hasNonTextContent?:boolean}):void; stream(messages:ChatMessage[], tools:ReturnType<ToolRegistry['schemas']>, signal:AbortSignal): AsyncGenerator<StreamEvent> }
+
+export interface ProviderCapabilities {
+  streaming: boolean
+  toolCalls: boolean
+  supportsToolCallIds: boolean
+  reasoning: boolean
+  structuredOutput: boolean
+}
+
+export function blankCapabilities(): ProviderCapabilities {
+  return { streaming: false, toolCalls: false, supportsToolCallIds: false, reasoning: false, structuredOutput: false }
+}
+
+export interface Provider { readonly id:string; readonly model:string; readonly config?:ProviderConfig; readonly capabilities:ProviderCapabilities; setRole?(role:string):void; setTurnContext?(input:{userText:string;turnNumber?:number;hasNonTextContent?:boolean}):void; stream(messages:ChatMessage[], tools:ReturnType<ToolRegistry['schemas']>, signal:AbortSignal): AsyncGenerator<StreamEvent> }

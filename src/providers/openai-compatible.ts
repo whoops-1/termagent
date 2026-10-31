@@ -7,7 +7,7 @@ import { ProviderHttpError, responseHeaders } from './errors.js'
 export type { Provider, StreamEvent }
 
 export class OpenAICompatibleProvider implements Provider {
-  readonly id='openai-compatible'; readonly model:string; readonly config:ProviderConfig
+  readonly id='openai-compatible'; readonly model:string; readonly config:ProviderConfig; readonly capabilities={streaming:true,toolCalls:true,supportsToolCallIds:true,reasoning:true,structuredOutput:false}
   constructor(private cfg:ProviderConfig){this.model=cfg.model;this.config=cfg}
   async *stream(messages:ChatMessage[],tools:ReturnType<ToolRegistry['schemas']>,signal:AbortSignal):AsyncGenerator<StreamEvent>{
     if(!this.cfg.model) throw new Error('No model configured. Set TERMAGENT_MODEL.')
