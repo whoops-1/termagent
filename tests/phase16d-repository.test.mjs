@@ -115,3 +115,48 @@ test('16D analyzeSource extracts markdown headings and strips emphasis', () => {
   ])
   assert.equal(analysis.references.length, 0)
 })
+
+test('16D language coverage: JSON top-level keys become variable symbols', () => {
+  const analysis = analyzeSource('config.json', '{\n  "name": "termagent",\n  "scripts": {\n    "build": "tsc",\n    "test": "node --test"\n  },\n  "compilerOptions": { "strict": true }\n}\n')
+  assert.equal(analysis.language, 'json')
+  assert.deepEqual(analysis.symbols.map(symbol => [symbol.name, symbol.kind, symbol.line]), [
+    ['name', 'variable', 2],
+    ['scripts', 'variable', 3],
+    ['compilerOptions', 'variable', 7],
+  ])
+})
+
+test('16D language coverage: JSONC comments and string braces are ignored safely', () => {
+  const analysis = analyzeSource('config.jsonc', '{\n  // line comment\n  "name": "a { b } c",\n  "obj": { "nested": 1 },\n  /* block comment */\n  "enabled": true\n}\n')
+  const symbols = analysis.symbols.map(symbol => symbol.name)
+  assert.deepEqual(symbols, ['name', 'obj', 'enabled'])
+})
+
+test('16D language coverage: YAML top-level keys become variable symbols', () => {
+  const analysis = analyzeSource('config.yaml', 'name: termagent\nversion: 1.18.0\n---\nignored: true\nserver:\n  host: localhost\n  port: 4096\n- list-item: nope\n')
+  assert.equal(analysis.language, 'yaml')
+  assert.deepEqual(analysis.symbols.map(symbol => [symbol.name, symbol.kind, symbol.line]), [
+    ['name', 'variable', 1],
+    ['version', 'variable', 2],
+    ['ignored', 'variable', 4],
+    ['server', 'variable', 5],
+  ])
+})
+
+test('16D repository map surfaces JSON and YAML key symbols on config files', async () => {
+  const root = await temp('termagent-p16d-config-symbols-')
+  await writeProject(root)
+  await writeFile(path.join(root, 'app.json'), '{\n  "name": "app",\n  "build": { "command": "tsc" }\n}\n')
+  await writeFile(path.join(root, 'deploy.yaml'), 'region: us-east-1\nimage: termagent:v1\n')
+  await invalidateRepositoryCache(root)
+  try {
+    const map = await buildRepositoryMap(root)
+    const appJson = map.files.find(file => file.path === 'app.json')
+    const deployYaml = map.files.find(file => file.path === 'deploy.yaml')
+    assert.ok(appJson)
+    assert.ok(deployYaml)
+    assert.deepEqual(appJson.symbols.map(symbol => symbol.name), ['name', 'build'])
+    assert.deepEqual(deployYaml.symbols.map(symbol => symbol.name), ['region', 'image'])
+    assert.ok(map.edges.some(edge => edge.from === 'src/main.py' && edge.to === 'src/helper.py'))
+  } finally { await cleanup(root) }
+})

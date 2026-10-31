@@ -5,7 +5,7 @@ export type Reference = { name:string; line:number; kind:'import'|'call'|'usage'
 export type SymbolInfo = { name:string; kind:SymbolKind; line:number; signature:string }
 export type FileAnalysis = {
   path:string
-  language:'typescript'|'javascript'|'python'|'unknown'
+  language:'typescript'|'javascript'|'python'|'json'|'yaml'|'unknown'
   symbols:SymbolInfo[]
   references:Reference[]
   imports:{ name:string; source:string; imported?:string }[]
@@ -13,6 +13,8 @@ export type FileAnalysis = {
 
 const JS_EXTS = new Set(['.ts','.tsx','.js','.jsx','.mjs','.cjs'])
 const PY_EXTS = new Set(['.py'])
+const JSON_EXTS = new Set(['.json','.jsonc'])
+const YAML_EXTS = new Set(['.yaml','.yml'])
 const MAX_SYMBOLS_PER_FILE=1000
 const MAX_REFERENCES_PER_FILE=4000
 const MAX_IMPORTS_PER_FILE=400
@@ -21,6 +23,8 @@ function languageFor(file:string):FileAnalysis['language'] {
   const ext=path.extname(file).toLowerCase()
   if(JS_EXTS.has(ext)) return ext.startsWith('.ts') ? 'typescript' : 'javascript'
   if(PY_EXTS.has(ext)) return 'python'
+  if(JSON_EXTS.has(ext)) return 'json'
+  if(YAML_EXTS.has(ext)) return 'yaml'
   return 'unknown'
 }
 
@@ -113,6 +117,76 @@ function analyzePython(text:string):FileAnalysis {
   return {path:'',language:'python',symbols:symbols.slice(0,MAX_SYMBOLS_PER_FILE),references:references.slice(0,MAX_REFERENCES_PER_FILE),imports:imports.slice(0,MAX_IMPORTS_PER_FILE)}
 }
 
+function stripJsonComments(text:string):string {
+  const out:string[]=[]; let i=0; const n=text.length; let inStr=false; let esc=false
+  while(i<n){
+    const ch=text[i]
+    if(inStr){
+      out.push(ch)
+      if(esc)esc=false
+      else if(ch==='\\')esc=true
+      else if(ch==='"')inStr=false
+      i++; continue
+    }
+    if(ch==='"'){inStr=true;out.push(ch);i++;continue}
+    if(ch==='/'&&text[i+1]==='/'){while(i<n&&text[i]!=='\n')i++;continue}
+    if(ch==='/'&&text[i+1]==='*'){i+=2;while(i+1<n&&!(text[i]==='*'&&text[i+1]==='/'))i++;i+=2;continue}
+    out.push(ch);i++
+  }
+  return out.join('')
+}
+
+function lineIndexForOffset(lineOffsets:number[],offset:number):number {
+  let lo=0,hi=lineOffsets.length-1
+  while(lo<hi){const mid=(lo+hi+1)>>1;if(lineOffsets[mid]!<=offset)lo=mid;else hi=mid-1}
+  return lo
+}
+
+function analyzeJson(text:string):FileAnalysis {
+  const clean=stripJsonComments(text)
+  const lineOffsets:number[]=[];let offset=0
+  for(const line of clean.split('\n')){lineOffsets.push(offset);offset+=line.length+1}
+  const symbols:SymbolInfo[]=[];const seen=new Set<string>()
+  let depth=0;let i=0;const n=clean.length;let inStr=false;let esc=false
+  while(i<n){
+    const ch=clean[i]
+    if(inStr){
+      if(esc)esc=false
+      else if(ch==='\\')esc=true
+      else if(ch==='"')inStr=false
+      i++;continue
+    }
+    if(ch==='"'){
+      let j=i+1;let key='';let e=false
+      while(j<n){const c=clean[j];if(e){key+=c;e=false}else if(c==='\\')e=true;else if(c==='"')break;else key+=c;j++}
+      let k=j+1;while(k<n&&/\s/.test(clean[k]))k++
+      if(clean[k]===':'&&depth===1&&key&&!seen.has(key)){
+        seen.add(key)
+        symbols.push({name:key,kind:'variable',line:lineIndexForOffset(lineOffsets,i)+1,signature:cleanSignature(`${key}:`)})
+      }
+      i=j+1;continue
+    }
+    if(ch==='{'||ch==='[')depth++
+    else if(ch==='}'||ch===']')depth--
+    i++
+  }
+  return {path:'',language:'json',symbols:symbols.slice(0,MAX_SYMBOLS_PER_FILE),references:[],imports:[]}
+}
+
+function analyzeYaml(text:string):FileAnalysis {
+  const symbols:SymbolInfo[]=[];const seen=new Set<string>()
+  const lines=text.split(/\r?\n/)
+  const keyRe=/^([A-Za-z0-9_][A-Za-z0-9_.-]*):(?:\s|$)/
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i]
+    if(!line.trim()||line.startsWith(' '))continue
+    if(line.startsWith('-')||line.startsWith('?')||line.startsWith('---')||line.startsWith('...'))continue
+    const m=line.match(keyRe)
+    if(m&&!seen.has(m[1]!)){seen.add(m[1]!);symbols.push({name:m[1]!,kind:'variable',line:i+1,signature:cleanSignature(`${m[1]}:`)})}
+  }
+  return {path:'',language:'yaml',symbols:symbols.slice(0,MAX_SYMBOLS_PER_FILE),references:[],imports:[]}
+}
+
 function analyzeMarkdown(text:string):FileAnalysis {
   const symbols:SymbolInfo[]=[]; const seen=new Set<string>()
   const lines=text.split(/\r?\n/)
@@ -133,6 +207,8 @@ export function analyzeSource(file:string,text:string):FileAnalysis {
   const language=languageFor(file)
   if(language==='typescript'||language==='javascript'){const result=analyzeJavaScript(text);result.path=file;result.language=language;return result}
   if(language==='python'){const result=analyzePython(text);result.path=file;return result}
+  if(language==='json'){const result=analyzeJson(text);result.path=file;return result}
+  if(language==='yaml'){const result=analyzeYaml(text);result.path=file;return result}
   const ext=path.extname(file).toLowerCase()
   if(ext==='.md'||ext==='.mdx'){const result=analyzeMarkdown(text);result.path=file;return result}
   return {path:file,language,symbols:[],references:[],imports:[]}

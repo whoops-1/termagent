@@ -77,23 +77,23 @@ The Phase 16 gate (explicit decisions, no complexity-only degradation, canonical
 ### Changes
 
 - `src/context/repository.ts` — cache payload bumped to version 4 and now persists the computed reference `edges`, per-file `structural` ranks, and a deterministic file-set `fingerprint`. On a full cache hit (every listed file reused unchanged), the persisted graph is reused directly instead of recomputing edges and ranks; any single-file change invalidates only that file's analysis and rebuilds the graph in the normal bounded path. This gives dependency/reference graph persistence plus incremental invalidation for the common unchanged-tree case.
-- `src/context/symbols.ts` — new `heading` symbol kind; Markdown (`.md`/`.mdx`) files now produce heading symbols (ATX headings, emphasis stripped), so documentation structure participates in symbol scoring and repository-map output.
+- `src/context/symbols.ts` — new `heading` symbol kind; Markdown (`.md`/`.mdx`) files now produce heading symbols (ATX headings, emphasis stripped), so documentation structure participates in symbol scoring and repository-map output. Follow-up: JSON/`.jsonc` top-level keys and YAML top-level keys now produce `variable` symbols with accurate line numbers (comment-safe for JSONC, multi-document-aware for YAML).
 
 ### Tests
 
-`tests/phase16d-repository.test.mjs` (6 cases): cache payload persistence (version 4, edges, ranks, fingerprint), unchanged-tree warm path reuse with identical edges/structural values and zero misses, single-file-change reparse (miss 1) with correct rebuilt edges, invalidation cold rebuild, markdown heading symbols at exact lines, and `analyzeSource` markdown extraction.
+`tests/phase16d-repository.test.mjs` (10 cases): cache payload persistence (version 4, edges, ranks, fingerprint), unchanged-tree warm path reuse with identical edges/structural values and zero misses, single-file-change reparse (miss 1) with correct rebuilt edges, invalidation cold rebuild, markdown heading symbols at exact lines, `analyzeSource` markdown extraction, JSON top-level key symbols, JSONC comment/string-brace safety, YAML top-level keys (multi-document aware, list/indented rows excluded), and end-to-end repository map surfacing config key symbols.
 
 ### Verification evidence
 
 - Production build: `tsc -p tsconfig.json` PASS.
-- `tests/phase16d-repository.test.mjs`: 6/6 PASS.
+- `tests/phase16d-repository.test.mjs`: 10/10 PASS.
 - `tests/context.test.mjs` (7/7) and `tests/tools.test.mjs` PASS.
 - `tests/phase2-context.test.mjs`: 42/45 PASS; the 3 failures are pre-existing baseline issues (tests build `new ToolRegistry()` without a `PermissionGate`, so `ToolRegistry.selectSchemas` dereferences `gate.isStaticallyDenied` on undefined). The identical TypeError was reproduced against the pre-16D baseline (HEAD at the 16B commit), confirming they are not regressions from 16D.
 
 ### Remaining 16D work
 
 - Recent-session evidence fusion into retrieval (currently lexical + structural + symbol + content + graph boosting).
-- Additional language coverage beyond TS/JS/Python and Markdown headings (e.g. JSON/YAML key symbols), and a generic fallback parser.
+- A generic fallback parser for unknown text languages (JSON top-level keys and YAML top-level keys are now covered; TOML/INI/ENV and free-form fallback remain open).
 - Agent-level use of exploration state to avoid redundant reads/searches (ties into the existing exploration guidance layer).
 
 ## 16F implementation
