@@ -638,7 +638,7 @@ export class Agent {
             if(!definition) throw new Error(`Unknown tool: ${call.function.name}`)
             if(workflow && !workflow.allowedTool(definition,true)) throw new Error(`Tool '${call.function.name}' is not allowed during autonomous ${workflow.state.phase} phase`)
             if(!allowWrite&&WRITE_TOOLS.has(call.function.name))throw new Error(`Agent mode '${mode}' is read-only`)
-            if(!allowShell&&definition.risk==='shell')throw new Error(`Agent mode '${mode}' does not allow shell commands`)
+            if(!allowShell&&(definition.risk==='shell'||definition.risk==='network'))throw new Error(`Agent mode '${mode}' does not allow shell or network commands`)
             if(this.hookManager){ await this.hookManager.emit({event:'PreToolUse',toolName:call.function.name,toolArgs:args,cwd:input.cwd,sessionID:input.sessionId,prompt:input.prompt}) }
             let result
             try {
@@ -887,7 +887,7 @@ export class Agent {
         const operationalRound=calls.some((call:any)=>{
           const name=String(call.function?.name||'')
           if(WRITE_TOOLS.has(name)) return true
-          return this.tools.get(name)?.risk==='shell'
+          return this.tools.get(name)?.risk==='shell' || this.tools.get(name)?.risk==='network'
         })
         if(!loopStopReason && semanticTrackingActive && !operationalRound){
           const semanticCheck=loopGuard.observeNoProgressRound(

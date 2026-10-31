@@ -331,6 +331,10 @@ text/native normalization
                                       Terminal / future Web projections
 ```
 
+## Phase 16 — network capability (webfetch/websearch)
+
+Phase 16B adds first-class network tools (`webfetch`, `websearch`) to the built-in tool set. They introduce a dedicated `network` permission action and tool `risk` class that behaves like `shell` for agent-mode gating: Explore and Plan (read-only) profiles exclude network tools, and default `ask` approval mode prompts per call, so the default runtime remains offline until a user explicitly approves network access. `webfetch` enforces http(s)-only targets, URL-credential rejection, manual bounded redirects with per-hop re-validation, fail-closed SSRF blocking of loopback/private/link-local/CGNAT/reserved/multicast/unspecified addresses (IPv4 and IPv6), a configurable size bound, timeout, and binary detection. `websearch` requires an explicitly configured endpoint (`config.webSearch` / `TERMAGENT_SEARCH_URL`) and is never bundled with a hidden provider. Full design and decisions are recorded in `docs/research/PHASE16-START.md`.
+
 ## Future Web View / multi-client presentation architecture
 
 Web View is a planned first-class client surface. It is not a second UI implementation of the terminal and must not be built by mirroring rendered ANSI output. The source of truth is the semantic runtime/session state and event stream; TerminalUI, Web View, and a future VS Code extension are independent projections of that state.

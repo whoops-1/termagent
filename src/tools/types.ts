@@ -6,7 +6,7 @@ export type Questioner = (questions:QuestionPrompt[], signal?:AbortSignal)=>Prom
 
 export type ToolKind = 'local'|'provider-hosted'|'plugin'|'mcp'|'declarative'
 export type ToolConcurrency = 'safe'|'unsafe'
-export type PermissionAction = 'read'|'edit'|'shell'|'external_directory'|'task'|'skill'
+export type PermissionAction = 'read'|'edit'|'shell'|'external_directory'|'task'|'skill'|'network'
 
 export type ToolProvenance = {
   kind:'mcp'|'plugin'|'builtin'|'provider-hosted'|'declarative'
@@ -53,7 +53,7 @@ export interface ToolDefinition {
   schema: JSONSchema
   inputSchema?: JSONSchema
   outputSchema?: JSONSchema
-  risk: 'read'|'write'|'shell'
+  risk: 'read'|'write'|'shell'|'network'
   readOnly?: boolean
   concurrency?: ToolConcurrency
   parallelSafe?: boolean

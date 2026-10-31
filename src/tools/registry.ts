@@ -120,7 +120,7 @@ export class ToolRegistry {
       if(tool.isEnabled && !tool.isEnabled({mode:options.mode,autonomous:options.autonomous,workflowPhase:options.workflowPhase,allowedTools:options.allowedTools,disallowedTools:options.disallowedTools}))continue
       if(tool.isAvailable && !tool.isAvailable({mode:options.mode,autonomous:options.autonomous,workflowPhase:options.workflowPhase,allowedTools:options.allowedTools,disallowedTools:options.disallowedTools}))continue
       if(options.allowWrite===false && !tool.readOnly)continue
-      if(options.allowShell===false && tool.risk==='shell')continue
+      if(options.allowShell===false && (tool.risk==='shell'||tool.risk==='network'))continue
       if(options.workflowAllowed && !options.workflowAllowed(tool))continue
       if(this.gate.isStaticallyDenied(tool,ctx))continue
       base.push({type:'function',function:{name:tool.name,description:tool.description,parameters:tool.inputSchema||tool.schema}})

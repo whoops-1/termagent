@@ -32,6 +32,7 @@ export function defaultPermissionAction(name:string,risk:ToolDefinition['risk'])
   const lower=name.toLowerCase()
   if(lower==='skill'||lower==='use_skill'||lower==='search_skills') return 'skill'
   if(lower==='task'||lower.startsWith('task_')||lower.includes('agent')||lower.startsWith('parallel_')||lower==='background') return 'task'
+  if(lower==='webfetch'||lower==='websearch'||risk==='network') return 'network'
   if(risk==='shell') return 'shell'
   if(risk==='write') return 'edit'
   return 'read'
@@ -59,6 +60,11 @@ function extractResources(action:PermissionAction,args:any):string[] {
   if(action==='shell')return typeof args?.command==='string'?[args.command]:[]
   if(action==='skill')return [typeof args?.name==='string'?args.name:'*']
   if(action==='task')return [typeof args?.task_id==='string'?args.task_id:'*']
+  if(action==='network'){
+    if(typeof args?.url==='string' && args.url.trim()) return [args.url.trim()]
+    if(typeof args?.query==='string' && args.query.trim()) return ['websearch']
+    return ['*']
+  }
   return extractPathResources(args)
 }
 

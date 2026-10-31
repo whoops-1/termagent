@@ -715,6 +715,43 @@
       "designNotes": "Tool.inputSchema/outputSchema and safeParse before execution; Tool.make codec boundary; invalid input/output never succeeds"
     },
     {
+      "id": "builtin.webfetch",
+      "kind": "builtin",
+      "name": "webfetch",
+      "source": "src/tools/web.ts",
+      "schema": {
+        "url": "string(uri)|required"
+      },
+      "output": "bounded text preview with status/content-type/bytes/hops metadata; binary responses summarized",
+      "permission": "PermissionGate via risk=network and network action; URL-based resource; non-public targets blocked by SSRF guard",
+      "cancellation": "AbortSignal forwarded from the turn plus timeout abort",
+      "concurrency": "parallelSafe=true (read-only fetch)",
+      "persistence": "nothing durable; bounded inline preview retained as a normal tool message",
+      "contextCost": "tool schema counted; output preview bounded to maxBytes (default 200KB)",
+      "severity": "high",
+      "gap": "None for v1: manual redirect cap, size/timeout bounds, protocol/scheme checks, credentials rejection, and private-address blocking are implemented.",
+      "designNotes": "Phase 16B implementation; docs/research/PHASE16-START.md"
+    },
+    {
+      "id": "builtin.websearch",
+      "kind": "builtin",
+      "name": "websearch",
+      "source": "src/tools/web.ts",
+      "schema": {
+        "query": "string|required",
+        "maxResults": "integer|optional"
+      },
+      "output": "bounded numbered result list (title/url/snippet) plus endpoint metadata",
+      "permission": "PermissionGate via risk=network and network action; requires explicit approval unless approvals=auto",
+      "cancellation": "AbortSignal forwarded from the turn plus timeout abort",
+      "concurrency": "parallelSafe=true (read-only query)",
+      "persistence": "nothing durable; bounded results retained as a normal tool message",
+      "contextCost": "tool schema counted; results bounded by maxResults (default 8, cap 20)",
+      "severity": "medium",
+      "gap": "Search requires an explicit endpoint (config webSearch.url or TERMAGENT_SEARCH_URL); no bundled search provider.",
+      "designNotes": "Phase 16B implementation; docs/research/PHASE16-START.md"
+    },
+    {
       "id": "capability.batch",
       "kind": "capability-evaluation",
       "name": "batch",
@@ -752,15 +789,15 @@
       "name": "webfetch/websearch",
       "source": "internal capability review",
       "schema": "bounded web fetch/search request schemas",
-      "output": "not enabled by default",
-      "permission": "not applicable",
-      "cancellation": "not applicable",
-      "concurrency": "not applicable",
-      "persistence": "not applicable",
-      "contextCost": "intentionally excluded from base builtin context",
-      "severity": "intentional",
-      "gap": "Network-heavy tools are not introduced into TermAgent builtins. External/MCP/plugin providers may supply network tools explicitly; default Termux path remains offline-friendly.",
-      "designNotes": "WebSearchTool/WebFetchTool patterns; runtime component/tool/webfetch.ts + runtime component/tool/websearch.ts"
+      "output": "Phase 16B builtins webfetch and websearch",
+      "permission": "network action via PermissionGate; per-call approval",
+      "cancellation": "turn AbortSignal plus timeout",
+      "concurrency": "parallelSafe read-only",
+      "persistence": "nothing durable; bounded previews in session",
+      "contextCost": "tool schemas counted in bounded context budget",
+      "severity": "active",
+      "gap": "Network tools are now first-class Phase 16B builtins (webfetch/websearch), but each call requires explicit network approval; the default Termux path stays offline until a user approves network access. websearch needs a configured endpoint; no bundled search provider.",
+      "designNotes": "WebSearchTool/WebFetchTool patterns implemented in src/tools/web.ts with SSRF/size/timeout/redirect controls; docs/research/PHASE16-START.md"
     },
     {
       "id": "capability.notebook",

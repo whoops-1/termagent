@@ -26,6 +26,8 @@ import {
   withFileMutationLock,
   writeIfUnchanged,
 } from './file-mutation.js'
+import { webfetchTool, websearchTool } from './web.js'
+import type { WebSearchConfig } from '../config/config.js'
 
 const DEFAULT_READ_LIMIT = 2000
 const MAX_READ_LINES = 2000
@@ -172,7 +174,7 @@ async function run(cmd: string, args: string[], cwd: string, timeout: number, ma
   })
 }
 
-export function builtinTools(opts: { timeout: number; maxOutput: number; toolOutputMaxLines?: number; toolOutputMaxBytes?: number; toolOutputRetentionDays?: number }): ToolDefinition[] {
+export function builtinTools(opts: { timeout: number; maxOutput: number; toolOutputMaxLines?: number; toolOutputMaxBytes?: number; toolOutputRetentionDays?: number; networkTimeoutMs?: number; webSearch?: WebSearchConfig }): ToolDefinition[] {
   const toolOutputStore = new ToolOutputStore({maxLines:opts.toolOutputMaxLines,maxBytes:opts.toolOutputMaxBytes,retentionDays:opts.toolOutputRetentionDays})
   const read: ToolDefinition = {
     name:'read_file',
@@ -435,5 +437,5 @@ export function builtinTools(opts: { timeout: number; maxOutput: number; toolOut
   }
   const repoMap: ToolDefinition = { name:'repo_map', risk:'read', parallelSafe:true, description:'Show a token-bounded structural map of the repository. Use focusFiles or focusSymbols for a specific area.', schema:{type:'object',properties:{tokens:{type:'integer',minimum:256},focusFiles:{type:'array',items:{type:'string'}},focusSymbols:{type:'array',items:{type:'string'}}}}, async execute(a,c){ const map=await buildRepositoryMap(c.cwd); const tokens=Math.max(256,Math.min(Number(a.tokens)||2048,8192)); const output= formatRepositoryMap(map,180,tokens,{focusFiles:Array.isArray(a.focusFiles)?a.focusFiles.map(String):[],focusSymbols:Array.isArray(a.focusSymbols)?a.focusSymbols.map(String):[]}); return {title:'Repository map',output:output.slice(0,opts.maxOutput),metadata:{repositoryMap:{files:map.files.map(file=>path.resolve(c.cwd,file.path)),symbols:map.files.flatMap(file=>file.symbols.map(symbol=>symbol.name)).slice(0,512)}}} } }
   const applyPatch = applyPatchTool()
-  return [read,write,edit,applyPatch,grep,glob,bash,git,repoMap]
+  return [read,write,edit,applyPatch,grep,glob,bash,git,repoMap,webfetchTool({timeoutMs:opts.networkTimeoutMs}),websearchTool({webSearch:opts.webSearch,timeoutMs:opts.networkTimeoutMs})]
 }

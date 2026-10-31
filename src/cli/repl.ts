@@ -59,7 +59,7 @@ export async function start(cwd=process.cwd(),resume?:string){
  const cfg=await loadConfig(cwd); const themeCatalog=await loadThemeCatalog(cwd); const store=new SessionStore(); let session:any; let messages:any[]=[]; let initialTodo:any[]=[]
  if(resume){const loaded=await store.load(resume);session=loaded.meta;messages=loaded.messages;const latest=[...loaded.events].reverse().find((e:any)=>e.type==='todo');if(Array.isArray(latest?.data?.items))initialTodo=activeTodoItems(latest.data.items)}else session=await store.create(cwd,cfg.model)
  const gate=new PermissionGate(cfg.approvals, process.stdin, process.stdout, cfg.permissionRules || []); const registry=new ToolRegistry(gate)
- builtinTools({timeout:cfg.shellTimeoutMs,maxOutput:cfg.maxOutputBytes,toolOutputMaxLines:cfg.toolOutputMaxLines,toolOutputMaxBytes:cfg.toolOutputMaxBytes,toolOutputRetentionDays:cfg.toolOutputRetentionDays}).forEach(t=>registry.add(t)); registry.add(questionTool(store))
+  builtinTools({timeout:cfg.shellTimeoutMs,maxOutput:cfg.maxOutputBytes,toolOutputMaxLines:cfg.toolOutputMaxLines,toolOutputMaxBytes:cfg.toolOutputMaxBytes,toolOutputRetentionDays:cfg.toolOutputRetentionDays,networkTimeoutMs:cfg.networkTimeoutMs,webSearch:cfg.webSearch}).forEach(t=>registry.add(t)); registry.add(questionTool(store))
  const tasks=new TaskManager(); await tasks.recover()
  let providerCfg:any=resolveProviderConfig(cfg); let provider:any=createProvider(providerCfg)
  let uiRef:TerminalUI|null=null

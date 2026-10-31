@@ -39,7 +39,7 @@ export async function createRuntime(cwd:string) {
   const store=new SessionStore(undefined,events)
   const gate=new PermissionGate(cfg.approvals, process.stdin, process.stdout, cfg.permissionRules || [], store)
   const registry=new ToolRegistry(gate)
-  builtinTools({timeout:cfg.shellTimeoutMs,maxOutput:cfg.maxOutputBytes,toolOutputMaxLines:cfg.toolOutputMaxLines,toolOutputMaxBytes:cfg.toolOutputMaxBytes,toolOutputRetentionDays:cfg.toolOutputRetentionDays}).forEach(t=>registry.add(t)); registry.add(questionTool(store))
+  builtinTools({timeout:cfg.shellTimeoutMs,maxOutput:cfg.maxOutputBytes,toolOutputMaxLines:cfg.toolOutputMaxLines,toolOutputMaxBytes:cfg.toolOutputMaxBytes,toolOutputRetentionDays:cfg.toolOutputRetentionDays,networkTimeoutMs:cfg.networkTimeoutMs,webSearch:cfg.webSearch}).forEach(t=>registry.add(t)); registry.add(questionTool(store))
   const tasks=new TaskManager(); await tasks.recover()
   let providerCfg:any=resolveProviderConfig(cfg)
   let provider:any=createProvider(providerCfg)

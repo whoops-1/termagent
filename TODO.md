@@ -852,6 +852,8 @@ The long-term VS Code integration uses the same TermAgent runtime rather than em
 
 This phase reopens capabilities previously deferred because TermAgent lacked the supporting architecture. Decisions must be based on engineering value and current TermAgents, not on resource pessimism.
 
+Phase 16 is open. 16B (web tools) is implemented and regression-tested. Explicit adopt/adapt/rewrite/defer decisions for 16A, 16C, 16D, 16E, and 16F are recorded in `docs/research/PHASE16-START.md`.
+
 ### 16A — LSP/code intelligence
 
 - [ ] Reassess the current session and language-server integration architecture when this phase is reopened.
@@ -863,11 +865,13 @@ This phase reopens capabilities previously deferred because TermAgent lacked the
 
 ### 16B — Web tools
 
-- [ ] Re-research current design webfetch/websearch implementations and network policies.
-- [ ] Define network permission and domain/resource classification.
-- [ ] Add bounded fetch/search result storage and context projection.
-- [ ] Preserve complete results out-of-band where useful.
-- [ ] Add SSRF, redirect, size, timeout, content-type, and authentication safety controls.
+- [verified] Re-research the current webfetch/websearch implementations and network policies; record the decision (adopt as approval-gated built-ins) in `docs/research/PHASE16-START.md`.
+- [verified] Define network permission and domain/resource classification (new `network` permission action and tool risk; SSRF/private-address blocking; per-call approval).
+- [impl] Add bounded fetch/search result storage and context projection (bounded inline previews + structured metadata; durable out-of-band full-body retention still pending).
+- [ ] Preserve complete results out-of-band where useful (explicitly deferred within 16B; only bounded previews are kept today).
+- [verified] Add SSRF, redirect (manual, capped, loop-detected), size, timeout, content-type, and authentication safety controls.
+
+**16B status:** Implementation present and focused regression-tested. `webfetch` and `websearch` are built-in tools gated behind the `network` permission action; Explore/Plan (read-only) modes exclude them. See `docs/research/PHASE16-START.md` for design, tests, and verification evidence.
 
 ### 16C — Notebook/structured document editing
 
