@@ -15,6 +15,19 @@ export type ToolCall = { id: string; type: 'function'; function: { name: string;
 export type SessionEvent = { type:'message'|'meta'|'compaction'|'context.checkpoint'|'context.instructions'|'branch'|'summary'|'todo'|'workflow'|'checkpoint'|'checkpoint.restore'|'turn'|'undo'|'redo'|'skill.search'|'skill.load'|'skill.skip'|'question.asked'|'question.replied'|'question.rejected'|'question.cancelled'|'permission.asked'|'permission.resolved'|'permission.cancelled'|'command.receipt'|'tool.call'|'provider.turn'|'provider.usage'|'task.notification'|'task.notification.consumed'|'prompt.queue'|'mutation'|'diff'|'verification'; ts:number; data:any; eventId?:string; version?:1; sequence?:number; durable?:true; category?:EventCategory; kind?:EventKind }
 export type SessionMeta = import('../protocol/api.js').SessionMeta
 export type TurnRecord = { id:string; prompt?:string; beforeSnapshot:string; afterSnapshot?:string; afterProtectedSnapshot?:string; started:number; committed?:number; interruptedAt?:number; beforeMessageCount:number; afterMessageCount?:number; status:'started'|'committed'|'failed'|'interrupted'; recovery?:{reason:'daemon-restart';ownerId:string} }
+// Redacted, in-memory view of a task.notification awaiting delivery: the task
+// identity plus optional child output references and the durable sequence of the
+// notification event being consumed. No prompt or credential content is retained.
+type PendingTaskNotification={
+  taskId:string
+  completedAt:number
+  kind?:string
+  status?:string
+  outputPath?:string
+  childSessionId?:string
+  summary?:string
+  notificationSequence:number
+}
 
 const SESSION_LOCKS = new Map<string, Promise<void>>()
 const SESSION_BUSY = new Set<string>()
@@ -40,14 +53,49 @@ const SESSION_LEASE_MALFORMED_FRESH_MS=5000
 // Attempt bound against pathological recreate/delete churn; the wall-clock
 // budget above is the primary bound for waiting on a live owner.
 const SESSION_LEASE_MAX_ATTEMPTS=512
-export type SessionLeaseContention = {
+// Redacted session-state lease contention decision. 'live-owner' means the
+// acquisition gave up waiting on a live owner (budget exhausted); 'failed' means
+// the attempt bound was exhausted without a resolution.
+export type SessionLeaseDecision='acquired'|'recovered-stale'|'recovered-malformed'|'live-owner'|'failed'
+export type SessionLeaseOutcome='acquired'|'recovered-stale'|'recovered-malformed'|'timeout'|'failed'
+// Structured, redacted session lease contention record (LIVE in-memory state,
+// never persisted, never replayed; no prompt text, credentials, or message
+// content — only lease mechanics). Field names keep the batch-1 S2
+// classification surface (sessionId/operation/attempts/waitedMs/outcome/
+// ownerPid/decidedAt) and extend it with hold/diagnostic context (retries,
+// decision, heldMs, jsonlBytes, sequenceState, at).
+export type SessionLeaseContentionRecord={
+  lock:'session'
   sessionId:string
+  id:string
   operation:string
-  attempts:number
-  waitedMs:number
-  outcome:'acquired'|'recovered-stale'|'recovered-malformed'|'timeout'
+  opKind:string
   ownerPid?:number
+  ownerIdentity?:string
+  attempts:number
+  retries:number
+  decision:SessionLeaseDecision
+  outcome:SessionLeaseOutcome
+  waitedMs:number
+  heldMs?:number
+  jsonlBytes?:number
+  sequenceState?:{current:number;cached?:number}
   decidedAt:number
+  at:number
+}
+/** Backwards-compatible alias for the redacted session lease contention record. */
+export type SessionLeaseContention=SessionLeaseContentionRecord
+// Corrupt-JSONL diagnostics are a SEPARATE class from lock contention and are
+// surfaced through their own accessor with their own record type; they are never
+// merged into a contention record.
+export type SessionDataIssueKind='corrupt-jsonl'|'trailing-partial-repair'
+export type SessionDataIssue={
+  sessionId:string
+  kind:SessionDataIssueKind
+  line?:number
+  detail:string
+  jsonlBytes?:number
+  at:number
 }
 type StateLockVerdict =
   | {kind:'gone';pid?:undefined}
@@ -74,6 +122,7 @@ export class SessionStore {
   }
   file(id:string){return path.join(this.root,`${id}.jsonl`)}
   private leases = new Map<string, TurnLease>()
+  private lastAcquisitionAt=0
 
   private async withSessionLock<T>(id:string,fn:()=>Promise<T>):Promise<T>{
     const key=this.file(id)
@@ -166,9 +215,16 @@ export class SessionStore {
   // only the most recent contended acquisition is kept; clean acquisitions do
   // not overwrite it. Redacted by construction — no message or credential
   // content, only lease mechanics.
-  private lastContention?:SessionLeaseContention
-  lastSessionLeaseContention():SessionLeaseContention|undefined{
+  private lastContention?:SessionLeaseContentionRecord
+  lastSessionLeaseContention():SessionLeaseContentionRecord|undefined{
     return this.lastContention?{...this.lastContention}:undefined
+  }
+  // Corrupt-JSONL / trailing-partial diagnostics are a separate class from lock
+  // contention; they are surfaced through their own accessor with their own
+  // record type and never merged into the contention projection.
+  private lastDataIssue?:SessionDataIssue
+  lastSessionDataIssue():SessionDataIssue|undefined{
+    return this.lastDataIssue?{...this.lastDataIssue}:undefined
   }
 
   // NOTE(deferred): robust cross-platform process-start identity (pid + process
@@ -188,8 +244,32 @@ export class SessionStore {
     let waitIndex=0
     let observedPid:number|undefined
     let recovery:'stale'|'malformed'|undefined
-    const recordContention=(outcome:SessionLeaseContention['outcome'])=>{
-      this.lastContention={sessionId:id,operation,attempts,waitedMs,outcome,...(observedPid!==undefined?{ownerPid:observedPid}:{}),decidedAt:Date.now()}
+    const recordContention=async(decision:SessionLeaseDecision)=>{
+      const decidedAt=Date.now()
+      const outcome:SessionLeaseOutcome=decision==='live-owner'?'timeout':decision
+      let jsonlBytes:number|undefined
+      try{ jsonlBytes=(await fs.stat(this.file(id))).size }catch{ }
+      let sequence=0
+      try{ sequence=await this.currentSequence(id) }catch{ sequence=0 }
+      this.lastContention={
+        lock:'session',
+        sessionId:id,
+        id,
+        operation,
+        opKind:operation,
+        ownerPid:observedPid,
+        ownerIdentity:observedPid!==undefined?`pid:${observedPid}`:undefined,
+        attempts,
+        retries:Math.max(0,attempts-1),
+        decision,
+        outcome,
+        waitedMs,
+        heldMs:this.lastAcquisitionAt>0?Math.max(0,Date.now()-this.lastAcquisitionAt):undefined,
+        jsonlBytes,
+        sequenceState:{current:sequence,cached:this.sequenceCache.get(id)?.sequence},
+        decidedAt,
+        at:decidedAt,
+      }
     }
     while(attempts<SESSION_LEASE_MAX_ATTEMPTS){
       attempts++
@@ -197,7 +277,8 @@ export class SessionStore {
         const handle=await fs.open(lockPath,'wx')
         try{await handle.writeFile(payload,'utf8')}finally{await handle.close()}
         if(attempts>1){
-          recordContention(recovery==='stale'?'recovered-stale':recovery==='malformed'?'recovered-malformed':'acquired')
+          this.lastAcquisitionAt=Date.now()
+          await recordContention(recovery==='stale'?'recovered-stale':recovery==='malformed'?'recovered-malformed':'acquired')
         }
         return {lockPath,token}
       }catch(error){
@@ -213,7 +294,7 @@ export class SessionStore {
           if(remaining<=0){
             // Budget exhausted while a live owner holds the lock: report and
             // leave the owner's lock untouched. Never delete on timeout.
-            recordContention('timeout')
+            await recordContention('live-owner')
             const detail=verdict.reason==='live-owner'&&verdict.pid!==undefined?`live owner pid ${verdict.pid} still holds the state lock`:'malformed or incomplete state lock contents'
             throw new Error(`Session state is busy: unable to acquire state lock after ${attempts} attempt(s) and ${waitedMs} ms wait (${detail})`)
           }
@@ -231,7 +312,7 @@ export class SessionStore {
         await new Promise(resolve=>setTimeout(resolve,1+Math.floor(Math.random()*9)))
       }
     }
-    recordContention('timeout')
+    await recordContention('failed')
     throw new Error(`Session state is busy: unable to acquire state lock after ${attempts} attempt(s) and ${waitedMs} ms wait (acquisition attempts exhausted)`)
   }
 
@@ -262,6 +343,10 @@ export class SessionStore {
     return {kind:'recover-malformed'}
   }
   private async releaseStateLease(lease:TurnLease){
+    const heldMs=this.lastAcquisitionAt>0?Math.max(0,Date.now()-this.lastAcquisitionAt):undefined
+    this.lastAcquisitionAt=0
+    const record=this.lastContention
+    if(heldMs!==undefined&&record)record.heldMs=heldMs
     try{
       // Compare-before-release: only delete the lock file whose payload token
       // still matches the token we acquired; a foreign or tampered owner's
@@ -270,7 +355,7 @@ export class SessionStore {
       if(owner?.token===lease.token)await fs.rm(lease.lockPath,{force:true})
     }catch(error){if((error as {code?:string}).code!=='ENOENT')throw error}
   }
-  async withSessionMutation<T>(id:string,fn:()=>Promise<T>):Promise<T>{
+  async withSessionMutation<T>(id:string,fn:()=>Promise<T>,operation:string='mutation'):Promise<T>{
     // Re-entrancy must be scoped to the current async call chain. A process-wide
     // per-session depth counter lets an unrelated concurrent worker mistake an
     // in-flight transaction for its own nested call and skip the lease. That
@@ -278,7 +363,7 @@ export class SessionStore {
     const inherited=this.mutationContext.getStore()
     if(inherited?.has(id))return await fn()
     return await this.withSessionLock(id,async()=>{
-      const lease=await this.acquireStateLease(id,'mutation')
+      const lease=await this.acquireStateLease(id,operation)
       const active=new Set(inherited??[])
       active.add(id)
       try{return await this.mutationContext.run(active,fn)}finally{await this.releaseStateLease(lease)}
@@ -297,6 +382,10 @@ export class SessionStore {
       try{events.push(JSON.parse(line) as SessionEvent)}
       catch(error){
         if(i===lastNonEmpty)break
+        const info=await fs.stat(this.file(id)).catch(()=>undefined)
+        const issue:SessionDataIssue={sessionId:id,kind:'corrupt-jsonl',line:i+1,detail:'invalid-json-line',at:Date.now()}
+        if(info)issue.jsonlBytes=info.size
+        this.lastDataIssue=issue
         throw new Error(`Corrupt session log at line ${i+1}: ${(error as Error).message}`)
       }
     }
@@ -330,6 +419,11 @@ export class SessionStore {
     if(lastNonEmpty<0) return
     const candidate=lines[lastNonEmpty]
     try{JSON.parse(candidate)}catch{
+      const issue:SessionDataIssue={sessionId:id,kind:text.endsWith('\n')?'corrupt-jsonl':'trailing-partial-repair',line:lastNonEmpty+1,detail:text.endsWith('\n')?'invalid-json-line':'partial-trailing-record',at:Date.now()}
+      let jsonlBytes:number|undefined
+      try{jsonlBytes=(await fs.stat(this.file(id))).size}catch{}
+      issue.jsonlBytes=jsonlBytes
+      this.lastDataIssue=issue
       if(text.endsWith('\n')) throw new Error(`Corrupt trailing session event at line ${lastNonEmpty+1}`)
       const offset=lines.slice(0,lastNonEmpty).reduce((total,line)=>total+line.length+1,0)
       await fs.truncate(this.file(id),offset)
@@ -672,15 +766,82 @@ export class SessionStore {
     if(expected!==actual) throw new Error(`Session belongs to ${loaded.meta.cwd}; refusing to operate on ${cwd}`)
   }
 
-  async consumeTaskNotifications(id:string){
+  // Task notification consumed-marker payload. Keeps the batch-2 marker shape
+  // ({taskId, completedAt}) backward compatible while preserving child output
+  // references and the durable notification sequence for deliberate retrieval.
+  private taskNotificationMarkerData(notification:{taskId?:unknown;completedAt?:unknown;kind?:unknown;status?:unknown;outputPath?:unknown;childSessionId?:unknown;notificationSequence?:unknown}){
+    const taskId=String(notification.taskId||'')
+    const completedAt=Number(notification.completedAt||Date.now())
+    const data:{taskId:string;completedAt:number;kind?:string;status?:string;outputPath?:string;childSessionId?:string;notificationSequence:number}={taskId,completedAt,notificationSequence:Number(notification.notificationSequence||0)}
+    if(typeof notification.kind==='string')data.kind=notification.kind
+    if(typeof notification.status==='string')data.status=notification.status
+    if(typeof notification.outputPath==='string')data.outputPath=notification.outputPath
+    if(typeof notification.childSessionId==='string')data.childSessionId=notification.childSessionId
+    data.notificationSequence=Number(notification.notificationSequence||0)
+    return data
+  }
+  private async collectPendingTaskNotifications(id:string):Promise<PendingTaskNotification[]>{
+    const loaded=await this.load(id)
+    const consumed=new Set(loaded.events.filter((event:SessionEvent)=>event.type==='task.notification.consumed').map((event:SessionEvent)=>String(event.data?.taskId||'')))
+    const pending:PendingTaskNotification[]=[]
+    for(const event of loaded.events){
+      if(event.type!=='task.notification')continue
+      const item=event.data
+      if(!item||typeof item!=='object')continue
+      const taskId=String((item as {taskId?:unknown}).taskId||'')
+      if(!taskId||consumed.has(taskId))continue
+      pending.push({
+        taskId,
+        completedAt:Number((item as {completedAt?:unknown}).completedAt||Date.now()),
+        kind:typeof (item as {kind?:unknown}).kind==='string'?(item as {kind:string}).kind:undefined,
+        status:typeof (item as {status?:unknown}).status==='string'?(item as {status:string}).status:undefined,
+        outputPath:typeof (item as {outputPath?:unknown}).outputPath==='string'?(item as {outputPath:string}).outputPath:undefined,
+        childSessionId:typeof (item as {childSessionId?:unknown}).childSessionId==='string'?(item as {childSessionId:string}).childSessionId:undefined,
+        summary:typeof (item as {summary?:unknown}).summary==='string'?(item as {summary:string}).summary:undefined,
+        notificationSequence:Number(event.sequence||0),
+      })
+    }
+    return pending
+  }
+  async consumeTaskNotifications(id:string):Promise<PendingTaskNotification[]>{
     return await this.withSessionLock(id,async()=>{
-      const loaded=await this.load(id)
-      const notifications=loaded.events.filter((event:SessionEvent)=>event.type==='task.notification').map(event=>event.data).filter(Boolean)
-      const consumed=new Set(loaded.events.filter((event:SessionEvent)=>event.type==='task.notification.consumed').map((event:SessionEvent)=>String(event.data?.taskId||'')))
-      const pending=notifications.filter((item:any)=>item.taskId&&!consumed.has(String(item.taskId)))
-      for(const item of pending) await this.appendUnlocked(id,{type:'task.notification.consumed',ts:Date.now(),data:{taskId:item.taskId,completedAt:item.completedAt}})
+      const pending=await this.collectPendingTaskNotifications(id)
+      for(const notification of pending) await this.appendUnlocked(id,{type:'task.notification.consumed',ts:Date.now(),data:this.taskNotificationMarkerData(notification)})
       return pending
     })
+  }
+  async pendingTaskNotifications(id:string):Promise<unknown[]>{
+    // Observe-only: no consumed markers, no durable mutation. Reconnect and
+    // restart paths use this to check for undelivered task notifications before
+    // re-entering the deliver pass.
+    return await this.withSessionLock(id,async()=>{
+      const pending=await this.collectPendingTaskNotifications(id)
+      return pending
+    })
+  }
+  async deliverTaskNotifications(id:string,deliver:(notification:unknown)=>Promise<void>):Promise<unknown[]>{
+    // Delivery is at-least-once and never-lost: each pending notification is
+    // handed to the deliver callback first and only after the delivery settles
+    // is the task.notification.consumed marker (carrying the notification
+    // sequence) appended, so a crash between deliver and marker re-delivers on
+    // the next pass. The marker prevents duplicate delivery once it lands.
+    // Dedup semantics: the taskId task.notification.consumed marker set is the
+    // cross-pass deduplication primitive; within a single pass a taskId observed
+    // more than once (duplicate worker completion) is collapsed to one delivery.
+    return await this.withSessionMutation(id,async()=>{
+      const pending=await this.collectPendingTaskNotifications(id)
+      const delivered:unknown[]=[]
+      const deliveredTaskIds=new Set<string>()
+      for(const notification of pending){
+        const taskId=notification.taskId
+        if(deliveredTaskIds.has(taskId))continue
+        deliveredTaskIds.add(taskId)
+        await deliver(notification)
+        delivered.push(notification)
+        await this.appendUnlocked(id,{type:'task.notification.consumed',ts:Date.now(),data:this.taskNotificationMarkerData(notification)})
+      }
+      return delivered
+    },'deliver')
   }
 
   async appendTodo(id:string,items:any[],previous?:any[]){await this.append(id,{type:'todo',ts:Date.now(),data:{items,previous:previous||[]}})}
