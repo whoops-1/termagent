@@ -33,7 +33,7 @@ import { renderExplorationGuidance } from './exploration-guidance.js'
 import { buildEvidenceLedger, type EvidenceLedgerSnapshot, type EvidenceLedgerVerification, type EvidenceLedgerLspDiagnostic } from '../context/evidence-ledger.js'
 import { normalizePostEditVerificationConfig, runAutomaticPostEditVerification, type AutomaticVerificationResult } from './post-edit-verification.js'
 import type { PostEditVerificationConfig } from '../config/config.js'
-import { TaskManager } from '../tasks/manager.js'
+import { TaskManager, type TaskRecord } from '../tasks/manager.js'
 import { specialistRole } from './specialists.js'
 import { canonicalJson } from '../util/canonical.js'
 import crypto from 'node:crypto'
@@ -163,6 +163,74 @@ function roleForPhase(phase:string):string {
   if(phase==='iterating') return 'building'
   if(phase==='building') return 'building'
   return 'default'
+}
+
+function readBoundedInt(raw:string|undefined,fallback:number,min:number,max:number){
+  if(!raw?.trim())return fallback
+  const value=Number(raw.trim())
+  return Number.isSafeInteger(value)&&value>=min?Math.min(value,max):fallback
+}
+
+// 14I-O (item 857): parent orchestration observe/reconcile.
+// The parent observes every child task it launched, distinguishes the child
+// lifecycle states, and reconciles the outcomes before it declares completion
+// or launches more work. Reconciliation is delivered as ONE structured
+// message per changed status fingerprint, never as a stream of progress
+// updates, and the number of observations per turn is bounded.
+export type ChildTaskOutcome='queued'|'running'|'completed'|'failed'|'cancelled'|'timed-out'
+export type ChildTaskView={id:string;kind:string;outcome:ChildTaskOutcome;summary?:string}
+export type TaskReconciliationDecision={
+  fingerprint:string
+  changed:boolean
+  pending:number
+  terminal:number
+  observed:number
+  inject:boolean
+  message:string
+}
+export function classifyChildTaskOutcome(task:{status?:string;termination?:string}):ChildTaskOutcome{
+  const status=String(task?.status||'')
+  const termination=String(task?.termination||'')
+  if(termination==='timeout')return 'timed-out'
+  if(status==='queued')return 'queued'
+  if(status==='running')return 'running'
+  if(status==='exited')return 'completed'
+  if(status==='cancelled')return 'cancelled'
+  return 'failed'
+}
+export function childTaskSummary(task:{result?:string;error?:string},outcome:ChildTaskOutcome):string{
+  const text=outcome==='completed'?String(task.result||''):(outcome==='failed'||outcome==='timed-out')?String(task.error||''):''
+  return text.replace(/\s+/g,' ').trim().slice(0,300)
+}
+export function planChildTaskReconciliation(tasks:readonly ChildTaskView[],options:{previousFingerprint?:string;maxObserve?:number}={}):TaskReconciliationDecision{
+  const sorted=[...tasks].sort((a,b)=>a.id.localeCompare(b.id))
+  const fingerprint=sorted.map(task=>`${task.id}:${task.outcome}`).join('|')
+  const pending=sorted.filter(task=>task.outcome==='queued'||task.outcome==='running').length
+  const terminal=sorted.length-pending
+  const limit=Math.max(1,Math.floor(options.maxObserve??12))
+  const observed=Math.min(sorted.length,limit)
+  const changed=sorted.length>0&&fingerprint!==String(options.previousFingerprint??'')
+  return {fingerprint,changed,pending,terminal,observed,inject:changed,message:changed?renderChildTaskReconciliation(sorted.slice(0,observed),pending,terminal,sorted.length):''}
+}
+function renderChildTaskReconciliation(tasks:readonly ChildTaskView[],pending:number,terminal:number,total:number):string{
+  const lines=[`<task-reconciliation tasks="${total}" pending="${pending}" settled="${terminal}">`]
+  for(const task of tasks){
+    const summary=String(task.summary||'').replace(/\s+/g,' ').trim()
+    lines.push(summary?`<task id="${task.id}" kind="${task.kind}" status="${task.outcome}">${summary}</task>`:`<task id="${task.id}" kind="${task.kind}" status="${task.outcome}"/>`)
+  }
+  if(tasks.length<total) lines.push(`<task-omitted count="${total-tasks.length}"/>`)
+  lines.push('</task-reconciliation>')
+  return lines.join('\n')
+}
+export function renderChildTaskBlockingNotice(tasks:readonly ChildTaskView[],pending:number):string{
+  const pendingTasks=tasks.filter(task=>task.outcome==='queued'||task.outcome==='running').slice(0,12)
+  const ids=pendingTasks.map(task=>`${task.id}(${task.outcome})`).join(', ')
+  return [
+    `<task-reconciliation-pending count="${pending}">`,
+    `Completion must wait: ${pending} delegated task(s) are still in flight (${ids}).`,
+    'Do not declare the work complete and do not launch replacement work. Observe the pending tasks and reconcile their outcomes before finishing.',
+    '</task-reconciliation-pending>',
+  ].join('\n')
 }
 
 export class Agent {
@@ -583,16 +651,84 @@ export class Agent {
 
     const turnNumberHint=messages.length+1
     const turn=await this.sessions.beginTurn(input.sessionId,input.cwd,messages,input.prompt)
+    // 14I-O (item 857): parent orchestration observation state. The turn start
+    // timestamp scopes the observation to children launched by this turn; the
+    // captured task ids additionally cover children that were observed
+    // through a task notification or an explicit task_status call.
+    const turnStartedAt=Date.now()
+    const taskObserver=this.taskManager ?? new TaskManager()
+    const observeBudget=readBoundedInt(process.env.TERMAGENT_TASK_OBSERVE_MAX,12,1,64)
+    const reconciliation={fingerprint:'',injections:0,waits:0,taskIds:new Set<string>()}
+    let sessionChildrenKnown=false
+    let sessionHasChildren=false
+    const captureLaunchedTaskIds=(metadata:any)=>{
+      if(!metadata||typeof metadata!=='object')return
+      const values:unknown[]=[]
+      if(typeof metadata.taskId==='string')values.push(metadata.taskId)
+      if(Array.isArray(metadata.taskIds))values.push(...metadata.taskIds)
+      for(const value of values){
+        const id=String(value||'').trim()
+        if(id)reconciliation.taskIds.add(id)
+      }
+    }
+    const observeChildTasks=async(force=false):Promise<ChildTaskView[]>=>{
+      // A parent session without any child task never has to scan the task
+      // root again; the first observation learns whether this session owns
+      // children at all. `force` re-reads the durable records when the caller
+      // needs the current state (the completion gate).
+      if(!force&&sessionChildrenKnown&&!sessionHasChildren&&reconciliation.taskIds.size===0)return []
+      const records=await taskObserver.list().catch(()=>[] as TaskRecord[])
+      sessionChildrenKnown=true
+      sessionHasChildren=records.some(task=>task.parentSessionId===input.sessionId)
+      const views:ChildTaskView[]=[]
+      const seen=new Set<string>()
+      for(const task of records){
+        if(task.parentSessionId!==input.sessionId)continue
+        if(task.started<turnStartedAt&&!reconciliation.taskIds.has(task.id))continue
+        if(seen.has(task.id))continue
+        seen.add(task.id)
+        const outcome=classifyChildTaskOutcome(task)
+        views.push({id:task.id,kind:task.kind||'task',outcome,summary:childTaskSummary(task,outcome)})
+      }
+      for(const id of reconciliation.taskIds){
+        if(seen.has(id))continue
+        seen.add(id)
+        views.push({id,kind:'task',outcome:'failed',summary:'Task record is no longer available.'})
+      }
+      return views
+    }
     const deliverTaskNotification=async(notification:any)=>{
       const status=String(notification?.status||'completed')
       const summary=String(notification?.summary||'No completion summary was recorded.').trim()
       const taskId=String(notification?.taskId||'unknown')
+      if(taskId!=='unknown')reconciliation.taskIds.add(taskId)
       const childSessionId=notification?.childSessionId?String(notification.childSessionId):''
       const outputPath=notification?.outputPath?String(notification.outputPath):''
       const noteParts=[`<task-notification id="${taskId}" state="${status}">`,summary,childSessionId?`child_session=${childSessionId}`:'',outputPath?`output_path=${outputPath}`:'','</task-notification>'].filter(Boolean)
       const message:ChatMessage={role:'user',content:noteParts.join('\n')}
       messages.push(message)
       await this.sessions.appendMessage(input.sessionId,message,turn.id)
+    }
+    const injectReconciliationMessage=async(content:string)=>{
+      if(!content.trim())return
+      const message:ChatMessage={role:'user',content}
+      messages.push(message)
+      await this.sessions.appendMessage(input.sessionId,message,turn.id)
+    }
+    /**
+     * Completion gate for delegated work: while a child task is still queued
+     * or running the turn must not end. The wait is bounded by the observe
+     * budget so reconciliation can never become its own loop.
+     */
+    const holdForPendingChildren=async()=>{
+      if(reconciliation.waits>=observeBudget)return false
+      const views=await observeChildTasks(true)
+      const decision=planChildTaskReconciliation(views,{previousFingerprint:reconciliation.fingerprint,maxObserve:observeBudget})
+      if(decision.changed)reconciliation.fingerprint=decision.fingerprint
+      if(decision.pending===0)return false
+      reconciliation.waits++
+      await injectReconciliationMessage(renderChildTaskBlockingNotice(views,decision.pending))
+      return true
     }
     const notifications=await this.sessions.consumeTaskNotifications(input.sessionId)
     for(const notification of notifications){ await deliverTaskNotification(notification) }
@@ -661,7 +797,7 @@ export class Agent {
 
       let overflowRecoveryUsed=false
       let overflowRecoveryRounds=0
-      for(let round=0;round<maxSteps+overflowRecoveryRounds;round++){
+      for(let round=0;round<maxSteps+overflowRecoveryRounds+reconciliation.waits;round++){
         if(round>0){
           // Parent-orchestration wakeup (TODO 14I items 1–4): child tasks that
           // settle while this turn is active are delivered into the running
@@ -672,13 +808,29 @@ export class Agent {
           const wakeups=await this.sessions.consumeTaskNotifications(input.sessionId).catch(()=>[])
           for(const notification of wakeups){ await deliverTaskNotification(notification) }
         }
+        // Parent-orchestration reconciliation (14I-O, item 857): observe every
+        // child task of this parent session and inject one structured
+        // reconciliation message per changed status fingerprint. Progress
+        // updates never flood the conversation.
+        const childViews=await observeChildTasks()
+        const childDecision=planChildTaskReconciliation(childViews,{previousFingerprint:reconciliation.fingerprint,maxObserve:observeBudget})
+        if(childDecision.changed)reconciliation.fingerprint=childDecision.fingerprint
+        if(childDecision.inject&&reconciliation.injections<observeBudget){
+          reconciliation.injections++
+          await injectReconciliationMessage(childDecision.message)
+        }
+        const childrenPending=childDecision.pending>0
+        // A pending child keeps the turn alive past the normal step budget;
+        // the extra rounds are bounded by the observe budget.
+        if(childrenPending&&reconciliation.waits<observeBudget&&round>=maxSteps-1)reconciliation.waits++
+        const canWaitForChildren=childrenPending&&reconciliation.waits<observeBudget
         await refreshActiveRouteContext()
         workflow?.assertProgressAllowed()
         await persistWorkflow()
         const phase=workflow?.state.phase
         const forcedFinal=hasLimit && round===maxSteps-1
         const completeOrBlocked=phase==='complete'||phase==='blocked'
-        const finalStep=forcedFinal||completeOrBlocked||Boolean(loopStopReason)||Boolean(completionRequested)
+        const finalStep=Boolean(loopStopReason)||(!canWaitForChildren&&(forcedFinal||completeOrBlocked||Boolean(completionRequested)))
         const finalNotice=loopStopReason
           ? `${explorationStopNotice ? `${explorationStopNotice}\n\n` : ''}Loop safety stop: ${loopStopReason}. Do not make additional tool calls. Re-check the original request mentally and respond with a concise summary of what was completed and anything that remains.`
           : 'Tool budget reached for this turn. Do not call tools. Respond with a concise summary of the work completed, verification performed, and any remaining work.'
@@ -1071,6 +1223,9 @@ export class Agent {
         }
         const settle = async (item:any) => {
           const {call,args,output,metadata,workflowOnly,error:toolError}=item
+          // 14I-O (item 857): remember the ids of the child tasks this parent
+          // launched so their outcomes can be reconciled later in the turn.
+          captureLaunchedTaskIds(metadata)
           const preserveOutput=Boolean(metadata?.preserveOutput) || ['use_skill','skill'].includes(call.function.name)
           const currentContextTokens=estimateMessagesTokens(messages)
           const requestHeadroom=Math.max(256,budget.usableTokens-currentContextTokens-requestSchemaResult.estimatedTokens)
@@ -1363,12 +1518,14 @@ export class Agent {
           await persistWorkflow()
           this.onStatus?.(`workflow ${workflow.state.phase}`)
           if(!calls.length && (workflow.state.phase==='complete'||workflow.state.phase==='blocked')){
+            if(await holdForPendingChildren())continue
             if(workflow.state.phase==='complete' && !loopStopReason){explorationTelemetry.setTerminationReason('completed');publishExplorationTelemetry()}
             await maybeCompact(0,'post-provider-response')
             resultText=text;break
           }
           if(!calls.length && !text.trim() && workflow.state.phase!=='complete') throw new Error(`Autonomous workflow requires progress; current state: ${workflowSummary(workflow.state)}`)
           if(calls.length===0 && workflow.state.phase==='complete'){
+            if(await holdForPendingChildren())continue
             if(!loopStopReason){explorationTelemetry.setTerminationReason('completed');publishExplorationTelemetry()}
             await maybeCompact(0,'post-provider-response')
             resultText=text;break
@@ -1376,6 +1533,7 @@ export class Agent {
           await maybeCompact(0,'post-tool-round')
         } else {
           if(!calls.length){
+            if(await holdForPendingChildren())continue
             if(!loopStopReason){explorationTelemetry.setTerminationReason('completed');publishExplorationTelemetry()}
             await maybeCompact(0,'post-provider-response')
             resultText=text;break

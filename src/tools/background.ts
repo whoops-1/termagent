@@ -1,5 +1,5 @@
 import type { Provider, ProviderConfig } from '../providers/types.js'
-import { TaskManager } from '../tasks/manager.js'
+import { TaskManager, assertChildLaunchPermitted, computeLaunchFingerprint, preflightChildProviderSnapshot } from '../tasks/manager.js'
 import { subagentProviderSnapshot } from '../tasks/task-provider.js'
 import { summarizeTask } from '../tasks/format.js'
 import type { ToolDefinition } from './types.js'
@@ -11,10 +11,15 @@ export function backgroundTool(manager: TaskManager): ToolDefinition {
     name:'background',
     risk:'shell',
     description:'Start a persistent shell command in the background. Returns a durable task id.',
-    schema:{type:'object',properties:{command:{type:'string',minLength:1},scope_paths:{type:'array',items:{type:'string'}}},required:['command']},
+    schema:{type:'object',properties:{command:{type:'string',minLength:1},scope_paths:{type:'array',items:{type:'string'}},retry_cause:{type:'string',description:'Required to retry an identical background command after it failed: describe the changed cause or configuration.'}},required:['command']},
     async execute(a,c){
       const scopes=Array.isArray(a.scope_paths)?a.scope_paths.map(String).filter(Boolean):(c.scopePaths?.length?c.scopePaths:['.'])
-      const task=await manager.createShell(String(a.command||''),c.cwd,c.sessionID,scopes,{background:true})
+      const command=String(a.command||'')
+      const retryCause=String(a.retry_cause??a.retryCause??'').trim()
+      // 14I-O (item 859): refuse a duplicate/no-progress background launch.
+      const fingerprint=computeLaunchFingerprint({kind:'shell',prompt:command,scopePaths:scopes})
+      await assertChildLaunchPermitted(manager,{parentSessionId:c.sessionID,fingerprint,retryCause,label:'background command'})
+      const task=await manager.createShell(command,c.cwd,c.sessionID,scopes,{background:true,launchFingerprint:fingerprint,launchRetryCause:retryCause||undefined})
       try {
         const pid=await manager.spawnWorker(task.id)
         const current=await manager.attachPid(task.id,pid)
@@ -75,15 +80,21 @@ export function backgroundAgentTool(manager: TaskManager, provider: Provider, pr
     name:'background_agent',
     risk:'shell',
     description:'Start a persistent autonomous coding agent task. It runs independently and stores status/output for later inspection.',
-    schema:{type:'object',properties:{prompt:{type:'string',minLength:1},scope_paths:{type:'array',items:{type:'string'}},role:{type:'string',enum:specialistRoleNames()}},required:['prompt']},
+    schema:{type:'object',properties:{prompt:{type:'string',minLength:1},scope_paths:{type:'array',items:{type:'string'}},role:{type:'string',enum:specialistRoleNames()},retry_cause:{type:'string',description:'Required to retry an identical background agent after it failed: describe the changed cause or configuration.'}},required:['prompt']},
     async execute(a,c){
       const cfg=await subagentProviderSnapshot(provider,providerConfig,{label:'a background agent',taskRoot:manager.taskRoot()})
+      await preflightChildProviderSnapshot(cfg,{label:'a background agent',kind:'agent',declaredAdapter:String(provider.config?.provider||providerConfig?.provider||'')})
       const policy=parentRegistry?parentRegistry.gate.deriveChildPolicy(parentRegistry.list()):{mode:'deny' as const,rules:[],allowedTools:[]}
       const role=specialistRole(typeof a.role==='string'?a.role:'general')
       const allowedTools=restrictSpecialistTools(role.name,policy.allowedTools)
       if(role.name!=='general' && !allowedTools.length) throw new Error(`Specialist role '${role.name}' has no tools permitted by the parent policy.`)
       const scopes=Array.isArray(a.scope_paths)?a.scope_paths.map(String).filter(Boolean):(c.scopePaths?.length?c.scopePaths:['.'])
-      const task=await manager.createAgent(String(a.prompt||''),c.cwd,cfg,scopes,c.sessionID,{permissionMode:policy.mode,permissionRules:policy.rules,allowedTools,background:true,specialistRole:role.name,delegationDepth:(c.delegationDepth||0)+1,parentTaskId:c.taskId})
+      const prompt=String(a.prompt||'')
+      const retryCause=String(a.retry_cause??a.retryCause??'').trim()
+      // 14I-O (item 859): refuse a duplicate/no-progress background launch.
+      const fingerprint=computeLaunchFingerprint({kind:'agent',prompt,scopePaths:scopes})
+      await assertChildLaunchPermitted(manager,{parentSessionId:c.sessionID,fingerprint,retryCause,label:'background agent'})
+      const task=await manager.createAgent(prompt,c.cwd,cfg,scopes,c.sessionID,{permissionMode:policy.mode,permissionRules:policy.rules,allowedTools,background:true,specialistRole:role.name,delegationDepth:(c.delegationDepth||0)+1,parentTaskId:c.taskId,launchFingerprint:fingerprint,launchRetryCause:retryCause||undefined})
       try {
         const pid=await manager.spawnWorker(task.id)
         const current=await manager.attachPid(task.id,pid)

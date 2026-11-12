@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { TaskManager } from '../tasks/manager.js'
+import { TaskManager, assertChildLaunchPermitted, computeLaunchFingerprint, preflightChildProviderSnapshot } from '../tasks/manager.js'
 import { subagentProviderSnapshot } from '../tasks/task-provider.js'
 import type { Provider, ProviderConfig } from '../providers/types.js'
 import type { ToolDefinition } from './types.js'
@@ -7,7 +7,7 @@ import { ToolRegistry } from './registry.js'
 import { within } from '../util/fs.js'
 import { specialistRole, specialistRoleNames, restrictSpecialistTools } from '../agent/specialists.js'
 
-type ParallelTask={prompt:string;paths:string[];role:string}
+type ParallelTask={prompt:string;paths:string[];role:string;retryCause:string}
 function normalizePaths(cwd:string,paths:string[]):string[]{return [...new Set(paths.map(x=>path.resolve(cwd,String(x))))].sort()}
 function overlaps(a:string,b:string){return a===b||a.startsWith(b+path.sep)||b.startsWith(a+path.sep)}
 
@@ -20,14 +20,14 @@ export function parallelAgentTool(manager:TaskManager,provider:Provider,provider
       properties:{
         tasks:{
           type:'array',minItems:2,maxItems:4,
-          items:{type:'object',properties:{prompt:{type:'string',minLength:1},paths:{type:'array',minItems:1,items:{type:'string'}},role:{type:'string',enum:specialistRoleNames()}},required:['prompt','paths']}
+          items:{type:'object',properties:{prompt:{type:'string',minLength:1},paths:{type:'array',minItems:1,items:{type:'string'}},role:{type:'string',enum:specialistRoleNames()},retry_cause:{type:'string',description:'Required to retry an identical parallel agent after it failed: describe the changed cause or configuration.'}},required:['prompt','paths']}
         }
       },
       required:['tasks']
     },
     async execute(a:any,c:any){
       if(!Array.isArray(a.tasks)||a.tasks.length<2||a.tasks.length>4)throw new Error('parallel_agents requires 2-4 tasks')
-      const tasks=(a.tasks as any[]).map((x:any)=>({prompt:String(x.prompt||'').trim(),paths:normalizePaths(c.cwd,Array.isArray(x.paths)?x.paths.map(String):[]),role:typeof x.role==='string'?x.role:'general'} as ParallelTask))
+      const tasks=(a.tasks as any[]).map((x:any)=>({prompt:String(x.prompt||'').trim(),paths:normalizePaths(c.cwd,Array.isArray(x.paths)?x.paths.map(String):[]),role:typeof x.role==='string'?x.role:'general',retryCause:String(x.retry_cause??x.retryCause??'').trim()} as ParallelTask))
       for(const [index,task] of tasks.entries()){
         if(!task.prompt)throw new Error(`parallel task ${index+1} has no prompt`)
         if(!task.paths.length)throw new Error(`parallel task ${index+1} must declare at least one workspace path`)
@@ -58,14 +58,24 @@ export function parallelAgentTool(manager:TaskManager,provider:Provider,provider
       const ids:string[]=[]
       const created:string[]=[]
       const persisted=await subagentProviderSnapshot(provider,providerConfig,{label:'parallel agents',taskRoot:manager.taskRoot()})
+      await preflightChildProviderSnapshot(persisted,{label:'parallel agents',kind:'agent',declaredAdapter:String(provider.config?.provider||providerConfig?.provider||'')})
       const policy=parentRegistry?parentRegistry.gate.deriveChildPolicy(parentRegistry.list()):{mode:'deny' as const,rules:[],allowedTools:[]}
+      // 14I-O (item 859): preflight the complete batch before any child is
+      // created so a refused launch never leaves half-applied work behind.
+      const launchPlans=tasks.map(task=>{
+        const relPaths=task.paths.map(p=>path.relative(c.cwd,p)||'.')
+        return {task,relPaths,fingerprint:computeLaunchFingerprint({kind:'agent',prompt:task.prompt,scopePaths:relPaths})}
+      })
+      for(const plan of launchPlans){
+        await assertChildLaunchPermitted(manager,{parentSessionId:c.sessionID,fingerprint:plan.fingerprint,retryCause:plan.task.retryCause,label:'parallel agent'})
+      }
       try{
-        for(const task of tasks){
-          const relPaths=task.paths.map(p=>path.relative(c.cwd,p)||'.')
+        for(const plan of launchPlans){
+          const {task,relPaths,fingerprint}=plan
           const role=specialistRole(task.role)
           const allowedTools=restrictSpecialistTools(role.name,policy.allowedTools)
           if(role.name!=='general' && !allowedTools.length) throw new Error(`Specialist role '${role.name}' has no tools permitted by the parent policy.`)
-          const t=await manager.createAgent(task.prompt,c.cwd,persisted,relPaths,c.sessionID,{allowedTools,specialistRole:role.name,delegationDepth:(c.delegationDepth||0)+1,parentTaskId:c.taskId,background:true,coordinated:true,permissionMode:policy.mode,permissionRules:policy.rules});created.push(t.id)
+          const t=await manager.createAgent(task.prompt,c.cwd,persisted,relPaths,c.sessionID,{allowedTools,specialistRole:role.name,delegationDepth:(c.delegationDepth||0)+1,parentTaskId:c.taskId,background:true,coordinated:true,permissionMode:policy.mode,permissionRules:policy.rules,launchFingerprint:fingerprint,launchRetryCause:task.retryCause||undefined});created.push(t.id)
           const pid=await manager.spawnWorker(t.id)
           const current=await manager.attachPid(t.id,pid);if(current.status==='cancelled'){try{process.kill(pid,'SIGTERM')}catch{}}
           await manager.event(t.id,'scope',{paths:relPaths});ids.push(t.id)
