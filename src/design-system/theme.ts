@@ -1,6 +1,7 @@
 import type { Theme, ThemeTokens } from './types.js'
-import process from 'node:process'
 import { promises as fs } from 'node:fs'
+import path from 'node:path'
+import { resolveHomeDirectory } from '../util/paths.js'
 
 const makeTheme = (value: Theme): Theme => ({
   ...value,
@@ -110,8 +111,8 @@ function sanitizeCustomTheme(id: string, raw: unknown): Theme | null {
 
 export async function loadThemeCatalog(cwd: string): Promise<Readonly<Record<string, Theme>>> {
   const directories = [
-    `${process.env.HOME || cwd}/.termagent/themes`,
-    `${cwd}/.termagent/themes`,
+    path.join(resolveHomeDirectory(), '.termagent', 'themes'),
+    path.join(cwd, '.termagent', 'themes'),
   ]
   const catalog: Record<string, Theme> = { ...THEMES }
   const builtInIds = new Set(Object.keys(THEMES))

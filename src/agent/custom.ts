@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { exists } from '../util/fs.js'
+import { resolveHomeDirectory } from '../util/paths.js'
 
 export type CustomAgent = { name:string; description:string; mode:'primary'|'subagent'|'all'; model?:string; prompt:string; permission?:Record<string,any>; hidden?:boolean; steps?:number; tools?:string[]; disallowedTools?:string[]; skills?:string[]; plugin?:{pluginId:string;pluginName:string;marketplace:string;version:string;installPath:string} }
 export type CustomCommand = { name:string; description:string; agent?:string; model?:string; subtask?:boolean; template:string; allowedTools?:string[]; argumentHint?:string; plugin?:{pluginId:string;pluginName:string;marketplace:string;version:string;installPath:string} }
@@ -15,13 +16,13 @@ export function parseFrontmatterText(text:string){
 async function scan(dir:string, suffix:string){const out:string[]=[];if(!(await exists(dir)))return out;for(const e of await fs.readdir(dir,{withFileTypes:true})){const p=path.join(dir,e.name);if(e.isDirectory())out.push(...await scan(p,suffix));else if(e.name.endsWith(suffix))out.push(p)}return out}
 function unique<T>(xs:T[]){return [...new Set(xs)]}
 export async function loadCustomAgents(cwd:string):Promise<CustomAgent[]>{
- const home=process.env.HOME||cwd; const dirs=unique([path.join(cwd,'.termagent','agents'),path.join(cwd,'.termagent','agent'),path.join(home,'.termagent','agents'),path.join(home,'.termagent','agent')]);
+ const home=resolveHomeDirectory(); const dirs=unique([path.join(cwd,'.termagent','agents'),path.join(cwd,'.termagent','agent'),path.join(home,'.termagent','agents'),path.join(home,'.termagent','agent')]);
  const files=(await Promise.all(dirs.map(d=>scan(d,'.md')))).flat(); const out:CustomAgent[]=[]
  for(const f of files){const parsed=parseFrontmatterText(await fs.readFile(f,'utf8'));const name=path.basename(f,'.md');out.push({name,description:String(parsed.meta.description||name),mode:(parsed.meta.mode==='primary'||parsed.meta.mode==='all')?parsed.meta.mode:'subagent',model:parsed.meta.model,prompt:parsed.body,permission:parsed.meta.permission,hidden:Boolean(parsed.meta.hidden),steps:parsed.meta.steps})}
  return out
 }
 export async function loadCustomCommands(cwd:string):Promise<CustomCommand[]>{
- const home=process.env.HOME||cwd; const dirs=unique([path.join(cwd,'.termagent','commands'),path.join(cwd,'.termagent','command'),path.join(home,'.termagent','commands'),path.join(home,'.termagent','command')]);
+ const home=resolveHomeDirectory(); const dirs=unique([path.join(cwd,'.termagent','commands'),path.join(cwd,'.termagent','command'),path.join(home,'.termagent','commands'),path.join(home,'.termagent','command')]);
  const files=(await Promise.all(dirs.map(d=>scan(d,'.md')))).flat(); const out:CustomCommand[]=[]
  for(const f of files){const parsed=parseFrontmatterText(await fs.readFile(f,'utf8'));const name=path.basename(f,'.md');out.push({name,description:String(parsed.meta.description||name),agent:parsed.meta.agent,model:parsed.meta.model,subtask:Boolean(parsed.meta.subtask),template:parsed.body})}
  return out

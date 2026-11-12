@@ -1,6 +1,7 @@
 import path from 'node:path'
 import { promises as fs } from 'node:fs'
 import { exists } from '../util/fs.js'
+import { resolveHomeDirectory } from '../util/paths.js'
 import type { Config, ProviderProfile } from '../config/config.js'
 
 export type ProviderManagerProfile = ProviderProfile & {
@@ -21,7 +22,7 @@ export type ProviderProfileDraft = {
   apiKey?: string
 }
 
-const HOME = () => process.env.HOME || process.cwd()
+const HOME = () => resolveHomeDirectory()
 
 export async function getProviderConfigPath(cwd: string): Promise<string> {
   const projectPath = path.join(cwd, '.termagent', 'config.json')
