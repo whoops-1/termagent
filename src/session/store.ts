@@ -20,6 +20,41 @@ const SESSION_LOCKS = new Map<string, Promise<void>>()
 const SESSION_BUSY = new Set<string>()
 type TurnLease = { lockPath:string; token:string }
 
+// Session state lease policy. Mirrors envNonNegativeInt from src/config/config.ts
+// because the session domain must not import config.
+function envNonNegativeInt(name:string,fallback:number){
+  const raw=process.env[name]
+  if(raw===undefined||raw.trim()==='') return fallback
+  const value=Number(raw)
+  return Number.isSafeInteger(value)&&value>=0 ? value : fallback
+}
+const SESSION_LEASE_INITIAL_WAIT_MS=10
+const SESSION_LEASE_MAX_WAIT_MS=200
+// ~8x the previous fixed 600 ms budget so concurrent session writes on slow
+// mobile/Termux storage stop failing spuriously, while staying well under a
+// user-perceived hang; TERMAGENT_SESSION_LOCK_TIMEOUT_MS overrides it.
+const SESSION_LEASE_DEFAULT_TIMEOUT_MS=5000
+// A lock whose contents cannot be classified (malformed/incomplete payload) may
+// still be mid-write by another process; only aged contents are recoverable.
+const SESSION_LEASE_MALFORMED_FRESH_MS=5000
+// Attempt bound against pathological recreate/delete churn; the wall-clock
+// budget above is the primary bound for waiting on a live owner.
+const SESSION_LEASE_MAX_ATTEMPTS=512
+export type SessionLeaseContention = {
+  sessionId:string
+  operation:string
+  attempts:number
+  waitedMs:number
+  outcome:'acquired'|'recovered-stale'|'recovered-malformed'|'timeout'
+  ownerPid?:number
+  decidedAt:number
+}
+type StateLockVerdict =
+  | {kind:'gone';pid?:undefined}
+  | {kind:'wait';reason:'live-owner'|'fresh-malformed';pid?:number}
+  | {kind:'recover-stale';pid:number}
+  | {kind:'recover-malformed';pid?:undefined}
+
 export class SessionStore {
   readonly root:string
   private snapshots = new Map<string, SnapshotStore>()
@@ -105,38 +140,109 @@ export class SessionStore {
     return await this.acquireTurnLease(id)
   }
 
-  private async acquireStateLease(id:string):Promise<TurnLease>{
+  // Bounded in-memory contention projection (LIVE state, never persisted):
+  // only the most recent contended acquisition is kept; clean acquisitions do
+  // not overwrite it. Redacted by construction — no message or credential
+  // content, only lease mechanics.
+  private lastContention?:SessionLeaseContention
+  lastSessionLeaseContention():SessionLeaseContention|undefined{
+    return this.lastContention?{...this.lastContention}:undefined
+  }
+
+  // NOTE(deferred): robust cross-platform process-start identity (pid + process
+  // start time) is deferred to the Windows-port work stream. Stale detection
+  // therefore relies on pid liveness plus the lock file's mtime/started
+  // heuristics; a recycled pid can keep a stale lock looking live until its
+  // contents age past the malformed-fresh recovery threshold.
+  private async acquireStateLease(id:string,operation='state'):Promise<TurnLease>{
     await ensureDir(this.root)
     const lockPath=this.stateLockFile(id)
     const token=crypto.randomBytes(12).toString('hex')
     const payload=JSON.stringify({pid:process.pid,token,started:Date.now()})+'\n'
-    for(let attempt=0;attempt<60;attempt++){
+    const budgetMs=envNonNegativeInt('TERMAGENT_SESSION_LOCK_TIMEOUT_MS',SESSION_LEASE_DEFAULT_TIMEOUT_MS)
+    const deadline=Date.now()+budgetMs
+    let attempts=0
+    let waitedMs=0
+    let waitIndex=0
+    let observedPid:number|undefined
+    let recovery:'stale'|'malformed'|undefined
+    const recordContention=(outcome:SessionLeaseContention['outcome'])=>{
+      this.lastContention={sessionId:id,operation,attempts,waitedMs,outcome,...(observedPid!==undefined?{ownerPid:observedPid}:{}),decidedAt:Date.now()}
+    }
+    while(attempts<SESSION_LEASE_MAX_ATTEMPTS){
+      attempts++
       try{
         const handle=await fs.open(lockPath,'wx')
         try{await handle.writeFile(payload,'utf8')}finally{await handle.close()}
+        if(attempts>1){
+          recordContention(recovery==='stale'?'recovered-stale':recovery==='malformed'?'recovered-malformed':'acquired')
+        }
         return {lockPath,token}
       }catch(error){
         if((error as {code?:string}).code!=='EEXIST')throw error
-        let owner:any
-        try{owner=JSON.parse(await fs.readFile(lockPath,'utf8'))}catch(error){
-          if((error as {code?:string}).code==='ENOENT')continue
-          const info=await fs.stat(lockPath).catch(()=>undefined)
-          if(info&&Date.now()-info.mtimeMs<5000){await new Promise(r=>setTimeout(r,10));continue}
-          await fs.rm(lockPath,{force:true});continue
+        const verdict=await this.classifyStateLock(lockPath)
+        observedPid=verdict.pid
+        if(verdict.kind==='gone')continue
+        if(verdict.kind==='wait'){
+          const remaining=deadline-Date.now()
+          if(remaining<=0){
+            // Budget exhausted while a live owner holds the lock: report and
+            // leave the owner's lock untouched. Never delete on timeout.
+            recordContention('timeout')
+            const detail=verdict.reason==='live-owner'&&verdict.pid!==undefined?`live owner pid ${verdict.pid} still holds the state lock`:'malformed or incomplete state lock contents'
+            throw new Error(`Session state is busy: unable to acquire state lock after ${attempts} attempt(s) and ${waitedMs} ms wait (${detail})`)
+          }
+          const wait=Math.max(0,Math.min(Math.round(Math.min(SESSION_LEASE_MAX_WAIT_MS,SESSION_LEASE_INITIAL_WAIT_MS*2**waitIndex)*(0.5+Math.random()*0.5)),remaining))
+          waitIndex++
+          if(wait>0){await new Promise(resolve=>setTimeout(resolve,wait));waitedMs+=wait}
+          continue
         }
-        const pid=Number(owner?.pid)
-        if(Number.isInteger(pid)&&pid>0){
-          try{process.kill(pid,0);await new Promise(r=>setTimeout(r,10));continue}catch(error){if((error as {code?:string}).code!=='ESRCH')throw error}
-        }
+        // Stale owner (provable dead pid) or aged malformed/incomplete
+        // contents: recover immediately, then retry the open attempt.
+        recovery=verdict.kind==='recover-stale'?'stale':'malformed'
         await fs.rm(lockPath,{force:true})
+        // Jitter after recovery keeps concurrent recovery loops from deleting
+        // and recreating the same lock in lockstep.
+        await new Promise(resolve=>setTimeout(resolve,1+Math.floor(Math.random()*9)))
       }
     }
-    throw new Error('Session state is busy: unable to acquire state lock')
+    recordContention('timeout')
+    throw new Error(`Session state is busy: unable to acquire state lock after ${attempts} attempt(s) and ${waitedMs} ms wait (acquisition attempts exhausted)`)
+  }
+
+  private async classifyStateLock(lockPath:string):Promise<StateLockVerdict>{
+    let owner:any
+    try{owner=JSON.parse(await fs.readFile(lockPath,'utf8'))}catch(error){
+      if((error as {code?:string}).code==='ENOENT')return {kind:'gone'}
+      return await this.stateLockFreshnessVerdict(lockPath)
+    }
+    const pid=Number(owner?.pid)
+    const started=Number(owner?.started)
+    const complete=Number.isInteger(pid)&&pid>0&&Number.isFinite(started)&&started>0&&typeof owner?.token==='string'&&owner.token.length>0
+    if(!complete)return await this.stateLockFreshnessVerdict(lockPath)
+    try{
+      process.kill(pid,0)
+      return {kind:'wait',reason:'live-owner',pid}
+    }catch(error){
+      if((error as {code?:string}).code==='ESRCH')return {kind:'recover-stale',pid}
+      // EPERM/EACCES or any other unresolved liveness signal means we could not
+      // prove the owner is dead; treat it as live so its lock is never deleted.
+      return {kind:'wait',reason:'live-owner',pid}
+    }
+  }
+
+  private async stateLockFreshnessVerdict(lockPath:string):Promise<StateLockVerdict>{
+    const info=await fs.stat(lockPath).catch(()=>undefined)
+    if(info&&Date.now()-info.mtimeMs<SESSION_LEASE_MALFORMED_FRESH_MS)return {kind:'wait',reason:'fresh-malformed'}
+    return {kind:'recover-malformed'}
   }
   private async releaseStateLease(lease:TurnLease){
     try{
+      // Compare-before-release: only delete the lock file whose payload token
+      // still matches the token we acquired; a foreign or tampered owner's
+      // lock must never be removed by our release path.
       const owner=JSON.parse(await fs.readFile(lease.lockPath,'utf8'))
-      if(owner?.pid===process.pid&&owner?.token===lease.token)await fs.rm(lease.lockPath,{force:true})
+      if(owner?.token===lease.token)await fs.rm(lease.lockPath,{force:true})
     }catch(error){if((error as {code?:string}).code!=='ENOENT')throw error}
   }
   async withSessionMutation<T>(id:string,fn:()=>Promise<T>):Promise<T>{
@@ -147,7 +253,7 @@ export class SessionStore {
     const inherited=this.mutationContext.getStore()
     if(inherited?.has(id))return await fn()
     return await this.withSessionLock(id,async()=>{
-      const lease=await this.acquireStateLease(id)
+      const lease=await this.acquireStateLease(id,'mutation')
       const active=new Set(inherited??[])
       active.add(id)
       try{return await this.mutationContext.run(active,fn)}finally{await this.releaseStateLease(lease)}
@@ -217,7 +323,7 @@ export class SessionStore {
 
   private async appendUnlocked(id:string,event:SessionEvent){
     if(this.mutationContext.getStore()?.has(id))return await this.appendCore(id,event)
-    const lease=await this.acquireStateLease(id)
+    const lease=await this.acquireStateLease(id,'append')
     try{return await this.appendCore(id,event)}finally{await this.releaseStateLease(lease)}
   }
 
