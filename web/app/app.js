@@ -483,11 +483,18 @@ function startEventStream(id) {
 
 function handleLiveEvent(event) {
   if (!event || event.sessionId !== state.activeId) return;
-  // The foreground POST stream is the authoritative live projection for a
-  // prompt initiated in this tab. Ignore its parallel EventBus copy to avoid
-  // rendering duplicate tokens and tool cards; durable events still reconcile
-  // through the session event stream.
-  if (state.promptStreamActive || Date.now() < state.promptStreamSuppressUntil) return;
+  // The foreground POST stream is the authoritative live projection for the
+  // prompt it owns: token deltas and the tool activity it renders. Suppress
+  // ONLY those duplicate sources while it is active. Everything else —
+  // run-state changes, task lifecycle, notifications — must stay live during
+  // a running prompt; the previous blanket suppression made tool calls and
+  // task progress visible only after stop/reconnect (Phase 14I batch-2
+  // live-delivery trace).
+  if (state.promptStreamActive || Date.now() < state.promptStreamSuppressUntil) {
+    const kind = String(event.kind || '');
+    if (kind === 'session.text.delta' || kind === 'session.reasoning.delta'
+      || kind === 'runtime.activity.changed' || kind === 'session.tool.output.delta') return;
+  }
   const payload = event.payload && typeof event.payload === 'object' ? event.payload : {};
   const streamId = String(payload.streamId || '');
   if (event.kind === 'runtime.status.changed') {

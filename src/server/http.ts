@@ -417,7 +417,16 @@ async function streamSessionEvents(runtime: Runtime, api: ReturnType<typeof crea
         if (!(await writeSse(res, 'live', live))) break
       }
       if (closed) break
-      await replay()
+      // Live durable delivery (Phase 14I batch-2 trace): the durable poll only
+      // needs to fetch pages when the durable sequence has actually moved.
+      // currentSequence is a stat-validated fast path in the session store
+      // (append optimization), so this gate keeps the per-client poll from
+      // rescanning the whole session log every tick while preserving the
+      // ≤1 s delivery floor for appends written by detached task workers that
+      // do not share this in-process event bus. Same-process durable appends
+      // still wake the bus and replay immediately.
+      const durableSequenceNow = await api.currentSequence(id)
+      if (durableSequenceNow > cursor) await replay()
     }
   } catch (error) {
     if (!closed) {
