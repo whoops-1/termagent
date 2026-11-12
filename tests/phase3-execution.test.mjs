@@ -396,7 +396,7 @@ test('phase 3: verification tool timeout is structured as a failure', async () =
   const result=await tool.execute({command:'sleep 1'},{sessionID:'s',agent:'build',cwd:process.cwd(),abort:abortSignal})
   assert.equal(result.metadata.ok,false)
   assert.equal(result.metadata.exitCode,124)
-  assert.equal(result.metadata.status,'failed')
+  assert.equal(result.metadata.status,'timeout')
 })
 
 test('phase 3: Agent lifecycle physically enforces the verification gate and provider roles', async () => {
@@ -416,7 +416,7 @@ test('phase 3: Agent lifecycle physically enforces the verification gate and pro
   const result=await agent.run({sessionId:session.id,messages:[],cwd,instructions:'',prompt:'implement it',autonomous:true,mode:'build'})
   assert.equal(result,'Implemented and verified.')
   assert.equal(await fs.readFile(path.join(cwd,'answer.txt'),'utf8'),'fixed')
-  assert.deepEqual(provider.roles.slice(0,4),['planning','building','verification','default'])
+  assert.deepEqual(provider.roles.slice(0,4),['planning','planning','building','verification'])
   const loaded=await store.load(session.id); const workflows=loaded.events.filter(e=>e.type==='workflow')
   assert.ok(workflows.some(e=>e.data?.phase==='complete'))
 })

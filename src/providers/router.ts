@@ -21,6 +21,10 @@ export class ProviderRouter implements Provider {
     this.model=first.model;this.config=first.config
   }
   setRole(role:string){this.role=role||'default'}
+  getActiveConfig():ProviderConfig{
+    const selected=this.select(this.role)
+    return selected.config
+  }
   setTurnContext(input:{userText:string;turnNumber?:number;hasNonTextContent?:boolean}){
     this.turnNumber=input.turnNumber??(this.turnNumber+1)
     this.decision=this.smartRouting?chooseSmartRoute({...input,turnNumber:this.turnNumber},this.smartRouting):null

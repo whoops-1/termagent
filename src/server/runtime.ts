@@ -1,10 +1,14 @@
 import process from 'node:process'
+import path from 'node:path'
 import crypto from 'node:crypto'
 import { loadConfig, resolveProviderConfig, type Config, type ProviderProfile } from '../config/config.js'
 import { loadInstructions } from '../context/instructions.js'
 import { compactMessages } from '../agent/compaction.js'
 import { buildRepositoryMap, formatRepositoryMap } from '../context/repository.js'
 import { retrieveContext } from '../context/retrieval.js'
+import { repositoryBudgetFor, contextLimitsFor } from '../context/runtime-budget.js'
+import { createContextBudget, estimateMessagesTokens } from '../context/budget.js'
+import { aggregateProviderUsageEvents } from '../providers/types.js'
 import { createProvider } from '../providers/registry.js'
 import { ProviderRouter } from '../providers/router.js'
 import { resolveProviderTarget } from '../providers/selection.js'
@@ -30,17 +34,38 @@ import { loadCustomAgents, loadCustomCommands } from '../agent/custom.js'
 import { loadInstalledPluginComponents } from '../plugins/components.js'
 import { PluginHookManager } from '../plugins/hooks.js'
 import { SessionEventBus } from '../session/event-bus.js'
+import { CommandLedger } from '../interaction/ledger.js'
+import { SessionPromptQueue } from '../session/prompt-queue.js'
+import { toLiveEventEnvelope } from '../protocol/session-events.js'
+import type { LiveEventKind } from '../protocol/types.js'
+import type { QuestionPrompt, QuestionResponse } from '../tools/types.js'
+import type { DaemonOwnerPublicInfo } from './daemon-owner.js'
 
 export type Runtime = Awaited<ReturnType<typeof createRuntime>>
 
-export async function createRuntime(cwd:string) {
+export async function createRuntime(cwd:string, daemonInfo?:()=>DaemonOwnerPublicInfo) {
   const cfg=await loadConfig(cwd)
   const events=new SessionEventBus()
   const store=new SessionStore(undefined,events)
+  const tasks=new TaskManager()
+  await tasks.recover()
+  if(daemonInfo){
+    const activeTaskSessions=new Set((await tasks.list())
+      .filter(task=>task.status==='running'&&task.pid&&typeof task.cwd==='string'&&path.resolve(task.cwd)===path.resolve(cwd))
+      .flatMap(task=>[task.childSessionId,task.sessionId].filter((id):id is string=>Boolean(id))))
+    await store.recoverOrphanedRuntimeState(cwd,daemonInfo().id,activeTaskSessions)
+  }
+  const ledger=new CommandLedger(store)
+  const queue=new SessionPromptQueue(store)
   const gate=new PermissionGate(cfg.approvals, process.stdin, process.stdout, cfg.permissionRules || [], store)
+  gate.setRequester(async request => {
+    const resolved=await store.waitForInteractionResolution(request.sessionId,request.requestId,request.signal)
+    if(resolved.kind!=='permission')throw new Error(`Interaction ${request.requestId} is not a permission request`)
+    if(resolved.status!=='resolved'||!resolved.resolution)return 'deny'
+    return resolved.resolution.decision
+  })
   const registry=new ToolRegistry(gate)
   builtinTools({timeout:cfg.shellTimeoutMs,maxOutput:cfg.maxOutputBytes,toolOutputMaxLines:cfg.toolOutputMaxLines,toolOutputMaxBytes:cfg.toolOutputMaxBytes,toolOutputRetentionDays:cfg.toolOutputRetentionDays}).forEach(t=>registry.add(t)); registry.add(questionTool(store))
-  const tasks=new TaskManager(); await tasks.recover()
   let providerCfg:any=resolveProviderConfig(cfg)
   let provider:any=createProvider(providerCfg)
   registry.add(backgroundTool(tasks)); registry.add(taskStatusTool(tasks)); registry.add(taskCancelTool(tasks));
@@ -64,48 +89,111 @@ export async function createRuntime(cwd:string) {
   pluginComponents.errors.forEach(e=>console.error(`[plugin:${e.plugin}:${e.component}] ${e.error}`))
   const hookManager=new PluginHookManager(pluginComponents.hooks,gate)
   const mcp=await connectMCP({...cfg.mcp,...pluginComponents.mcpServers},cwd); mcp.tools.forEach(t=>registry.add(t))
-  skillTools(async (sessionID,event)=>{ await store.append(sessionID,{type:`skill.${event.action}` as any,ts:Date.now(),data:event}) }, { maxBodyTokens: Math.max(512, Math.floor((cfg.maxContextTokens || 12000) * 0.16)) }).forEach(t=>registry.add(t))
+  const skillContextLimits=contextLimitsFor(provider,cfg,'subagent')
+  skillTools(async (sessionID,event)=>{ await store.append(sessionID,{type:`skill.${event.action}` as any,ts:Date.now(),data:event}) }, { maxBodyTokens: Math.min(48_000,Math.max(2_048,Math.floor(skillContextLimits.contextWindow*0.14))) }).forEach(t=>registry.add(t))
   const instructions=await loadInstructions(cwd)
   const skillCatalog=await loadSkillCatalog(cwd); const skills=skillCatalog.list()
   const customAgents=[...(await loadCustomAgents(cwd)),...pluginComponents.agents]
   const customCommands=[...(await loadCustomCommands(cwd)),...pluginComponents.commands]
   const activeControllers=new Map<string,AbortController>()
+  const activeRunCompletions=new Map<string,Promise<void>>()
+  const queueWorkers=new Map<string,Promise<void>>()
+  let shuttingDown=false
+  let kickQueue:(sessionId:string)=>Promise<void> = async()=>{}
   let repositoryMap=await buildRepositoryMap(cwd)
-  return {
-    cwd,cfg,store,events,registry,tasks,mcp,instructions,skills,customAgents,customCommands,getProvider:()=>provider,getProviderCfg:()=>providerCfg,
+  const runtime:any = {
+    cwd,cfg,store,events,registry,tasks,mcp,instructions,skills,customAgents,customCommands,ledger,queue,getDaemonInfo:()=>daemonInfo?.(),getProvider:()=>provider,getProviderCfg:()=>providerCfg,
     getMode:()=>agentMode,setMode:(m:string)=>{agentMode=m;selectedCustom=undefined},getCustom:()=>selectedCustom,
     setCustom:(a:any)=>{selectedCustom=a},getRepository:()=>repositoryMap,
     async refresh(){ repositoryMap=await buildRepositoryMap(cwd); return repositoryMap },
-    async runPrompt(sessionId:string,messages:any[],prompt:string,opts:{mode?:string;customAgent?:any;autonomous?:boolean;signal?:AbortSignal;onText?:(s:string)=>void;onReasoning?:(s:string)=>void;onTool?:(n:string,a:any)=>void;onToolResult?:(n:string,o:string,m?:any)=>void;onQuestion?:(questions:any[],signal?:AbortSignal)=>Promise<string[][]|import('../tools/types.js').QuestionResponse>;onStatus?:(s:string)=>void;allowedTools?:string[]}={}){
-      const mode=opts.mode||agentMode
-      const custom=opts.customAgent
-      const selectedProvider = custom?.model ? (resolveProviderTarget(cfg, custom.model) || provider) : provider
-      const repositoryOverview=formatRepositoryMap(repositoryMap,100)
-      const retrieved=await retrieveContext(repositoryMap,prompt,{maxFiles:5,maxBytes:cfg.maxContextBytes||36000})
-      const selected=skills
-      const agent=new Agent(selectedProvider,registry,store,cfg.maxToolRounds,cfg.maxContextTokens||12000,cfg.retryMax||4,opts.onStatus,skills,{threshold:cfg.compactionThreshold,reserveTokens:cfg.contextReserveTokens,recentTokens:cfg.contextRecentTokens},hookManager,{maxLines:cfg.toolOutputMaxLines,maxBytes:cfg.toolOutputMaxBytes,retentionDays:cfg.toolOutputRetentionDays},cfg.postEditVerification)
-      const controller=new AbortController()
-      if(opts.signal){if(opts.signal.aborted)controller.abort();else opts.signal.addEventListener('abort',()=>controller.abort(),{once:true})}
+    async runPrompt(sessionId:string,messages:any[],prompt:string,opts:{mode?:string;customAgent?:any;autonomous?:boolean;signal?:AbortSignal;onText?:(s:string)=>void;onReasoning?:(s:string)=>void;onTool?:(n:string,a:any,callId?:string)=>void;onToolResult?:(n:string,o:string,m?:any)=>void;onQuestion?:(questions:any[],signal?:AbortSignal)=>Promise<string[][]|import('../tools/types.js').QuestionResponse>;onStatus?:(s:string)=>void;allowedTools?:string[]}={}){
+      // Register ownership before any asynchronous context retrieval. Shutdown
+      // must be able to abort every accepted run, not only runs that have
+      // reached Agent.run() already.
       if(activeControllers.has(sessionId)) throw new Error('Session is busy: another prompt is already running')
+      const controller=new AbortController()
+      const forwardAbort=()=>{if(!controller.signal.aborted)controller.abort(opts.signal?.reason)}
+      if(opts.signal){
+        if(opts.signal.aborted)forwardAbort()
+        else opts.signal.addEventListener('abort',forwardAbort,{once:true})
+      }
+      let finishRun!:()=>void
+      const runCompletion=new Promise<void>(resolve=>{finishRun=resolve})
+      activeRunCompletions.set(sessionId,runCompletion)
       activeControllers.set(sessionId,controller)
+      let finalState:'completed'|'failed'|'interrupted'='completed'
+      let emitIdle:(()=>void)|undefined
+      const streamId=`run_${crypto.randomBytes(8).toString('hex')}`
+      let liveEventNo=0
+      const emitLive=(kind:LiveEventKind,payload:Record<string,unknown>)=>events.publishLive(toLiveEventEnvelope(sessionId,`${streamId}_${++liveEventNo}`,kind,{streamId,...payload}))
+      const onText=(delta:string)=>{emitLive('session.text.delta',{delta});opts.onText?.(delta)}
+      const onReasoning=(delta:string)=>{emitLive('session.reasoning.delta',{delta});opts.onReasoning?.(delta)}
+      const describeToolActivity=(name:string)=>{
+        const tool=name.toLowerCase()
+        if(['task','background_agent','parallel_agents'].includes(tool)) return 'Delegating to subagents'
+        if(['read_file','list_files','grep','glob','repo_map','search_files','find_files','web_search'].includes(tool)) return 'Exploring workspace'
+        if(['write_file','edit_file','apply_patch','delete_file'].includes(tool)) return 'Editing files'
+        if(tool==='bash'||tool==='shell') return 'Running terminal command'
+        if(tool.includes('test')||tool==='verify') return 'Running verification'
+        return `Using ${name}`
+      }
+      const onTool=(name:string,args:unknown,callId?:string)=>{
+        emitLive('runtime.activity.changed',{state:'tool',phase:'started',name,activityLabel:describeToolActivity(name),callId})
+        opts.onTool?.(name,args,callId)
+      }
+      const onToolResult=(name:string,output:string,metadata?:unknown)=>{
+        const toolLifecycle=metadata&&typeof metadata==='object'?(metadata as Record<string,any>).toolLifecycle:undefined
+        const callId=toolLifecycle&&typeof toolLifecycle.callId==='string'?toolLifecycle.callId:undefined
+        emitLive('session.tool.output.delta',{name,output,metadata,complete:true,...(callId?{callId}:{})})
+        opts.onToolResult?.(name,output,metadata)
+      }
+      const onStatus=(message:string)=>{
+        emitLive('runtime.activity.changed',{state:'working',message,activityLabel:message})
+        opts.onStatus?.(message)
+      }
+      emitIdle=()=>emitLive('runtime.status.changed',{state:'idle',phase:finalState,endedAt:Date.now()})
+      emitLive('runtime.status.changed',{state:'working',phase:'started',startedAt:Date.now()})
+      emitLive('runtime.activity.changed',{state:'preparing',phase:'context',message:'Preparing workspace context',activityLabel:'Preparing workspace context'})
+      opts.onStatus?.('Preparing workspace context')
       try {
-        return await agent.run({sessionId,messages,cwd,instructions,repositoryContext:`${repositoryOverview}\n\n${retrieved}`,skillsContext:'(automatic skill discovery is performed by the agent)',prompt,onText:opts.onText,onReasoning:opts.onReasoning,onTool:opts.onTool,onToolResult:opts.onToolResult,onQuestion:opts.onQuestion,autonomous:opts.autonomous,mode,customAgent:opts.customAgent,signal:controller.signal,allowedTools:opts.allowedTools} as any)
-      } finally { activeControllers.delete(sessionId) }
+        const mode=opts.mode||agentMode
+        const custom=opts.customAgent
+        const selectedProvider=custom?.model?(resolveProviderTarget(cfg,custom.model)||provider):provider
+        const role=mode==='plan'?'planning':mode==='build'?'building':'default'
+        const repoBudget=repositoryBudgetFor(selectedProvider,cfg,role,repositoryMap.files.length,prompt,messages.length+1)
+        const repositoryOverview=formatRepositoryMap(repositoryMap,repoBudget.mapPaths,repoBudget.mapTokens)
+        const retrieved=await retrieveContext(repositoryMap,prompt,{maxFiles:repoBudget.retrievalFiles,maxBytes:repoBudget.retrievalBytes,maxTokens:repoBudget.retrievalTokens,maxFileBytes:repoBudget.retrievalFileBytes})
+        if(controller.signal.aborted) throw controller.signal.reason || new Error('Prompt interrupted')
+        const agent=new Agent(selectedProvider,registry,store,cfg.maxToolRounds,cfg.maxContextTokens||0,cfg.retryMax||4,onStatus,skills,{threshold:cfg.compactionThreshold,reserveTokens:cfg.contextReserveTokens,recentTokens:cfg.contextRecentTokens},hookManager,{maxLines:cfg.toolOutputMaxLines,maxBytes:cfg.toolOutputMaxBytes,retentionDays:cfg.toolOutputRetentionDays},cfg.postEditVerification)
+        return await agent.run({sessionId,messages,cwd,instructions,repositoryContext:`${repositoryOverview}\n\n${retrieved}`,skillsContext:'(automatic skill discovery is performed by the agent)',prompt,onText,onReasoning,onTool,onToolResult,onQuestion:opts.onQuestion,autonomous:opts.autonomous,mode,customAgent:opts.customAgent,signal:controller.signal,allowedTools:opts.allowedTools} as any)
+      } catch(error) {
+        finalState=controller.signal.aborted?'interrupted':'failed'
+        throw error
+      } finally {
+        if(opts.signal)opts.signal.removeEventListener('abort',forwardAbort)
+        activeControllers.delete(sessionId)
+        activeRunCompletions.delete(sessionId)
+        try { emitIdle?.() } finally {
+          finishRun()
+          if(!shuttingDown) queueMicrotask(()=>{ void kickQueue(sessionId) })
+        }
+      }
     },
     async contextSnapshot(sessionId:string){
-      const { estimateMessagesTokens, createContextBudget } = await import('../context/budget.js')
       const x=await store.load(sessionId)
       const contextCheckpoint=await store.latestContextCheckpoint(sessionId)
       const projectedMessages=Array.isArray(contextCheckpoint?.messages) ? contextCheckpoint.messages : x.messages
+      const limits=contextLimitsFor(provider,cfg,agentMode==='plan'?'planning':agentMode==='build'?'building':'default')
       const tokens=estimateMessagesTokens(projectedMessages)
-      const limit=cfg.maxContextTokens||12000
-      const budget=createContextBudget({maxContextTokens:limit,reserveTokens:cfg.contextReserveTokens||0,recentTokens:cfg.contextRecentTokens||3000,maxOutputTokens:provider.config?.maxTokens||0})
-      return {sessionId,tokens,limit,remaining:Math.max(0,limit-tokens),utilization:limit?tokens/limit:0,messageCount:projectedMessages.length,toolMessages:projectedMessages.filter((m:any)=>m.role==='tool').length,updated:x.meta?.updated,checkpoint:contextCheckpoint?{id:contextCheckpoint.id,epoch:contextCheckpoint.epoch,stage:contextCheckpoint.stage,summaryRevision:contextCheckpoint.summaryRevision}:undefined}
+      const limit=limits.contextWindow
+      const budget=createContextBudget({maxContextTokens:limit,maxOutputTokens:limits.maxOutputTokens,reserveTokens:cfg.contextReserveTokens,recentTokens:cfg.contextRecentTokens})
+      return {sessionId,tokens,limit,contextSource:limits.contextSource,provider:limits.provider,model:limits.model,maxOutputTokens:limits.maxOutputTokens,usableTokens:budget.usableTokens,remaining:Math.max(0,budget.usableTokens-tokens),utilization:limit?tokens/limit:0,messageCount:projectedMessages.length,toolMessages:projectedMessages.filter((m:any)=>m.role==='tool').length,usage:aggregateProviderUsageEvents(x.events),updated:x.meta?.updated,checkpoint:contextCheckpoint?{id:contextCheckpoint.id,epoch:contextCheckpoint.epoch,stage:contextCheckpoint.stage,summaryRevision:contextCheckpoint.summaryRevision}:undefined}
     },
     async compactSession(sessionId:string){
       const x=await store.load(sessionId)
-      const budget=cfg.maxContextTokens||12000
-      const compacted=compactMessages(x.messages,budget,{maxOutputTokens:provider.config?.maxTokens||0,threshold:1,reserveTokens:0,recentTokens:cfg.contextRecentTokens||3000})
+      const limits=contextLimitsFor(provider,cfg)
+      const budget=limits.contextWindow
+      const compacted=compactMessages(x.messages,budget,{maxOutputTokens:limits.maxOutputTokens,threshold:1,reserveTokens:cfg.contextReserveTokens||0,recentTokens:cfg.contextRecentTokens||0})
       if(compacted.removed){
         const prior=await store.latestContextCheckpoint(sessionId)
         const loaded=await store.load(sessionId)
@@ -120,6 +208,97 @@ export async function createRuntime(cwd:string) {
     },
     interrupt(sessionId:string){ const controller=activeControllers.get(sessionId); if(!controller) return false; controller.abort(); return true },
     isRunning(sessionId:string){ return activeControllers.has(sessionId) },
-    async close(){await Promise.all(mcp.clients.map(c=>c.close()))}
+    kickQueue(sessionId:string){ return kickQueue(sessionId) },
+    async recoverQueuedPrompts(){
+      if(!daemonInfo) return
+      const sessions=await store.list()
+      const workspace=path.resolve(cwd)
+      for(const session of sessions){
+        if(!session.cwd || path.resolve(session.cwd)!==workspace) continue
+        await queue.recoverStaleExecuting(session.id)
+        const pending=await queue.list(session.id,true)
+        if(pending.some(item=>item.status==='queued')) void kickQueue(session.id)
+      }
+    },
+    async close(){
+      shuttingDown=true
+      for(const controller of activeControllers.values())controller.abort()
+      await Promise.all([...activeRunCompletions.values()])
+      await Promise.all([...queueWorkers.values()])
+      await Promise.all(mcp.clients.map(c=>c.close()))
+    }
   }
+
+  kickQueue=(sessionId:string):Promise<void>=>{
+    // Queue execution belongs to the exclusive daemon owner. Standalone local
+    // REPL runtimes retain their existing in-process queue drain.
+    if(!daemonInfo || shuttingDown) return Promise.resolve()
+    const current=queueWorkers.get(sessionId)
+    if(current) return current
+    let worker:Promise<void>
+    worker=(async()=>{
+      while(!shuttingDown){
+        // A direct prompt request may already own the session. Wait rather than
+        // failing or stealing the queued item; runPrompt remains the final
+        // synchronous owner check for the narrow admission race.
+        if(activeControllers.has(sessionId)){
+          await new Promise(resolve=>setTimeout(resolve,75))
+          continue
+        }
+        const next=await queue.claimNext(sessionId)
+        if(!next) break
+        try{
+          const loaded=await store.load(sessionId)
+          await runtime.runPrompt(sessionId,loaded.messages,next.content,{
+            mode:typeof next.metadata?.mode==='string'?next.metadata.mode:agentMode,
+            autonomous:Boolean(next.metadata?.autonomous),
+            customAgent:typeof next.metadata?.agent==='string'?customAgents.find((item:any)=>item.name===next.metadata!.agent):undefined,
+            onQuestion:async(questions:QuestionPrompt[],signal?:AbortSignal):Promise<QuestionResponse>=>{
+              const pending=await store.pendingInteractions(sessionId)
+              // The durable interaction projection intentionally omits UI-only
+              // fields such as header/custom. Match the stable question content,
+              // not the richer in-memory prompt object.
+              const normalized=questions.map((question,index)=>({
+                id:String(question.id||`q_${index+1}`),
+                question:String(question.question||''),
+                ...(Array.isArray(question.options)?{options:question.options.map(option=>({label:String(option.label||''),...(option.description===undefined?{}:{description:String(option.description)})})).filter(option=>option.label)}:{}),
+                ...(question.multiple!==undefined||question.multi!==undefined?{multi:Boolean(question.multiple??question.multi)}:{}),
+              }))
+              const request=[...pending].reverse().find((item:any)=>item.kind==='question'&&JSON.stringify(item.questions)===JSON.stringify(normalized))
+              if(!request) throw new Error('Question request was not persisted before waiting for its answer')
+              const resolved=await store.waitForInteractionResolution(sessionId,request.requestId,signal)
+              if(resolved.kind!=='question') throw new Error(`Interaction ${request.requestId} changed kind unexpectedly`)
+              return {
+                requestId:request.requestId,
+                status:resolved.status==='replied'?'replied':resolved.status==='rejected'?'rejected':'cancelled',
+                answers:resolved.resolution?.answers||[],
+              }
+            },
+          })
+          await queue.complete(sessionId,next.id)
+        }catch(error){
+          const message=error instanceof Error?error.message:String(error)
+          if(shuttingDown || /^Session is busy:/.test(message)){
+            await queue.requeue(sessionId,next.id).catch(()=>undefined)
+            if(!shuttingDown) await new Promise(resolve=>setTimeout(resolve,75))
+            continue
+          }
+          await queue.fail(sessionId,next.id,error).catch(queueError=>console.error('queue item failure persistence:',queueError))
+        }
+      }
+    })().catch(error=>{
+      console.error(`daemon queue worker failed for ${sessionId}:`,error)
+    }).finally(async()=>{
+      if(queueWorkers.get(sessionId)===worker) queueWorkers.delete(sessionId)
+      if(!shuttingDown){
+        try{
+          const pending=await queue.list(sessionId,true)
+          if(pending.some(item=>item.status==='queued')) void kickQueue(sessionId)
+        }catch(error){ console.error(`daemon queue recovery failed for ${sessionId}:`,error) }
+      }
+    })
+    queueWorkers.set(sessionId,worker)
+    return worker
+  }
+  return runtime
 }

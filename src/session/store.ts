@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { ensureDir } from '../util/fs.js'
 import { SnapshotStore } from './snapshot.js'
 import { enrichStoredEvent, toDurableEventEnvelope, legacyEventKind, legacyEventCategory } from '../protocol/session-events.js'
@@ -9,11 +10,11 @@ import type { CommandReceipt, DurableEventEnvelope, EventCategory, EventKind, In
 import { firstWriterWins } from '../protocol/types.js'
 import { canonicalJson } from '../util/canonical.js'
 
-export type ChatMessage = { role: 'system'|'user'|'assistant'|'tool'; content: string | null; tool_call_id?: string; tool_calls?: ToolCall[]; name?: string; reasoning?: string }
+export type ChatMessage = import('../protocol/api.js').ChatMessage
 export type ToolCall = { id: string; type: 'function'; function: { name: string; arguments: string } }
-export type SessionEvent = { type:'message'|'meta'|'compaction'|'context.checkpoint'|'branch'|'summary'|'todo'|'workflow'|'checkpoint'|'checkpoint.restore'|'turn'|'undo'|'redo'|'skill.search'|'skill.load'|'skill.skip'|'question.asked'|'question.replied'|'question.rejected'|'question.cancelled'|'permission.asked'|'permission.resolved'|'permission.cancelled'|'command.receipt'|'tool.call'|'provider.turn'|'task.notification'|'task.notification.consumed'|'prompt.queue'|'mutation'|'diff'|'verification'; ts:number; data:any; eventId?:string; version?:1; sequence?:number; durable?:true; category?:EventCategory; kind?:EventKind }
-export type SessionMeta = { id:string; cwd:string; model:string; created:number; updated:number; parentId?:string; branchPoint?:number; parentCheckpointId?:string; parentSnapshotId?:string }
-export type TurnRecord = { id:string; prompt?:string; beforeSnapshot:string; afterSnapshot?:string; afterProtectedSnapshot?:string; started:number; committed?:number; beforeMessageCount:number; afterMessageCount?:number; status:'started'|'committed' }
+export type SessionEvent = { type:'message'|'meta'|'compaction'|'context.checkpoint'|'context.instructions'|'branch'|'summary'|'todo'|'workflow'|'checkpoint'|'checkpoint.restore'|'turn'|'undo'|'redo'|'skill.search'|'skill.load'|'skill.skip'|'question.asked'|'question.replied'|'question.rejected'|'question.cancelled'|'permission.asked'|'permission.resolved'|'permission.cancelled'|'command.receipt'|'tool.call'|'provider.turn'|'provider.usage'|'task.notification'|'task.notification.consumed'|'prompt.queue'|'mutation'|'diff'|'verification'; ts:number; data:any; eventId?:string; version?:1; sequence?:number; durable?:true; category?:EventCategory; kind?:EventKind }
+export type SessionMeta = import('../protocol/api.js').SessionMeta
+export type TurnRecord = { id:string; prompt?:string; beforeSnapshot:string; afterSnapshot?:string; afterProtectedSnapshot?:string; started:number; committed?:number; interruptedAt?:number; beforeMessageCount:number; afterMessageCount?:number; status:'started'|'committed'|'failed'|'interrupted'; recovery?:{reason:'daemon-restart';ownerId:string} }
 
 const SESSION_LOCKS = new Map<string, Promise<void>>()
 const SESSION_BUSY = new Set<string>()
@@ -22,7 +23,7 @@ type TurnLease = { lockPath:string; token:string }
 export class SessionStore {
   readonly root:string
   private snapshots = new Map<string, SnapshotStore>()
-  private mutationDepth = new Map<string, number>()
+  private readonly mutationContext = new AsyncLocalStorage<ReadonlySet<string>>()
   readonly events?: SessionEventBus
   constructor(root=path.join(process.env.HOME||process.cwd(),'.termagent','sessions'), eventBus?: SessionEventBus) { this.root=root; this.events=eventBus }
   private snapshotStore(cwd:string, id:string) {
@@ -139,22 +140,18 @@ export class SessionStore {
     }catch(error){if((error as {code?:string}).code!=='ENOENT')throw error}
   }
   async withSessionMutation<T>(id:string,fn:()=>Promise<T>):Promise<T>{
-    const nested=(this.mutationDepth.get(id)??0)>0
-    if(nested){
-      this.mutationDepth.set(id,(this.mutationDepth.get(id)??0)+1)
-      try{return await fn()}finally{this.decrementMutationDepth(id)}
-    }
+    // Re-entrancy must be scoped to the current async call chain. A process-wide
+    // per-session depth counter lets an unrelated concurrent worker mistake an
+    // in-flight transaction for its own nested call and skip the lease. That
+    // can allocate duplicate durable sequence numbers under daemon load.
+    const inherited=this.mutationContext.getStore()
+    if(inherited?.has(id))return await fn()
     return await this.withSessionLock(id,async()=>{
       const lease=await this.acquireStateLease(id)
-      this.mutationDepth.set(id,1)
-      try{return await fn()}finally{this.decrementMutationDepth(id);await this.releaseStateLease(lease)}
+      const active=new Set(inherited??[])
+      active.add(id)
+      try{return await this.mutationContext.run(active,fn)}finally{await this.releaseStateLease(lease)}
     })
-  }
-
-  private decrementMutationDepth(id:string){
-    const depth=this.mutationDepth.get(id)??0
-    if(depth<=1)this.mutationDepth.delete(id)
-    else this.mutationDepth.set(id,depth-1)
   }
 
   private async readEventsRaw(id:string):Promise<SessionEvent[]>{
@@ -219,13 +216,13 @@ export class SessionStore {
   }
 
   private async appendUnlocked(id:string,event:SessionEvent){
-    if((this.mutationDepth.get(id)??0)>0)return await this.appendCore(id,event)
+    if(this.mutationContext.getStore()?.has(id))return await this.appendCore(id,event)
     const lease=await this.acquireStateLease(id)
     try{return await this.appendCore(id,event)}finally{await this.releaseStateLease(lease)}
   }
 
   async append(id:string,event:SessionEvent){
-    if((this.mutationDepth.get(id)??0)>0) return await this.appendUnlocked(id,event)
+    if(this.mutationContext.getStore()?.has(id)) return await this.appendUnlocked(id,event)
     return await this.withSessionLock(id,()=>this.appendUnlocked(id,event))
   }
   async currentSequence(id:string):Promise<import('../protocol/types.js').DurableSequence>{
@@ -300,14 +297,14 @@ export class SessionStore {
       if(event.type==='permission.asked'){
         const prior=states.get(requestId)
         if(prior && prior.kind==='permission' && prior.status!=='pending') continue
-        states.set(requestId,{kind:'permission',requestId,sessionId:id,revision:Math.max(Number(data.revision||1),prior?.revision||0),status:'pending',tool:String(data.tool||''),action:String(data.action||''),resources:Array.isArray(data.resources)?data.resources.map(String):[],createdAt:Number(data.createdAt||event.ts)})
+        states.set(requestId,{kind:'permission',requestId,sessionId:id,revision:Math.max(Number(data.revision||1),prior?.revision||0),status:'pending',tool:String(data.tool||''),...(typeof data.toolCallId==='string'?{toolCallId:data.toolCallId}:{}),action:String(data.action||''),resources:Array.isArray(data.resources)?data.resources.map(String):[],createdAt:Number(data.createdAt||event.ts)})
         continue
       }
       if(event.type==='permission.resolved' || event.type==='permission.cancelled'){
         const prior=states.get(requestId)
         if(!prior||prior.kind!=='permission')continue
         const status=event.type==='permission.cancelled'?'cancelled':'resolved'
-        states.set(requestId,{...prior,status,resolvedAt:Number(data.resolvedAt||event.ts),revision:prior.revision+1,resolution:event.type==='permission.resolved'?data.resolution:undefined})
+        states.set(requestId,{...prior,status,resolvedAt:Number(data.resolvedAt||event.ts),revision:prior.revision+1,...(event.type==='permission.cancelled'&&typeof data.reason==='string'?{cancelReason:data.reason}:{}),resolution:event.type==='permission.resolved'?data.resolution:undefined})
         continue
       }
       if(event.type==='question.asked'){
@@ -326,8 +323,132 @@ export class SessionStore {
     return [...states.values()]
   }
 
+
+  async waitForInteractionResolution(id:string,requestId:string,signal?:AbortSignal,timeoutMs=86_400_000){
+    // Subscribe before reading the durable projection. The event bus is only a
+    // wakeup; the append-only session log remains the source of truth.
+    const subscription=this.events?.subscribe(id)
+    const timeout=Math.max(1,timeoutMs)
+    let timer:ReturnType<typeof setTimeout>|undefined
+    let abortListener:(()=>void)|undefined
+    try {
+      const timeoutPromise=new Promise<never>((_,reject)=>{
+        timer=setTimeout(()=>reject(new Error(`Interaction request timed out: ${requestId}`)),timeout)
+      })
+      // A shutdown can abort before the first durable-state read finishes. Mark
+      // these long-lived race branches handled immediately; Promise.race below
+      // still observes and propagates their rejection to the waiter.
+      void timeoutPromise.catch(()=>undefined)
+      const abortPromise=signal ? new Promise<never>((_,reject)=>{
+        abortListener=()=>reject(new Error(`Interaction ${requestId} cancelled`))
+        signal.addEventListener('abort',abortListener,{once:true})
+        if(signal.aborted)abortListener()
+      }) : undefined
+      if(abortPromise)void abortPromise.catch(()=>undefined)
+
+      while(true){
+        const state=await this.getInteractionState(id,requestId)
+        if(!state) throw new Error(`Interaction request not found: ${requestId}`)
+        if(state.status!=='pending') return state
+        if(signal?.aborted) throw new Error(`Interaction ${requestId} cancelled`)
+        const changed=subscription?.waitForChange() ?? new Promise<boolean>(resolve=>setTimeout(()=>resolve(true),250))
+        try {
+          await Promise.race([changed,timeoutPromise,...(abortPromise?[abortPromise]:[])])
+        } catch(error) {
+          // An abort/timeout can race with a durable reply. Re-read before
+          // rejecting so the committed first-writer decision always wins.
+          const latest=await this.getInteractionState(id,requestId)
+          if(latest && latest.status!=='pending') return latest
+          throw error
+        }
+      }
+    } finally {
+      if(signal&&abortListener) signal.removeEventListener('abort',abortListener)
+      if(timer)clearTimeout(timer)
+      subscription?.close()
+    }
+  }
+
   async pendingInteractions(id:string):Promise<InteractionRequestState[]>{
     return (await this.interactionStates(id)).filter(state=>state.status==='pending')
+  }
+
+  /**
+   * Reconcile runtime-owned state left pending by a process that exited without
+   * graceful shutdown. Call only after the workspace daemon lease is acquired.
+   */
+  async recoverOrphanedRuntimeState(cwd:string,ownerId:string,preserveSessionIds:ReadonlySet<string>=new Set()){
+    const workspace=path.resolve(cwd)
+    const sessions=await this.listForWorkspace(workspace)
+    let permissionsCancelled=0
+    let questionsCancelled=0
+    let turnsInterrupted=0
+    let taskSessionsPreserved=0
+    for(const meta of sessions){
+      const id=String(meta.id||'')
+      if(!id)continue
+      if(preserveSessionIds.has(id)){taskSessionsPreserved++;continue}
+      const loaded=await this.load(id)
+      if(!loaded.meta||path.resolve(loaded.meta.cwd)!==workspace)continue
+      for(const interaction of await this.pendingInteractions(id)){
+        try{
+          if(interaction.kind==='permission'){
+            const result=await this.cancelPermission(id,interaction.requestId,'daemon-restart')
+            if(result.applied)permissionsCancelled++
+          }else{
+            const result=await this.resolveQuestion(id,interaction.requestId,{
+              commandId:`daemon-recovery-${ownerId}-${interaction.requestId}`,
+              clientId:`daemon-recovery:${ownerId}`,
+              disposition:'cancelled',
+            })
+            if(result.applied)questionsCancelled++
+          }
+        }catch(error){
+          // A reply committed during recovery wins. Other errors remain visible
+          // to the caller rather than silently leaving runtime state ambiguous.
+          const latest=await this.getInteractionState(id,interaction.requestId).catch(()=>undefined)
+          if(latest?.status==='pending')throw error
+        }
+      }
+      const turnState=new Map<string,{turn:TurnRecord;terminal:boolean}>()
+      for(const event of loaded.events){
+        if(event.type!=='turn'||!event.data||typeof event.data!=='object')continue
+        const turn=event.data as TurnRecord
+        if(!turn.id)continue
+        if(turn.status==='started')turnState.set(turn.id,{turn,terminal:false})
+        else if(['committed','failed','interrupted'].includes(turn.status)){
+          const current=turnState.get(turn.id)
+          if(current)current.terminal=true
+        }
+      }
+      for(const {turn,terminal} of turnState.values()){
+        if(terminal)continue
+        const interruptedAt=Date.now()
+        await this.append(id,{type:'turn',ts:interruptedAt,data:{
+          ...turn,
+          status:'interrupted',
+          interruptedAt,
+          recovery:{reason:'daemon-restart',ownerId},
+        }})
+        turnsInterrupted++
+      }
+    }
+    return {sessionsChecked:sessions.length,taskSessionsPreserved,permissionsCancelled,questionsCancelled,turnsInterrupted}
+  }
+
+  async listForWorkspace(cwd:string){
+    await ensureDir(this.root)
+    const workspace=path.resolve(cwd)
+    const files=(await fs.readdir(this.root)).filter((name:string)=>name.endsWith('.jsonl')).sort().reverse()
+    const output:any[]=[]
+    for(const file of files){
+      try{
+        const first=(await fs.readFile(path.join(this.root,file),'utf8')).split('\n',1)[0]
+        const meta=JSON.parse(first).data
+        if(meta&&typeof meta.id==='string'&&typeof meta.cwd==='string'&&path.resolve(meta.cwd)===workspace)output.push(meta)
+      }catch{}
+    }
+    return output
   }
 
   async getInteractionState(id:string,requestId:string):Promise<InteractionRequestState|undefined>{
@@ -343,6 +464,19 @@ export class SessionStore {
         await this.append(id,{type:resolution.decision==='deny'?'permission.resolved':'permission.resolved',ts:Date.now(),data:{requestId,resolvedAt:result.request.resolvedAt,resolution}})
       }
       return result
+    })
+  }
+
+  async cancelPermission(id:string,requestId:string,reason='cancelled'){
+    return await this.withSessionMutation(id,async()=>{
+      const request=await this.getInteractionState(id,requestId)
+      if(!request||request.kind!=='permission')throw new Error(`Permission request not found: ${requestId}`)
+      if(request.status!=='pending')return {applied:false as const,reason:'already-resolved' as const,request}
+      const resolvedAt=Date.now()
+      await this.append(id,{type:'permission.cancelled',ts:resolvedAt,data:{requestId,reason,resolvedAt}})
+      const cancelled=await this.getInteractionState(id,requestId)
+      if(!cancelled||cancelled.kind!=='permission')throw new Error(`Permission request disappeared while being cancelled: ${requestId}`)
+      return {applied:true as const,request:cancelled}
     })
   }
 

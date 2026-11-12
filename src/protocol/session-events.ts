@@ -34,6 +34,8 @@ export function legacyEventKind(event: Pick<StoredSessionEventLike, 'type' | 'da
     }
     case 'context.checkpoint':
       return 'session.context.checkpoint'
+    case 'context.instructions':
+      return 'session.context.instructions'
     case 'compaction':
       return event.data && typeof event.data === 'object' && (event.data as { stage?: unknown }).stage === 'started'
         ? 'session.compaction.started'
@@ -52,6 +54,7 @@ export function legacyEventKind(event: Pick<StoredSessionEventLike, 'type' | 'da
       const status = event.data && typeof event.data === 'object' ? String((event.data as { status?: unknown }).status || '') : ''
       if (status === 'started') return 'session.turn.started'
       if (status === 'failed') return 'session.turn.failed'
+      if (status === 'interrupted') return 'session.turn.interrupted'
       return 'session.turn.completed'
     }
     case 'undo':
@@ -79,6 +82,8 @@ export function legacyEventKind(event: Pick<StoredSessionEventLike, 'type' | 'da
       return 'session.tool.called'
     case 'provider.turn':
       return 'session.provider.updated'
+    case 'provider.usage':
+      return 'session.provider.usage'
     case 'task.notification':
     case 'task.notification.consumed':
       return 'session.task.notification'

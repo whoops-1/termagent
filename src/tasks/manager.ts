@@ -10,6 +10,7 @@ import type { ProviderConfig } from '../providers/types.js'
 
 export type TaskKind = 'shell'|'agent'
 export type TaskStatus = 'queued'|'running'|'exited'|'failed'|'cancelled'
+export type TaskActivity = {kind:'tool'|'status'|'turn'|'output';label:string;detail?:string;at:number;callId?:string;outcome?:'success'|'error'|'running'}
 export interface TaskRecord {
   id:string; kind:TaskKind; command?:string; prompt?:string; cwd:string; started:number; updated:number; ended?:number;
   status:TaskStatus; pid?:number; exitCode?:number; output:string; sessionId?:string; childSessionId?:string; parentSessionId?:string;
@@ -17,6 +18,7 @@ export interface TaskRecord {
   permissionMode?:ApprovalMode; permissionRules?:PermissionRule[]; allowedTools?:string[]; coordinated?:boolean; specialistRole?:string; delegationDepth?:number; parentTaskId?:string;
   provider?:ProviderConfig;
   usage?:{inputTokens:number;outputTokens:number;totalTokens:number;estimated:boolean};
+  activity?:TaskActivity;
   workerToken?:string;
   processIdentity?:{command:string;cwd:string;startTime?:string};
   scopePaths?:string[]; outputPath?:string; outputBytes?:number; outputTruncated?:boolean; timeoutMs?:number; backgrounded?:boolean; backgroundChildrenPreserved?:boolean; signal?:any; termination?:'completed'|'nonzero'|'timeout'|'cancelled'|'signal'|'output-limit'|'stdin-timeout'|'spawn-error';
@@ -63,7 +65,7 @@ export class TaskManager {
     const tmp=`${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`
     await fs.writeFile(tmp,JSON.stringify(t,null,2))
     await fs.rename(tmp,target)
-    await this.events.append(t.id,'state',{status:t.status,pid:t.pid,exitCode:t.exitCode,outputTail:(t.output||'').slice(-2000),sessionId:t.sessionId})
+    await this.events.append(t.id,'state',{kind:t.kind,status:t.status,pid:t.pid,exitCode:t.exitCode,outputTail:(t.output||'').slice(-2000),sessionId:t.sessionId,childSessionId:t.childSessionId,parentSessionId:t.parentSessionId,parentTaskId:t.parentTaskId,specialistRole:t.specialistRole,activity:t.activity})
   }
   async save(t:TaskRecord){
     const previous=this.saveQueues.get(t.id)||Promise.resolve()
@@ -152,7 +154,7 @@ export class TaskManager {
     const depth=Number.isFinite(options.delegationDepth) ? Math.max(0,Math.floor(options.delegationDepth!)) : (options.parentTaskId ? 1 : 0)
     const maxDepth=Math.max(0,Number(process.env.TERMAGENT_MAX_AGENT_DEPTH||1))
     if(depth>maxDepth) throw new Error(`Agent delegation depth ${depth} exceeds the configured maximum of ${maxDepth}.`)
-    const id=crypto.randomBytes(5).toString('hex');const t:TaskRecord={id,kind:'agent',prompt,cwd,started:Date.now(),updated:Date.now(),status:'queued',output:'',provider,sessionId:parentSessionId,parentSessionId,scopePaths:normalized,childSessionId:options.sessionId,permissionMode:options.permissionMode,permissionRules:options.permissionRules,allowedTools:options.allowedTools,background:Boolean(options.background),coordinated:Boolean(options.coordinated),runCount:0,pendingPrompts:[],specialistRole:options.specialistRole||'general',delegationDepth:depth,parentTaskId:options.parentTaskId};await this.save(t);return t
+    const id=crypto.randomBytes(5).toString('hex');const t:TaskRecord={id,kind:'agent',prompt,cwd,started:Date.now(),updated:Date.now(),status:'queued',output:'',provider,sessionId:parentSessionId,parentSessionId,scopePaths:normalized,childSessionId:options.sessionId,permissionMode:options.permissionMode,permissionRules:options.permissionRules,allowedTools:options.allowedTools,background:Boolean(options.background),coordinated:Boolean(options.coordinated),runCount:0,pendingPrompts:[],specialistRole:options.specialistRole||'general',delegationDepth:depth,parentTaskId:options.parentTaskId};await this.save(t);await this.events.append(id,'agent.created',{specialistRole:t.specialistRole,parentSessionId,parentTaskId:t.parentTaskId,delegationDepth:depth,scopePaths:normalized,prompt:prompt.slice(0,500)});return t
   }
   async activeAgentTasks(sessionId:string){ return (await this.list()).filter(t=>t.kind==='agent'&&t.parentSessionId===sessionId&&(t.status==='queued'||t.status==='running')) }
   async appendOutput(id:string,chunk:string){

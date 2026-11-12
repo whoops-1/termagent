@@ -16,6 +16,96 @@
 
 ## Unreleased
 
+### Phase 14F.6 — Live activity and reconnection reliability
+
+- Routed foreground Web View prompts through the existing SSE `streamPrompt()` client so status, reasoning, response text, tool lifecycle, questions and completion are presented while the run is in progress.
+- Published “Preparing workspace context” before context retrieval and “Thinking” before the provider emits its first token; added an inline mobile live-stage indicator.
+- Exposed event-stream connection lifecycle to the client and separated live-event connectivity from actual server health, with health-probed stream replacement from the last durable cursor.
+- Added prompt-stream heartbeats and hardened SSE frame parsing for split LF/CRLF/CR boundaries.
+- Preserved permission policy: tool/shell permission-denied output is surfaced as an explicit activity result, never auto-approved or bypassed.
+- Adapted OpenCode's explicit SSE lifecycle and shared activity-stream patterns to TermAgent's existing runtime, JSONL durability and HTTP/SSE protocol.
+- Verified TypeScript build, Web View syntax, and 75/75 Phase 14 regression tests; physical Android Brave validation remains outstanding. The repository-wide test command exceeded its 240-second limit and is not claimed as passing.
+
+### Phase 14F.5 — First-class Subagents workspace
+
+- Added a session-scoped hierarchical Subagents workspace built from the existing TaskManager parent/child graph, with role, scope, status, duration, activity, usage, and nested delegation visibility.
+- Added worker turn/tool lifecycle activity and durable task-event SSE replay/tail so detached child workers update the Web View without creating a second agent runtime.
+- Added bounded child-transcript, event-history and output reads; safe public task/event projections omit provider credentials, worker tokens, permission rules, process identity, raw output tails and prompt-bearing event payloads.
+- Added Web View details and live follow-up/cancel/resume controls, plus daemon terminal `/subagents`, `/subagent-send`, and `/subagent-resume` commands.
+- Adapted OpenCode child-session tracking and OpenClaude teammate-detail patterns to TermAgent's TaskManager, TaskEventLog, SessionStore and existing Web View. No unsupported pause control was added.
+- Verified the Phase 14F.5 tests (4/4) and focused Phase 13I/14A–14F.5 regression set (81/81). The complete test command remains blocked by the `/auto` E2E assertion also reproduced against the Phase 14F.4 baseline and by the aggregate run timeout; see the Phase 14F.5 report.
+
+### Phase 14F.4 — Cross-client state convergence
+
+- Reconstructed terminal tool transcripts by stable provider call ID and propagated call identity through live runtime events, durable tool lifecycle records and permission requests.
+- Kept non-interactive daemon-attached terminals passive so they do not reject or cancel browser-owned permissions/questions they cannot render.
+- Expanded attached-terminal daemon projections for tool lifecycle, Todo/tasks, workflow/verification, diffs, checkpoints, compaction, queues and history reconciliation.
+- Added attached-terminal diff, task, cancel/interrupt, checkpoint, restore and branch commands using existing daemon APIs.
+- Adapted upstream keyed tool lifecycle reconciliation to TermAgent's existing HTTP/SSE, durable event and snapshot protocol; full multi-client TTY/mobile parity remains open.
+
+### Phase 14F.3 — Terminal daemon client convergence
+
+- Made terminal startup attach to a ready workspace daemon before constructing local Agent runtime state, while retaining the standalone path when no server owns the workspace.
+- Added terminal device pairing and owner-only per-workspace credential persistence with `/device revoke`.
+- Routed terminal prompts, queue/session operations, turn controls, permissions and questions through the daemon-owned runtime and existing HTTP/SSE protocol.
+- Added durable assistant-history reconciliation for incomplete transient streams and server-owned queue-worker recovery.
+- Fixed asynchronous SessionStore mutation reentrancy with `AsyncLocalStorage` and moved queue-worker kickoff outside the command-ledger mutation.
+- Documented the initial daemon-client command subset and remaining TTY parity, remote attach, mobile validation and repository-wide test limitations.
+
+### Phase 14F.2 — Durable SSE tail, backpressure and transient-gap reconciliation
+
+- Kept the append-only JSONL event log as truth and added a bounded one-second SSE durable-tail poll to complement process-local EventBus wakeups.
+- Made durable session-event SSE writes honor Node response backpressure, with stream-serialized heartbeats and authorization re-checks.
+- Added explicit transient live-buffer overflow signaling and Web View snapshot reconciliation without advancing the durable cursor from a gap frame.
+- Added regression coverage for detached-worker durable writes, buffer overflow, browser reconciliation, and waiting for response drain.
+
+### Phase 14F.1 — Exclusive daemon ownership and restart reconciliation
+
+- Added a workspace-keyed exclusive owner lease shared by server and standalone terminal startup, with process identity, heartbeat, endpoint metadata and guarded stale-owner recovery.
+- Added authenticated health discovery of safe daemon metadata, and an explicit server shutdown lifecycle hook that releases the owner after runtime shutdown.
+- Prevented a second terminal/server runtime from silently opening the same workspace; until terminal attachment is implemented, the second launcher fails with owner details.
+- Reconciled orphaned permission and question requests after fenced startup and recorded unmatched started turns as interrupted.
+- Adapted OpenCode service registration/probe/recovery behavior; inspected but did not port the supplied OpenClaude no-op lockfile stub.
+
+### Phase 14E — Security, pairing, and remote access
+
+- Kept loopback-only Web View access as the default and made direct non-loopback binds fail closed without explicit HTTPS device pairing.
+- Added direct HTTPS and TLS-terminating reverse-proxy deployment modes with exact public Host/Origin validation.
+- Added one-time short-lived pairing codes, random per-device bearer tokens, hash-only owner-mode persistence, token expiry, and device self-revocation.
+- Added workspace/session/task authorization scopes and server-assigned command client identity; permission/question and task mutations require dedicated scopes.
+- Added JSON-only mutation requests, Fetch Metadata checks, no CORS/query credentials/cookies, bounded per-source request and pairing limits, and audit records.
+- Minimized browser configuration projections and redacted internal HTTP/SSE errors.
+- Added direct TLS, reverse-proxy, workspace, scope, expiry, revocation, replay, Origin/Host, and CSRF-style integration tests.
+
+### Phase 14E.1 — Server-owned permission resolver integration
+
+- Connected the server `PermissionGate` requester to the canonical durable `SessionStore` interaction wait, so browser Allow/Once/Always and Deny settle the exact permission wait already awaited by the original `ToolRegistry.execute()` call.
+- Kept browser HTTP handlers as command adapters; the existing durable store and runtime-local event bus remain authoritative instead of introducing an HTTP-owned or duplicate in-memory promise registry.
+- Made interaction waiting race-safe across subscribe/read, durable reply, timeout and `AbortSignal`; re-read durable state after timeout/abort races so the first committed resolution wins.
+- Persisted cancellation reasons for interrupted, timed-out and failed permission waits, and prevented an already-aborted turn from starting a tool even when approval committed concurrently.
+- Added unique fallback permission identities for concurrent direct tool calls that do not carry provider tool-call IDs.
+- Registered active run completion before asynchronous context retrieval and made graceful runtime shutdown abort and await active turns before closing MCP clients.
+- Added nine focused permission-resolver integration/regression tests.
+
+### Phase 14D — Browser Web View
+
+- Bound the supplied v4 mobile-first Web View prototype to the existing typed HTTP/SSE client without replacing the runtime, protocol, or session store.
+- Added allowlisted Web View static asset routes and browser URL output for `termagent --serve`; API/session data remains bearer-token protected.
+- Projected canonical session snapshots, durable replay events and bounded transient run events into transcript, tool, reasoning, activity, permission/question, plan, queue, task, diff and verification surfaces.
+- Added mobile-first session navigation, live composer/queue interactions, slash suggestions, context/runtime panels, checkpoints, task continuation, compact/undo/redo, accessible sheet/tab controls and dependency-free Markdown tables.
+- Preserved the uploaded prototype unchanged and added no frontend dependencies or animation library.
+- Added focused static-asset/auth/SSE/reconciliation/coalescing/design-foundation tests.
+
+
+### Phase 14C — HTTP API and dependency-free client SDK
+
+- Added a stable renderer-neutral HTTP API for sessions, history, durable event replay/streaming, runtime status, context/snapshot, permissions, questions, Todo/queue, tasks, diffs, checkpoints, and capability discovery.
+- Kept `src/server/http.ts` at the transport boundary and routed state-changing operations through the canonical `CommandEnvelope`/`CommandLedger` path.
+- Added a typed dependency-free `src/client` API based on standard Fetch APIs.
+- Added header-authenticated fetch-based SSE parsing with durable cursor tracking, reconnect backoff, and cancellation.
+- Added route/schema drift tests and corrected the stable plural checkpoint-create route while retaining the legacy singular compatibility alias.
+- Kept durable SessionStore history/events authoritative for recovery; live-only connection/heartbeat/streaming fragments remain transport events.
+
 ### 13N-J-C shell service/process semantics
 
 - Scoped semantic no-progress detection away from operational shell/write rounds so unrelated command execution cannot inherit an exploration stagnation streak.
@@ -317,6 +407,16 @@ Phase gate: build, full test suite, package dry-run, source-hygiene scan, and ex
 - Atomic persistence for draft, task, and session-related state.
 
 ## Unreleased
+
+### Phase 14E — Security, pairing, and remote access
+
+- Kept loopback-only Web View access as the default and made direct non-loopback binds fail closed without explicit HTTPS device pairing.
+- Added direct HTTPS and TLS-terminating reverse-proxy deployment modes with exact public Host/Origin validation.
+- Added one-time short-lived pairing codes, random per-device bearer tokens, hash-only owner-mode persistence, token expiry, and device self-revocation.
+- Added workspace/session/task authorization scopes and server-assigned command client identity; permission/question and task mutations require dedicated scopes.
+- Added JSON-only mutation requests, Fetch Metadata checks, no CORS/query credentials/cookies, bounded per-source request and pairing limits, and audit records.
+- Minimized browser configuration projections and redacted internal HTTP/SSE errors.
+- Added direct TLS, reverse-proxy, workspace, scope, expiry, revocation, replay, Origin/Host, and CSRF-style integration tests.
 
 ### Loop-safety correction
 

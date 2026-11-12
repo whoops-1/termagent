@@ -16,9 +16,10 @@
   transcript must keep content primary.                                         
                                                                                 
   ⠋ writing response                                                            
-╭─ ● Ready  provider/mock  ctx 0/12k───────────────────────────────────────────╮
+╭─ ● Ready  provider/mock  ctx 0/128k──────────────────────────────────────────╮
 │                                                                            │  
 │ Build · mock provider Tip: ↑↓ history · Ctrl+P commands · ↵ send│             
 ╰──────────────────────────────────────────────────────────────────────────────╯
 esc                               Ctrl+E reasoning   Ctrl+O details   Tab agents
 /workspace/project                                                              
+ 

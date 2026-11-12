@@ -258,13 +258,13 @@ test('hardening: HTTP undo/redo endpoints restore the transactional turn', async
     const port=server.address().port
     const base=`http://127.0.0.1:${port}/api/v1/sessions/${encodeURIComponent(session.id)}`
 
-    const undo=await fetch(`${base}/undo`,{method:'POST'})
+    const undo=await fetch(`${base}/undo`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'})
     assert.equal(undo.status,200)
     const undoBody=await undo.json()
     assert.equal(undoBody.messages.length,0)
     await assert.rejects(readFile(path.join(paths.root,'http.txt'),'utf8'))
 
-    const redo=await fetch(`${base}/redo`,{method:'POST'})
+    const redo=await fetch(`${base}/redo`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'})
     assert.equal(redo.status,200)
     const redoBody=await redo.json()
     assert.equal(redoBody.messages.filter(m=>m.role==='user').length,1)
@@ -621,8 +621,8 @@ test('hardening: HTTP undo/redo reports session contention as a conflict', async
     const port=server.address().port
     const base=`http://127.0.0.1:${port}/api/v1/sessions/${encodeURIComponent(session.id)}`
     const [undo,redo] = await Promise.all([
-      fetch(`${base}/undo`,{method:'POST'}),
-      fetch(`${base}/redo`,{method:'POST'})
+      fetch(`${base}/undo`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'}),
+      fetch(`${base}/redo`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'})
     ])
     assert.equal(undo.status,409)
     assert.equal(redo.status,409)

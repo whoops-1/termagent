@@ -1,5 +1,7 @@
-import { promises as fs } from 'node:fs'
+import { promises as fs, createReadStream } from 'node:fs'
 import crypto from 'node:crypto'
+import path from 'node:path'
+import { within } from '../util/fs.js'
 export type FileReadRange = {
   startLine: number
   endLine: number
@@ -36,6 +38,22 @@ export type ReadFileState = {
 
 export type ReadCacheStatus = 'miss' | 'fresh' | 'unchanged' | 'rehydrated' | 'overlap' | 'already-covered'
 
+export type PersistedReadCoverage = {
+  canonicalPath: string
+  mtimeMs: number
+  size: number
+  totalLines: number
+  contentHash?: string
+  ranges: readonly FileReadRange[]
+}
+
+export type ReadCoverageRestoreResult = {
+  restoredFiles: number
+  restoredRanges: number
+  restoredBytes: number
+  skipped: number
+}
+
 export type ReadCacheLookup = {
   state: ReadFileState
   status: Exclude<ReadCacheStatus, 'miss'>
@@ -48,6 +66,12 @@ export type ReadCacheLookup = {
 const DEFAULT_MAX_ENTRIES = 100
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024
 const MAX_REQUEST_HISTORY = 64
+const MAX_RESTORE_FILES = 64
+const MAX_RESTORE_BYTES = 8 * 1024 * 1024
+const MAX_RESTORE_FILE_SCAN_BYTES = 32 * 1024 * 1024
+const MAX_RESTORE_TOTAL_SCAN_BYTES = 64 * 1024 * 1024
+const MAX_RESTORE_LINE_CHARS = 256 * 1024
+const MAX_EVIDENCE_FILE_BYTES = 2 * 1024 * 1024
 
 function normalizeRange(range: FileReadRange): FileReadRange {
   const startLine = Math.max(1, Math.floor(Number(range.startLine) || 1))
@@ -94,9 +118,10 @@ function stateBytes(state: ReadFileState) {
 /**
  * TermAgent adaptation of TermAgent's FileStateCache pattern.
  *
- * The cache lives for one Agent.run session. It tracks what the model has
- * actually read, keeps a bounded LRU footprint, and can mark cached requests
- * as needing rehydration after context compaction without serializing raw file
+ * The cache is ephemeral to one Agent.run call, but its safe read-coverage
+ * metadata can be checkpointed and revalidated on the next turn. It tracks
+ * what the model actually read, keeps a bounded LRU footprint, and marks
+ * restored requests as needing prompt rehydration without serializing raw file
  * contents into the durable session log.
  */
 
@@ -111,7 +136,7 @@ export async function rehydrateReadCoverageEvidence(
   for (const item of coverage.slice(0, Math.max(0, maxFiles))) {
     let stat: any
     try { stat = await fs.stat(item.canonicalPath) } catch { continue }
-    if (!stat.isFile() || stat.mtimeMs !== item.mtimeMs || stat.size !== item.size) continue
+    if (!stat.isFile() || stat.mtimeMs !== item.mtimeMs || stat.size !== item.size || stat.size > MAX_EVIDENCE_FILE_BYTES) continue
     let text: string
     try { text = await fs.readFile(item.canonicalPath, 'utf8') } catch { continue }
     if (item.contentHash && crypto.createHash('sha256').update(text, 'utf8').digest('hex') !== item.contentHash) continue
@@ -130,6 +155,134 @@ export async function rehydrateReadCoverageEvidence(
     if (used >= budget) break
   }
   return evidence
+}
+
+/**
+ * Reconstruct only previously inspected, complete ranges while hashing the
+ * whole file as a stream. This keeps restart recovery memory-bounded even for
+ * large source files and refuses stale/tampered file contents.
+ */
+async function readValidatedRanges(
+  filePath: string,
+  ranges: readonly FileReadRange[],
+  maxBytes: number,
+): Promise<{ segments: Array<{ startLine: number; endLine: number; content: string }>; totalLines: number; contentHash: string; bom: boolean; lineEnding: 'LF' | 'CRLF'; bytes: number } | undefined> {
+  const wanted = mergeReadRanges([...ranges])
+  if (!wanted.length || maxBytes <= 0) return undefined
+  const collected = wanted.map(range => ({ ...range, lines: [] as string[], bytes: 0, overflow: false }))
+  const digest = crypto.createHash('sha256')
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  let carry = ''
+  let discardCurrentLine = false
+  let lineNumber = 0
+  let crlfCount = 0
+  let lfCount = 0
+  let firstChunk = true
+  let bom = false
+  let storedBytes = 0
+
+  const overflowLine = (nextLine: number) => {
+    const target = collected.find(item => nextLine >= item.startLine && nextLine <= item.endLine)
+    if (!target || target.overflow) return
+    target.overflow = true
+    storedBytes -= target.bytes
+    target.bytes = 0
+    target.lines = []
+  }
+
+  const consume = (raw: string) => {
+    const crlf = raw.endsWith('\r')
+    const text = crlf ? raw.slice(0, -1) : raw
+    if (crlf) crlfCount++
+    else lfCount++
+    lineNumber++
+    const target = collected.find(item => lineNumber >= item.startLine && lineNumber <= item.endLine)
+    if (!target || target.overflow) return
+    if (text.length > MAX_RESTORE_LINE_CHARS) {
+      overflowLine(lineNumber)
+      return
+    }
+    const bytes = Buffer.byteLength(text, 'utf8') + (target.lines.length ? 1 : 0)
+    if (storedBytes + bytes > maxBytes) {
+      overflowLine(lineNumber)
+      return
+    }
+    target.lines.push(text)
+    target.bytes += bytes
+    storedBytes += bytes
+  }
+
+  try {
+    for await (const chunk of createReadStream(filePath)) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
+      digest.update(buffer)
+      let decoded = decoder.decode(buffer, { stream: true })
+      if (firstChunk) {
+        firstChunk = false
+        bom = buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf
+        if (decoded.startsWith('\uFEFF')) decoded = decoded.slice(1)
+      }
+
+      let offset = 0
+      let newline = decoded.indexOf('\n', offset)
+      while (newline >= 0) {
+        const fragment = decoded.slice(offset, newline)
+        if (!discardCurrentLine) {
+          carry += fragment
+          if (carry.length > MAX_RESTORE_LINE_CHARS) {
+            discardCurrentLine = true
+            carry = ''
+          }
+        }
+        if (discardCurrentLine) {
+          if (fragment.endsWith('\r')) crlfCount++
+          else lfCount++
+          lineNumber++
+          overflowLine(lineNumber)
+        } else consume(carry)
+        carry = ''
+        discardCurrentLine = false
+        offset = newline + 1
+        newline = decoded.indexOf('\n', offset)
+      }
+
+      const tail = decoded.slice(offset)
+      if (tail && !discardCurrentLine) {
+        carry += tail
+        if (carry.length > MAX_RESTORE_LINE_CHARS) {
+          discardCurrentLine = true
+          carry = ''
+          overflowLine(lineNumber + 1)
+        }
+      }
+    }
+    const tail = decoder.decode()
+    if (tail && !discardCurrentLine) {
+      carry += tail
+      if (carry.length > MAX_RESTORE_LINE_CHARS) {
+        discardCurrentLine = true
+        carry = ''
+        overflowLine(lineNumber + 1)
+      }
+    }
+    if (discardCurrentLine) lineNumber++
+    else if (carry.length > 0) consume(carry)
+  } catch {
+    return undefined
+  }
+
+  const hash = digest.digest('hex')
+  const segments = collected
+    .filter(item => !item.overflow && item.lines.length === item.endLine - item.startLine + 1)
+    .map(item => ({ startLine: item.startLine, endLine: item.endLine, content: item.lines.join('\n') }))
+  return {
+    segments,
+    totalLines: lineNumber,
+    contentHash: hash,
+    bom,
+    lineEnding: crlfCount > lfCount ? 'CRLF' : 'LF',
+    bytes: storedBytes,
+  }
 }
 
 export class FileReadStateCache {
@@ -174,6 +327,98 @@ export class FileReadStateCache {
   }
 
   /**
+   * Restore durable read coverage into this turn's ephemeral cache.
+   *
+   * The checkpoint stores identities and line ranges, never raw source text.
+   * Every file is re-resolved, checked against the caller's active workspace
+   * scope, stat-checked, and hashed before any cached segment is admitted.
+   * Restored ranges are marked context-absent so the next read_file call
+   * rehydrates the evidence into the model instead of incorrectly returning
+   * "already visible" after a process restart.
+   */
+  async restoreCoverage(
+    coverage: readonly PersistedReadCoverage[],
+    options: { cwd: string; scopePaths?: readonly string[]; maxFiles?: number; maxBytes?: number },
+  ): Promise<ReadCoverageRestoreResult> {
+    const result: ReadCoverageRestoreResult = { restoredFiles: 0, restoredRanges: 0, restoredBytes: 0, skipped: 0 }
+    const fileLimit = Math.min(MAX_RESTORE_FILES, Math.max(0, Math.floor(options.maxFiles ?? MAX_RESTORE_FILES)))
+    const byteLimit = Math.min(this.maxBytes, MAX_RESTORE_BYTES, Math.max(0, Math.floor(options.maxBytes ?? MAX_RESTORE_BYTES)))
+    if (!fileLimit || !byteLimit) return { ...result, skipped: coverage.length }
+
+    const cwd = await fs.realpath(options.cwd).catch(() => path.resolve(options.cwd))
+    const roots = (options.scopePaths?.length ? options.scopePaths : ['.'])
+      .map(scope => path.resolve(cwd, scope))
+    const realRoots = await Promise.all(roots.map(root => fs.realpath(root).catch(() => root)))
+    let remainingBytes = byteLimit
+    let remainingScanBytes = MAX_RESTORE_TOTAL_SCAN_BYTES
+
+    for (const item of coverage) {
+      if (result.restoredFiles >= fileLimit || remainingScanBytes <= 0) { result.skipped++; continue }
+      if (!item || typeof item.canonicalPath !== 'string' || !path.isAbsolute(item.canonicalPath)
+        || !Number.isFinite(item.mtimeMs) || !Number.isFinite(item.size)
+        || !Number.isSafeInteger(item.totalLines) || item.totalLines < 0
+        || !Array.isArray(item.ranges) || !item.ranges.length
+        || typeof item.contentHash !== 'string' || !/^[a-f0-9]{64}$/i.test(item.contentHash)) {
+        result.skipped++
+        continue
+      }
+      const lexicalPath = path.resolve(item.canonicalPath)
+      let realPath: string
+      try { realPath = await fs.realpath(lexicalPath) } catch { result.skipped++; continue }
+      if (!realRoots.some(root => within(root, realPath))) { result.skipped++; continue }
+
+      let before: Awaited<ReturnType<typeof fs.stat>>
+      try { before = await fs.stat(realPath) } catch { result.skipped++; continue }
+      if (!before.isFile() || before.mtimeMs !== item.mtimeMs || before.size !== item.size
+        || before.size > MAX_RESTORE_FILE_SCAN_BYTES || before.size > remainingScanBytes) { result.skipped++; continue }
+
+      const ranges = mergeReadRanges(item.ranges.filter(range =>
+        Number.isSafeInteger(range.startLine) && Number.isSafeInteger(range.endLine)
+        && range.startLine >= 1 && range.endLine >= range.startLine
+        && range.endLine <= item.totalLines,
+      ))
+      if (!ranges.length) { result.skipped++; continue }
+
+      const restored = await readValidatedRanges(realPath, ranges, remainingBytes)
+      remainingScanBytes = Math.max(0, remainingScanBytes - before.size)
+      if (!restored || !restored.segments.length || restored.contentHash.toLowerCase() !== item.contentHash.toLowerCase()
+        || restored.totalLines !== item.totalLines) {
+        result.skipped++
+        continue
+      }
+      // Guard against a write racing the stream read. Hashing already checks
+      // content identity; this second stat prevents admitting a moving target.
+      const after = await fs.stat(realPath).catch(() => undefined)
+      if (!after?.isFile() || after.mtimeMs !== before.mtimeMs || after.size !== before.size) {
+        result.skipped++
+        continue
+      }
+
+      let fileRestored = 0
+      for (const segment of restored.segments) {
+        this.record(
+          lexicalPath,
+          { mtimeMs: before.mtimeMs, size: before.size, totalLines: restored.totalLines, contentHash: restored.contentHash, bom: restored.bom, lineEnding: restored.lineEnding },
+          segment,
+          [{ ...segment, complete: true }],
+          { lineCount: segment.endLine - segment.startLine + 1, truncated: false },
+        )
+        this.markContextCoverage(lexicalPath, segment, false)
+        fileRestored++
+        result.restoredRanges++
+        result.restoredBytes += Buffer.byteLength(segment.content, 'utf8')
+      }
+      if (fileRestored) result.restoredFiles++
+      remainingBytes = Math.max(0, remainingBytes - restored.bytes)
+      if (remainingBytes <= 0) {
+        result.skipped += coverage.length - result.restoredFiles - result.skipped
+        break
+      }
+    }
+    return result
+  }
+
+  /**
    * Context compaction removes old tool results from the prompt. Cached file
    * evidence therefore remains valid on disk but is no longer guaranteed to
    * be visible to the model. The next exact read may rehydrate that evidence
@@ -212,7 +457,7 @@ export class FileReadStateCache {
     for (const state of states) {
       let currentStat: any
       try { currentStat = await fs.stat(state.canonicalPath) } catch { continue }
-      if (!currentStat.isFile() || currentStat.mtimeMs !== state.mtimeMs || currentStat.size !== state.size) continue
+      if (!currentStat.isFile() || currentStat.mtimeMs !== state.mtimeMs || currentStat.size !== state.size || currentStat.size > MAX_EVIDENCE_FILE_BYTES) continue
       let text: string
       try { text = await fs.readFile(state.canonicalPath, 'utf8') } catch { continue }
       if (state.contentHash && crypto.createHash('sha256').update(text, 'utf8').digest('hex') !== state.contentHash) continue

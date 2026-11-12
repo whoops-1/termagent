@@ -5,7 +5,6 @@ import type { RepositoryMap, RepoFile } from './repository.js'
 import { estimateTokens } from './budget.js'
 
 const STOP=new Set('the a an and or to of in on for with from into is are was were be this that it as at by fix add update make use how why what where which does do can could should would about please project code file files'.split(' '))
-const MAX_FILE_BYTES=16_000
 const DEFAULT_TOTAL_TOKENS=7_000
 
 function byteLength(text:string):number{return Buffer.byteLength(text,'utf8')}
@@ -69,10 +68,10 @@ async function lexicalSearch(root:string,queryTokens:string[]):Promise<SearchHit
 
 function lineHits(text:string,queryTokens:string[]):number[]{const lines=text.split(/\r?\n/);const hits:number[]=[];for(let i=0;i<lines.length;i++){const lower=lines[i].toLowerCase();let matched=0;for(const t of queryTokens)if(lower.includes(t))matched++;if(matched)hits.push(i+1)}return hits}
 
-async function excerpt(root:string,file:RepoFile,hits:number[],budgetBytes:number):Promise<string>{
+async function excerpt(root:string,file:RepoFile,hits:number[],budgetBytes:number,maxFileBytes:number):Promise<string>{
   try{
     if(file.size>2_000_000||['.png','.jpg','.jpeg','.gif','.webp','.pdf'].includes(file.ext))return ''
-    const text=(await fs.readFile(path.join(root,file.path),'utf8')).slice(0,MAX_FILE_BYTES*4);const lines=text.split(/\r?\n/);const centers=[...hits].slice(0,8);if(!centers.length)centers.push(1)
+    const text=(await fs.readFile(path.join(root,file.path),'utf8')).slice(0,maxFileBytes*4);const lines=text.split(/\r?\n/);const centers=[...hits].slice(0,8);if(!centers.length)centers.push(1)
     const ranges:{start:number;end:number}[]=[]
     for(const c of centers){const start=Math.max(1,c-18),end=Math.min(lines.length,c+34);const prior=ranges.at(-1);if(prior&&start<=prior.end+2)prior.end=Math.max(prior.end,end);else ranges.push({start,end})}
     let out=''
@@ -82,12 +81,13 @@ async function excerpt(root:string,file:RepoFile,hits:number[],budgetBytes:numbe
   }catch{return ''}
 }
 
-export type RetrievalOptions={maxFiles?:number;maxBytes?:number;maxTokens?:number;focusFiles?:string[];focusSymbols?:string[]}
+export type RetrievalOptions={maxFiles?:number;maxBytes?:number;maxTokens?:number;maxFileBytes?:number;focusFiles?:string[];focusSymbols?:string[]}
 
 export async function retrieveContext(map:RepositoryMap,query:string,opts:RetrievalOptions={}):Promise<string>{
   const maxFiles=Math.max(1,opts.maxFiles??6)
   const tokenBudget=Math.max(300,opts.maxTokens??(opts.maxBytes?Math.floor(opts.maxBytes/4):DEFAULT_TOTAL_TOKENS))
   const byteBudget=Math.max(300,Math.min(opts.maxBytes??tokenBudget*4,tokenBudget*4))
+  const maxFileBytes=Math.max(1024,Math.min(128*1024,Math.floor(opts.maxFileBytes||Math.max(16_000,byteBudget/Math.max(1,maxFiles)))))
   const qs=tokens(query);const focusFiles=new Set((opts.focusFiles||[]).map(x=>x.toLowerCase()));const focusSymbols=new Set((opts.focusSymbols||[]).map(x=>x.toLowerCase()))
   const contentHits=await lexicalSearch(map.root,qs)
   const contentMap=new Map(contentHits.map(h=>[h.path,h]))
@@ -106,7 +106,7 @@ export async function retrieveContext(map:RepositoryMap,query:string,opts:Retrie
   for(const item of chosen){
     if(sections.length>=maxFiles||usedBytes>=byteBudget)break
     const raw=await fs.readFile(path.join(map.root,item.file.path),'utf8').catch(()=>null);if(raw===null)continue
-    const hits=[...new Set([...item.hitLines,...lineHits(raw,qs)])].sort((a,b)=>a-b);const remain=Math.max(180,byteBudget-usedBytes-96);const body=await excerpt(map.root,item.file,[...hits].slice(0,8),Math.min(MAX_FILE_BYTES,remain));if(!body)continue
+    const hits=[...new Set([...item.hitLines,...lineHits(raw,qs)])].sort((a,b)=>a-b);const remain=Math.max(180,byteBudget-usedBytes-96);const body=await excerpt(map.root,item.file,[...hits].slice(0,8),Math.min(maxFileBytes,remain),maxFileBytes);if(!body)continue
     const why=item.symbolHits?`symbol match; `:''
     const label=`${why}${item.contentHits?'content match; ':''}structural ${item.file.structural.toFixed(2)}`
     const section=`### ${item.file.path} (${label.trim()})\n${body}`

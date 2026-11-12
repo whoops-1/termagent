@@ -42,7 +42,7 @@ export type ToolAvailabilityContext = {
   disallowedTools?:ReadonlySet<string>
 }
 
-export interface ToolContext { sessionID: string; agent: string; cwd: string; abort: AbortSignal; toolCallId?: string; scopePaths?: string[]; taskId?: string; delegationDepth?: number; specialistRole?: string; questioner?: Questioner; permissionRules?: import('../config/config.js').PermissionRule[]; readFileState?: import('./file-state.js').FileReadStateCache }
+export interface ToolContext { sessionID: string; agent: string; cwd: string; abort: AbortSignal; toolCallId?: string; scopePaths?: string[]; taskId?: string; delegationDepth?: number; specialistRole?: string; questioner?: Questioner; permissionRules?: import('../config/config.js').PermissionRule[]; readFileState?: import('./file-state.js').FileReadStateCache; contextWindow?: number }
 
 export interface ToolResult { output:string; title?:string; metadata?:any }
 

@@ -28,6 +28,7 @@ export type KnownEventKind =
   | 'session.turn.started'
   | 'session.turn.completed'
   | 'session.turn.failed'
+  | 'session.turn.interrupted'
   | 'session.message.user'
   | 'session.message.assistant'
   | 'session.message.tool'
@@ -56,8 +57,10 @@ export type KnownEventKind =
   | 'session.skill.load'
   | 'session.skill.skip'
   | 'session.provider.updated'
+  | 'session.provider.usage'
   | 'session.branch.created'
   | 'session.context.checkpoint'
+  | 'session.context.instructions'
   | 'session.summary.updated'
   | 'session.queue.updated'
   | 'session.workflow.updated'
@@ -82,6 +85,7 @@ export const DURABLE_EVENT_KINDS: ReadonlySet<KnownEventKind> = new Set([
   'session.turn.started',
   'session.turn.completed',
   'session.turn.failed',
+  'session.turn.interrupted',
   'session.message.user',
   'session.message.assistant',
   'session.reasoning.started',
@@ -107,8 +111,10 @@ export const DURABLE_EVENT_KINDS: ReadonlySet<KnownEventKind> = new Set([
   'session.skill.load',
   'session.skill.skip',
   'session.provider.updated',
+  'session.provider.usage',
   'session.branch.created',
   'session.context.checkpoint',
+  'session.context.instructions',
   'session.summary.updated',
   'session.workflow.updated',
   'session.checkpoint.created',
@@ -219,6 +225,9 @@ export type CommandKind =
   | 'session.prompt'
   | 'session.steer'
   | 'session.queue'
+  | 'session.queue.edit'
+  | 'session.queue.cancel'
+  | 'session.queue.move'
   | 'session.resume'
   | 'session.abort'
   | 'session.interrupt'
@@ -271,10 +280,12 @@ export interface PermissionRequestState {
   revision: number
   status: 'pending' | 'resolved' | 'cancelled'
   tool: string
+  toolCallId?: string
   action: string
   resources: string[]
   createdAt: number
   resolvedAt?: number
+  cancelReason?: string
   resolution?: PermissionResolution
 }
 

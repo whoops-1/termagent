@@ -1,4 +1,5 @@
 import process from 'node:process'
+import path from 'node:path'
 import crypto from 'node:crypto'
 import readline from 'node:readline/promises'
 import { loadConfig, resolveProviderConfig, saveUIPreferences } from '../config/config.js'
@@ -7,9 +8,11 @@ import { migrateLegacyState } from '../migration.js'
 import { buildRepositoryMap, formatRepositoryMap, invalidateRepositoryCache } from '../context/repository.js'
 import { retrieveContext } from '../context/retrieval.js'
 import { compactMessages } from '../agent/compaction.js'
-import { estimateMessagesTokens } from '../context/budget.js'
+import { accountContext, createContextBudget, deriveRepositoryContextBudget, estimateMessagesTokens } from '../context/budget.js'
+import { contextLimitsFor, repositoryBudgetFor } from '../context/runtime-budget.js'
 import { projectionHash } from '../context/state.js'
 import { createProvider } from '../providers/registry.js'
+import { aggregateProviderUsageEvents, latestProviderUsageFromEvents, type ProviderUsageReport } from '../providers/types.js'
 import { ProviderRouter } from '../providers/router.js'
 import { resolveProviderTarget } from '../providers/selection.js'
 import { listProviderProfiles, removeProviderProfile, saveProviderProfile, setActiveProviderProfile, useEnvironmentProvider, type ProviderProfileDraft } from '../providers/manager.js'
@@ -53,14 +56,38 @@ import { TerminalUI } from './ui.js'
 import { listThemes, loadThemeCatalog, THEMES } from '../design-system/theme.js'
 import { renderEffectPickerRows } from '../design-system/effects.js'
 import { renderBannerStyleRows } from '../design-system/banner.js'
+import { acquireDaemonOwner, readDaemonOwner, type DaemonOwnerPublicInfo } from '../server/daemon-owner.js'
+import { startDaemonClient } from './daemon-client.js'
+
+async function waitForExistingServerOwner(cwd:string):Promise<DaemonOwnerPublicInfo|undefined>{
+ let owner=await readDaemonOwner(cwd)
+ if(owner?.mode!=='server') return undefined
+ for(let attempt=0;attempt<150;attempt++){
+   if(owner.state==='ready'&&owner.endpoint) return owner
+   await new Promise(resolve=>setTimeout(resolve,100))
+   owner=await readDaemonOwner(cwd)
+   if(owner?.mode!=='server') return undefined
+ }
+ throw new Error('A TermAgent server owns this workspace but did not become ready within 15 seconds.')
+}
 
 export async function start(cwd=process.cwd(),resume?:string){
+ const existingServer=await waitForExistingServerOwner(cwd)
+ if(existingServer) return await startDaemonClient(cwd,resume,existingServer)
+ let daemonOwner
+ try{
+   daemonOwner=await acquireDaemonOwner(cwd,{mode:'terminal'})
+ }catch(error){
+   const concurrentServer=await waitForExistingServerOwner(cwd)
+   if(concurrentServer) return await startDaemonClient(cwd,resume,concurrentServer)
+   throw error
+ }
+ try {
  try { await migrateLegacyState(cwd) } catch (migrationError) { console.warn(`startup migration: ${(migrationError as Error).message}`) }
- const cfg=await loadConfig(cwd); const themeCatalog=await loadThemeCatalog(cwd); const store=new SessionStore(); let session:any; let messages:any[]=[]; let initialTodo:any[]=[]
- if(resume){const loaded=await store.load(resume);session=loaded.meta;messages=loaded.messages;const latest=[...loaded.events].reverse().find((e:any)=>e.type==='todo');if(Array.isArray(latest?.data?.items))initialTodo=activeTodoItems(latest.data.items)}else session=await store.create(cwd,cfg.model)
+ const cfg=await loadConfig(cwd); const themeCatalog=await loadThemeCatalog(cwd); const store=new SessionStore(); const tasks=new TaskManager(); await tasks.recover(); const activeTaskSessions=new Set((await tasks.list()).filter(task=>task.status==='running'&&task.pid&&typeof task.cwd==='string'&&path.resolve(task.cwd)===path.resolve(cwd)).flatMap(task=>[task.childSessionId,task.sessionId].filter((id):id is string=>Boolean(id)))); await store.recoverOrphanedRuntimeState(cwd,daemonOwner.id,activeTaskSessions); let session:any; let messages:any[]=[]; let initialTodo:any[]=[]; let initialUsage:ProviderUsageReport|undefined
+ if(resume){const loaded=await store.load(resume);session=loaded.meta;messages=loaded.messages;initialUsage=latestProviderUsageFromEvents(loaded.events);const latest=[...loaded.events].reverse().find((e:any)=>e.type==='todo');if(Array.isArray(latest?.data?.items))initialTodo=activeTodoItems(latest.data.items)}else session=await store.create(cwd,cfg.model)
  const gate=new PermissionGate(cfg.approvals, process.stdin, process.stdout, cfg.permissionRules || []); const registry=new ToolRegistry(gate)
  builtinTools({timeout:cfg.shellTimeoutMs,maxOutput:cfg.maxOutputBytes,toolOutputMaxLines:cfg.toolOutputMaxLines,toolOutputMaxBytes:cfg.toolOutputMaxBytes,toolOutputRetentionDays:cfg.toolOutputRetentionDays}).forEach(t=>registry.add(t)); registry.add(questionTool(store))
- const tasks=new TaskManager(); await tasks.recover()
  let providerCfg:any=resolveProviderConfig(cfg); let provider:any=createProvider(providerCfg)
  let uiRef:TerminalUI|null=null
  registry.add(backgroundTool(tasks)); registry.add(taskStatusTool(tasks)); registry.add(taskCancelTool(tasks)); registry.add(verifyTool(cfg.shellTimeoutMs,cfg.maxOutputBytes,tasks))
@@ -127,7 +154,7 @@ export async function start(cwd=process.cwd(),resume?:string){
    gate.setRequester(request => ui.requestPermission(request))
    ui.hydrate(messages)
    ui.setTodos(todoState)
-   ui.setContextUsage(estimateMessagesTokens(messages), cfg.maxContextTokens || 12000)
+   ui.setContextUsage(estimateMessagesTokens(messages), contextLimitsFor(provider,cfg).contextWindow, true)
    ui.enter()
  } else banner(`${cfg.provider}:${providerCfg.model}`,cwd)
 
@@ -137,6 +164,7 @@ export async function start(cwd=process.cwd(),resume?:string){
  const commands=['help','model','models','variants','provider','agent','agents','commands','theme','effect','banner','animations','plugins','marketplace','marketplace-auto-update','skill','skill-registry','plan','build','explore','sessions','resume','fork','skills','doctor','permissions','context','compact','thinking','details','undo','redo','diff','repomap','history','editor','export','stash','queue','vim','tasks','task-log','checkpoints','checkpoint','restore','cancel','auto','clear','quit','exit']
  const builtinAgentModes=['build','plan','explore'] as const
  let processingQueue=false
+ const usageTelemetry:{latest?:ProviderUsageReport}={latest:initialUsage}
  let activeTurnPromise:Promise<unknown>|null=null
  let editingQueuedId:string|undefined
  const agentShortcut=async(name:EditorShortcut)=>{
@@ -332,11 +360,11 @@ export async function start(cwd=process.cwd(),resume?:string){
  }
 
  const resumeSession=async(id:string)=>{
-   const loaded=await store.load(id); session=loaded.meta; messages=loaded.messages
+   const loaded=await store.load(id); session=loaded.meta; messages=loaded.messages; usageTelemetry.latest=latestProviderUsageFromEvents(loaded.events)
    await runtimeQueue.recoverStaleExecuting(session.id)
    const latest=[...loaded.events].reverse().find((e:any)=>e.type==='todo')
    todoState.splice(0,todoState.length,...(Array.isArray(latest?.data?.items)?activeTodoItems(latest.data.items):[]))
-   ui?.clearConversation(); ui?.hydrate(messages); ui?.setContextUsage(estimateMessagesTokens(messages), cfg.maxContextTokens || 12000); await syncQueue(); output(`resumed ${id}`)
+   ui?.clearConversation(); ui?.hydrate(messages); ui?.setContextUsage(estimateMessagesTokens(messages), contextLimitsFor(provider,cfg).contextWindow, true); await syncQueue(); output(`resumed ${id}`)
  }
  const requestQuestion=async(questions:any[],signal?:AbortSignal)=>ui?ui.requestQuestion(questions,signal):questions.map(()=>[])
  const selectRequestProvider=(custom:any)=>custom?.model ? (resolveProviderTarget(cfg,custom.model) || provider) : provider
@@ -372,7 +400,7 @@ export async function start(cwd=process.cwd(),resume?:string){
     if(input==='/quit'||input==='/exit') return true
     ui?.setInput('', 0)
     ui?.addUser(input)
-    if(input==='/help'){output('/help  /theme  /effect  /banner  /animations  /model  /models  /provider <name>  /agent [build|plan|explore|custom]  /agents  /commands  /skill <id> [args]  /variants\n/plugins  /marketplace  /marketplace-auto-update <name> [on|off]  /skills [query|install|uninstall|installed|registries]  /skill-registry [list|add|remove|refresh|search|install|installed|uninstall]\n/plan  /build  /explore  /sessions  /resume <id>  /fork [message-count|checkpoint <id>]  /branch <checkpoint-id> [--restore]  /history [query]  /doctor  /context\n/permissions  /compact  /thinking  /undo  /redo  /diff  /details  /repomap [--tokens N] [--focus PATH] [--focus-symbols NAME] [--stats|--invalidate]\n/editor  /export  /vim  /stash [list|clear]  /queue [prompt|clear]  /tasks  /task-log <id>  /checkpoints  /checkpoint  /restore <id>  /cancel <id>  /auto <task>  /clear  /quit');return false}
+    if(input==='/help'){output('/help  /theme  /effect  /banner  /animations  /model  /models  /provider <name>  /agent [build|plan|explore|custom]  /agents  /commands  /skill <id> [args]  /variants\n/plugins  /marketplace  /marketplace-auto-update <name> [on|off]  /skills [query|install|uninstall|installed|registries]  /skill-registry [list|add|remove|refresh|search|install|installed|uninstall]\n/plan  /build  /explore  /sessions  /resume <id>  /fork [message-count|checkpoint <id>]  /branch <checkpoint-id> [--restore]  /history [query]  /doctor  /context  /usage\n/permissions  /compact  /thinking  /undo  /redo  /diff  /details  /repomap [--tokens N] [--focus PATH] [--focus-symbols NAME] [--stats|--invalidate]\n/editor  /export  /vim  /stash [list|clear]  /queue [prompt|clear]  /tasks  /task-log <id>  /checkpoints  /checkpoint  /restore <id>  /cancel <id>  /auto <task>  /clear  /quit');return false}
     if(input==='/agent'){output(`${agentMode} · ${agentMode==='build'?'full development access':agentMode==='plan'?'read-only planning':'read-only exploration'}`);return false}
     if(input==='/theme' || input.startsWith('/theme ')){
       const requested = input.slice('/theme'.length).trim().toLowerCase()
@@ -477,10 +505,11 @@ available: showcase, split, signal, minimal`);return false}
       session=child
       const loaded=await store.load(child.id)
       messages=loaded.messages
+      usageTelemetry.latest=latestProviderUsageFromEvents(loaded.events)
       await runtimeQueue.recoverStaleExecuting(session.id)
       const latest=[...loaded.events].reverse().find((e:any)=>e.type==='todo')
       todoState.splice(0,todoState.length,...(Array.isArray(latest?.data?.items)?activeTodoItems(latest.data.items):[]))
-      ui?.clearConversation(); ui?.hydrate(messages); ui?.setContextUsage(estimateMessagesTokens(messages), cfg.maxContextTokens || 12000)
+      ui?.clearConversation(); ui?.hydrate(messages); ui?.setContextUsage(estimateMessagesTokens(messages), contextLimitsFor(provider,cfg).contextWindow, true)
       await syncQueue()
       output(`${messagePrefix} ${child.id}`)
     }
@@ -571,9 +600,56 @@ available: showcase, split, signal, minimal`);return false}
     }
     if(input==='/doctor' || input.startsWith('/doctor ')){const args=input.slice('/doctor'.length).trim().split(/\s+/).filter(Boolean);const d=await doctor(cwd);if(args.includes('--json')){output(JSON.stringify(d,null,2));return false} for(const group of ['environment','configuration','migration','marketplaces','plugins','skills','storage']){const rows=d.checks.filter(item=>item.group===group);if(!rows.length)continue;output(`\n${group.toUpperCase()}`);for(const item of rows){const mark=item.status==='ok'?'✓':item.status==='warn'?'!':'✗';output(`${mark} ${item.label}: ${item.value}${item.detail?` · ${item.detail}`:''}`);if(item.remediation)output(`  → ${item.remediation}`)}} output(`\ndoctor: ${d.counts.ok} ok · ${d.counts.warn} warnings · ${d.counts.error} errors`);return false}
     if(input==='/permissions'){output(`approvals=${cfg.approvals}`);if(cfg.permissionRules?.length)for(const r of cfg.permissionRules)output(`${r.decision} ${r.tool}${r.pattern?`  ${r.pattern}`:''}`);return false}
-    if(input==='/context'){const tokens=estimateMessagesTokens(messages);const limit=cfg.maxContextTokens||12000;output(`context: ${tokens}/${limit} tokens (${limit?Math.round(tokens/limit*100):0}%)\nmessages: ${messages.length}\ntool messages: ${messages.filter((m:any)=>m.role==='tool').length}\nremaining: ${Math.max(0,limit-tokens)}`);return false}
+    if(input==='/usage'){
+      const history=await store.load(session.id)
+      const usage=aggregateProviderUsageEvents(history.events)
+      if(!usage.requests){output('no provider usage history recorded for this session');return false}
+      output(formatProviderUsageAggregate(usage))
+      return false
+    }
+    if(input==='/context'){
+      const role=agentMode==='plan'?'planning':agentMode==='build'?'building':agentMode==='explore'?'default':'default'
+      const latestPrompt=[...messages].reverse().find((message:any)=>message.role==='user'&&typeof message.content==='string')?.content || ''
+      const limits=contextLimitsFor(provider,cfg,role,latestPrompt,messages.length)
+      const budget=createContextBudget({maxContextTokens:limits.contextWindow,maxOutputTokens:limits.maxOutputTokens,threshold:cfg.compactionThreshold,reserveTokens:cfg.contextReserveTokens,recentTokens:cfg.contextRecentTokens})
+      const accounting=accountContext(messages,registry.schemas() as any)
+      const repoBudget=repositoryBudgetFor(provider,cfg,role,repositoryMap.files.length,latestPrompt,messages.length)
+      const activeConfig=provider.getActiveConfig?.()||provider.config
+      let endpoint='unknown'
+      try { const parsed=new URL(activeConfig?.baseUrl||''); endpoint=`${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/$/,'')}` } catch {}
+      const percentage=limits.contextWindow?Math.round(accounting.total/limits.contextWindow*100):0
+      const limitNote=limits.contextSource==='user-config'
+        ? '\nlimit note: an explicit maxContextTokens / TERMAGENT_CONTEXT_WINDOW override is capping this route; remove it to use provider/model metadata'
+        : limits.contextSource==='conservative-fallback'
+          ? '\nlimit note: this route has no verified context-window metadata; the 128,000-token conservative fallback is being used'
+          : ''
+      const lastUsage=usageTelemetry.latest
+      const contextHistory=await store.load(session.id)
+      const latestCompaction=[...contextHistory.events].reverse().find((event:any)=>event.type==='compaction' && event.data?.reason==='estimated-request-footprint-exceeded-budget' && event.data?.after)
+      const compactData=latestCompaction?.data
+      const compactionLine=compactData
+        ? `\nlast automatic compaction: ${compactData.method||'unknown method'} · trigger ${compactData.trigger||'unknown'} · ${Number(compactData.before?.estimatedRequestTokens||0).toLocaleString()} → ${Number(compactData.after?.estimatedRequestTokens||0).toLocaleString()} tokens · ${Number(compactData.after?.headroomTokens||0).toLocaleString()} headroom · ${Number(compactData.removedMessages||0)} messages removed · ${Number(compactData.prunedToolResults||0)} tool results pruned · ${Number(compactData.retainedMessages||0)} messages retained · ${new Date(latestCompaction.ts).toLocaleString()}`
+        : ''
+      const usageLine=lastUsage
+        ? `\nlast provider report: ${lastUsage.provider}/${lastUsage.model} · input ${lastUsage.inputTokens.toLocaleString()} (${lastUsage.nonCachedInputTokens.toLocaleString()} uncached + ${(lastUsage.cacheReadTokens||0).toLocaleString()} read-cache + ${(lastUsage.cacheWriteTokens||0).toLocaleString()} write-cache) · output ${lastUsage.outputTokens.toLocaleString()}${lastUsage.reasoningTokens!==undefined?` (${lastUsage.reasoningTokens.toLocaleString()} reasoning)`:''} ${lastUsage.toolUsePromptTokens!==undefined?` · tool-use input ${lastUsage.toolUsePromptTokens.toLocaleString()}`:''}${lastUsage.contextTokens!==undefined?` · final request context ${lastUsage.contextTokens.toLocaleString()}`:''} · total ${lastUsage.totalTokens.toLocaleString()} · estimator ${lastUsage.estimateInputTokens.toLocaleString()}${lastUsage.driftPercent!==undefined?` · drift ${lastUsage.driftPercent>0?'+':''}${lastUsage.driftPercent}%`:''}${formatUsageModalities(lastUsage.modalityTokens)}${lastUsage.estimated?' · provider usage unavailable; estimate only':''}${lastUsage.recordedAt?` · recorded ${new Date(lastUsage.recordedAt).toLocaleString()}`:''}`
+        : '\nlast provider report: no completed request usage in this process yet'
+      output(`model: ${limits.provider}/${limits.model}\nendpoint: ${endpoint}\ncontext window: ${limits.contextWindow.toLocaleString()} tokens (${limits.contextSource})\noutput reserve: ${limits.maxOutputTokens.toLocaleString()} tokens (${limits.outputSource})\nrequest estimate: ${accounting.total.toLocaleString()} tokens (${percentage}%)\nusable before compaction: ${budget.usableTokens.toLocaleString()}\nremaining usable: ${Math.max(0,budget.usableTokens-accounting.total).toLocaleString()}\ncompaction threshold: ${(budget.threshold*100).toFixed(0)}% · target after compaction: ${budget.compactTargetTokens.toLocaleString()}\nrecent-turn retention target: ${budget.recentTokens.toLocaleString()}\nmessages: ${messages.length} · tool results: ${messages.filter((m:any)=>m.role==='tool').length}\ntool schemas: ${accounting.toolDefinitions} · tool calls: ${accounting.toolCalls} · tool results: ${accounting.toolResults}\ninstructions: ${accounting.instructions} · repository: ${accounting.repository} · system/other: ${accounting.systemNotices+accounting.other}\nskill descriptors: ${accounting.skillDescriptors} · loaded skills: ${accounting.loadedSkills}\nsummaries: ${accounting.summaries} · multimodal: ${accounting.multimodal}\nrepository budgets: map ${repoBudget.mapTokens.toLocaleString()} tokens / ${repoBudget.mapPaths} paths · retrieval ${repoBudget.retrievalTokens.toLocaleString()} tokens / ${repoBudget.retrievalFiles} files / ${repoBudget.retrievalBytes.toLocaleString()} bytes\nestimator: conservative character/token heuristic; compare with provider-reported prompt usage in the live meter${usageLine}${compactionLine}${limitNote}`)
+      return false
+    }
     if(input==='/thinking'){if(ui) ui.openReasoningView(); else output('reasoning inspection is only available in interactive mode');return false}
-    if(input==='/repomap'||input.startsWith('/repomap ')){const parts=input.slice(8).trim().split(/\s+/).filter(Boolean);let tokens=Number(cfg.repoMapTokens||2048);const focusFiles:string[]=[];const focusSymbols:string[]=[];let stats=false;let invalidate=false;for(let i=0;i<parts.length;i++){const part=parts[i];if(part==='--tokens')tokens=Number(parts[++i]||tokens);else if(part==='--focus')focusFiles.push(parts[++i]||'');else if(part==='--focus-symbols')focusSymbols.push(parts[++i]||'');else if(part==='--stats')stats=true;else if(part==='--invalidate')invalidate=true}if(invalidate)await invalidateRepositoryCache(cwd);repositoryMap=await buildRepositoryMap(cwd);output(formatRepositoryMap(repositoryMap,180,Math.max(256,Math.min(tokens||2048,8192)),{focusFiles,focusSymbols}));if(stats)output(`cache: ${repositoryMap.cache.hit} reused, ${repositoryMap.cache.miss} parsed\nfiles: ${repositoryMap.files.length}\nsymbols: ${repositoryMap.files.reduce((n,f)=>n+f.symbols.length,0)}\nedges: ${repositoryMap.edges.length}`);return false}
+    if(input==='/repomap'||input.startsWith('/repomap ')){
+      const parts=input.slice(8).trim().split(/\s+/).filter(Boolean)
+      const role=agentMode==='plan'?'planning':agentMode==='build'?'building':'default'
+      const repoBudget=repositoryBudgetFor(provider,cfg,role,repositoryMap.files.length)
+      let tokens=repoBudget.mapTokens
+      const focusFiles:string[]=[];const focusSymbols:string[]=[];let stats=false;let invalidate=false
+      for(let i=0;i<parts.length;i++){const part=parts[i];if(part==='--tokens')tokens=Number(parts[++i]||tokens);else if(part==='--focus')focusFiles.push(parts[++i]||'');else if(part==='--focus-symbols')focusSymbols.push(parts[++i]||'');else if(part==='--stats')stats=true;else if(part==='--invalidate')invalidate=true}
+      if(invalidate)await invalidateRepositoryCache(cwd)
+      repositoryMap=await buildRepositoryMap(cwd)
+      output(formatRepositoryMap(repositoryMap,repoBudget.mapPaths,Math.max(256,Math.min(tokens||repoBudget.mapTokens,64_000)),{focusFiles,focusSymbols}))
+      if(stats)output(`cache: ${repositoryMap.cache.hit} reused, ${repositoryMap.cache.miss} parsed\nfiles: ${repositoryMap.files.length}\nsymbols: ${repositoryMap.files.reduce((n,f)=>n+f.symbols.length,0)}\nedges: ${repositoryMap.edges.length}\nauto budget: ${repoBudget.mapTokens} tokens / ${repoBudget.mapPaths} paths`)
+      return false
+    }
     if(input==='/undo'){const result=await store.undo(session.id,cwd);messages=result.messages;ui?.clearConversation();ui?.hydrate(messages);output(`undid turn ${result.turn.id}`);return false}
     if(input==='/redo'){const result=await store.redo(session.id,cwd);messages=result.messages;ui?.clearConversation();ui?.hydrate(messages);output(`redid turn ${result.turn.id}`);return false}
     if(input==='/sessions'){const sessions=await store.list();if(interactive){if(!sessions.length){output('no saved sessions','warn');return false}editor.openCommandPalette(sessions.map((s:any)=>`/resume ${s.id} · ${s.model} · ${s.cwd}`), async(value)=>{const id=String(value).match(/^\/resume\s+(\S+)/)?.[1];if(id)await resumeSession(id)});return false}for(const s of sessions)output(`${s.id}  ${s.model}  ${s.cwd}`);return false}
@@ -610,21 +686,24 @@ available: showcase, split, signal, minimal`);return false}
       const task=parts.join(' ').trim() || `Apply skill ${loaded.descriptor.id} to the current task and project.`
       clearCompletedTodoState();
       ui?.setStatus('working…');
-      await providerRun(selectRequestProvider(selectedCustom),registry,store,session,messages,cwd,instructions,formatRepositoryMap(repositoryMap,100,cfg.repoMapTokens||2600),task,cfg,'(automatic skill discovery suppressed for explicit skill invocation)',false,agentMode,selectedCustom,ui,requestQuestion,{id:loaded.descriptor.id,content:loaded.content,sha256:loaded.sha256},undefined,hookManager);
+      const requestProvider=selectRequestProvider(selectedCustom)
+      const requestRole=agentMode==='plan'?'planning':agentMode==='build'?'building':'default'
+      const skillRepoBudget=repositoryBudgetFor(requestProvider,cfg,requestRole,repositoryMap.files.length,task,messages.length+1)
+      await providerRun(requestProvider,registry,store,session,messages,cwd,instructions,formatRepositoryMap(repositoryMap,skillRepoBudget.mapPaths,skillRepoBudget.mapTokens),task,cfg,'(automatic skill discovery suppressed for explicit skill invocation)',false,agentMode,selectedCustom,ui,requestQuestion,{id:loaded.descriptor.id,content:loaded.content,sha256:loaded.sha256},undefined,hookManager,usageTelemetry)
       repositoryMap=await buildRepositoryMap(cwd);
       return false
     }
-    if(input==='/compact'){const c=compactMessages(messages,cfg.maxContextTokens||12000,{maxOutputTokens:provider.config?.maxTokens||0,threshold:cfg.compactionThreshold,reserveTokens:cfg.contextReserveTokens,recentTokens:cfg.contextRecentTokens});messages.splice(0,messages.length,...c.messages);if(c.removed){const loaded=await store.load(session.id);const prior=await store.latestContextCheckpoint(session.id);const activeTurn=[...loaded.events].reverse().find((e:any)=>e.type==='turn'&&e.data?.status==='committed')?.data;const epoch=Number(prior?.epoch||0)+1;const summaryRevision=Number(prior?.summaryRevision||0)+1;const id=crypto.randomBytes(8).toString('hex');const machine={...(prior?.machineState||{}),version:1,sessionId:session.id,turnId:activeTurn?.id,epoch,checkpointId:id,sourceEventCount:loaded.events.length,projectionHash:projectionHash(messages),summaryRevision,createdAt:Date.now()};await store.append(session.id,{type:'compaction',ts:Date.now(),data:{removed:c.removed,tokens:c.budget.usableTokens,summary:c.summary,budget:c.budget,manual:true,stage:'full-compaction',epoch,summaryRevision}});await store.saveContextCheckpoint(session.id,{version:1,id,sessionId:session.id,turnId:activeTurn?.id,epoch,sourceEventCount:loaded.events.length,projectionHash:machine.projectionHash,summaryRevision,summary:c.summary,messages:messages.filter(m=>m.role!=='system'),machineState:machine,stage:'full-compaction',createdAt:Date.now()});}output(c.removed?`context compacted (${c.removed} messages removed from active context)`:'context already within budget');return false}
+    if(input==='/compact'){const compactLimits=contextLimitsFor(provider,cfg,agentMode==='plan'?'planning':agentMode==='build'?'building':'default',[...messages].reverse().find((message:any)=>message.role==='user')?.content||'',messages.length);const c=compactMessages(messages,compactLimits.contextWindow,{maxOutputTokens:compactLimits.maxOutputTokens,threshold:cfg.compactionThreshold,reserveTokens:cfg.contextReserveTokens,recentTokens:cfg.contextRecentTokens});messages.splice(0,messages.length,...c.messages);if(c.removed){const loaded=await store.load(session.id);const prior=await store.latestContextCheckpoint(session.id);const activeTurn=[...loaded.events].reverse().find((e:any)=>e.type==='turn'&&e.data?.status==='committed')?.data;const epoch=Number(prior?.epoch||0)+1;const summaryRevision=Number(prior?.summaryRevision||0)+1;const id=crypto.randomBytes(8).toString('hex');const machine={...(prior?.machineState||{}),version:1,sessionId:session.id,turnId:activeTurn?.id,epoch,checkpointId:id,sourceEventCount:loaded.events.length,projectionHash:projectionHash(messages),summaryRevision,createdAt:Date.now()};await store.append(session.id,{type:'compaction',ts:Date.now(),data:{removed:c.removed,tokens:c.budget.usableTokens,summary:c.summary,budget:c.budget,manual:true,stage:'full-compaction',epoch,summaryRevision}});await store.saveContextCheckpoint(session.id,{version:1,id,sessionId:session.id,turnId:activeTurn?.id,epoch,sourceEventCount:loaded.events.length,projectionHash:machine.projectionHash,summaryRevision,summary:c.summary,messages:messages.filter(m=>m.role!=='system'),machineState:machine,stage:'full-compaction',createdAt:Date.now()});}output(c.removed?`context compacted (${c.removed} messages removed from active context)`:'context already within budget');return false}
     if(input==='/checkpoint'){const cp=await store.checkpoint(session.id,messages,{agent:agentMode,provider:provider.id,model:provider.model});output(`checkpoint saved: ${cp.id}`);return false}
     if(input.startsWith('/resume ')){await resumeSession(input.slice(8).trim());return false}
     if(input.startsWith('/restore ')){const parts=input.slice(9).trim().split(/\s+/);const checkpointId=parts[0];if(!checkpointId)throw new Error('Usage: /restore <checkpoint-id>');const restored=await store.restoreCheckpoint(session.id,checkpointId);messages=restored.messages;ui?.clearConversation();ui?.hydrate(messages);output(`restored checkpoint ${restored.checkpoint.id} · workspace restored`);return false}
     if(input.startsWith('/') && !input.startsWith('/auto ')){
       const parts=input.slice(1).split(/\s+/); const cmd=customCommands.find(c=>c.name===parts[0])
-      if(cmd){clearCompletedTodoState();ui?.setStatus('working…');const rendered=await interpolateCommandTemplate(cmd.template,parts.slice(1),cwd,cfg.maxOutputBytes||12000);const agentName=cmd.agent||agentMode;const custom=customAgents.find(a=>a.name===agentName);const prompt=custom?`${custom.prompt}\n\nUSER COMMAND:\n${rendered}`:rendered;const mode=custom?.mode==='subagent'?'build':(['build','plan','explore'].includes(agentName)?agentName:'build');await providerRun(cmd.model ? (resolveProviderTarget(cfg,cmd.model) || selectRequestProvider(custom)) : selectRequestProvider(custom),registry,store,session,messages,cwd,instructions,formatRepositoryMap(repositoryMap,100,cfg.repoMapTokens||2600),prompt,cfg,'(automatic skill discovery is performed by the agent)',false,mode,custom,ui,requestQuestion,undefined,cmd.allowedTools,hookManager);repositoryMap=await buildRepositoryMap(cwd);return false}
+      if(cmd){clearCompletedTodoState();ui?.setStatus('working…');const rendered=await interpolateCommandTemplate(cmd.template,parts.slice(1),cwd,cfg.maxOutputBytes||12000);const agentName=cmd.agent||agentMode;const custom=customAgents.find(a=>a.name===agentName);const prompt=custom?`${custom.prompt}\n\nUSER COMMAND:\n${rendered}`:rendered;const mode=custom?.mode==='subagent'?'build':(['build','plan','explore'].includes(agentName)?agentName:'build');const requestProvider=cmd.model?(resolveProviderTarget(cfg,cmd.model)||selectRequestProvider(custom)):selectRequestProvider(custom);const requestRole=mode==='plan'?'planning':mode==='build'?'building':'default';const commandRepoBudget=repositoryBudgetFor(requestProvider,cfg,requestRole,repositoryMap.files.length,prompt,messages.length+1);await providerRun(requestProvider,registry,store,session,messages,cwd,instructions,formatRepositoryMap(repositoryMap,commandRepoBudget.mapPaths,commandRepoBudget.mapTokens),prompt,cfg,'(automatic skill discovery is performed by the agent)',false,mode,custom,ui,requestQuestion,undefined,cmd.allowedTools,hookManager,usageTelemetry);repositoryMap=await buildRepositoryMap(cwd);return false}
     }
-    if(input.startsWith('/auto ')){const taskPrompt=input.slice(6).trim();clearCompletedTodoState();ui?.setStatus('working…');const repositoryOverview=formatRepositoryMap(repositoryMap,100,cfg.repoMapTokens||2600);const retrieved=await retrieveContext(repositoryMap,taskPrompt,{maxFiles:6,maxBytes:cfg.maxContextBytes||36000,maxTokens:Math.floor((cfg.maxContextBytes||36000)/4)});const selected=[];await providerRun(provider,registry,store,session,messages,cwd,instructions,`${repositoryOverview}\n\n${retrieved}`,taskPrompt,cfg,'(automatic skill discovery is performed by the agent)',true,'build',undefined,ui,requestQuestion,undefined,undefined,hookManager);repositoryMap=await buildRepositoryMap(cwd);return false}
+    if(input.startsWith('/auto ')){const taskPrompt=input.slice(6).trim();clearCompletedTodoState();ui?.setStatus('working…');const taskRepoBudget=repositoryBudgetFor(provider,cfg,'building',repositoryMap.files.length,taskPrompt,messages.length+1);const repositoryOverview=formatRepositoryMap(repositoryMap,taskRepoBudget.mapPaths,taskRepoBudget.mapTokens);const retrieved=await retrieveContext(repositoryMap,taskPrompt,{maxFiles:taskRepoBudget.retrievalFiles,maxBytes:taskRepoBudget.retrievalBytes,maxTokens:taskRepoBudget.retrievalTokens,maxFileBytes:taskRepoBudget.retrievalFileBytes});await providerRun(provider,registry,store,session,messages,cwd,instructions,`${repositoryOverview}\n\n${retrieved}`,taskPrompt,cfg,'(automatic skill discovery is performed by the agent)',true,'build',undefined,ui,requestQuestion,undefined,undefined,hookManager,usageTelemetry);repositoryMap=await buildRepositoryMap(cwd);return false}
     clearCompletedTodoState()
-    ui?.setStatus('working…');const repositoryOverview=formatRepositoryMap(repositoryMap,100,cfg.repoMapTokens||2600);const retrieved=await retrieveContext(repositoryMap,input,{maxFiles:6,maxBytes:cfg.maxContextBytes||36000,maxTokens:Math.floor((cfg.maxContextBytes||36000)/4)});const selected=[];await providerRun(selectRequestProvider(selectedCustom),registry,store,session,messages,cwd,instructions,`${repositoryOverview}\n\n${retrieved}`,input,cfg,'(automatic skill discovery is performed by the agent)',false,agentMode,selectedCustom,ui,requestQuestion,undefined,undefined,hookManager);repositoryMap=await buildRepositoryMap(cwd);return false
+    ui?.setStatus('working…');const requestProvider=selectRequestProvider(selectedCustom);const requestRole=agentMode==='plan'?'planning':agentMode==='build'?'building':'default';const requestRepoBudget=repositoryBudgetFor(requestProvider,cfg,requestRole,repositoryMap.files.length,input,messages.length+1);const repositoryOverview=formatRepositoryMap(repositoryMap,requestRepoBudget.mapPaths,requestRepoBudget.mapTokens);const retrieved=await retrieveContext(repositoryMap,input,{maxFiles:requestRepoBudget.retrievalFiles,maxBytes:requestRepoBudget.retrievalBytes,maxTokens:requestRepoBudget.retrievalTokens,maxFileBytes:requestRepoBudget.retrievalFileBytes});await providerRun(requestProvider,registry,store,session,messages,cwd,instructions,`${repositoryOverview}\n\n${retrieved}`,input,cfg,'(automatic skill discovery is performed by the agent)',false,agentMode,selectedCustom,ui,requestQuestion,undefined,undefined,hookManager,usageTelemetry);repositoryMap=await buildRepositoryMap(cwd);return false
    } catch(e){showError(e);ui?.clearStatus();return false}
  }
 
@@ -689,6 +768,7 @@ available: showcase, split, signal, minimal`);return false}
    }
    return await handleInput(value)
  }
+ await daemonOwner.update({state:'ready'})
  if(interactive){
    while(true){
      const result=await editor.read()
@@ -707,12 +787,14 @@ available: showcase, split, signal, minimal`);return false}
  }
  await Promise.all(mcp.clients.map(c=>c.close()))
  ui?.leave(session.id)
+ } finally {
+   await daemonOwner.release()
+ }
 }
 
-async function providerRun(provider:any,registry:any,store:any,session:any,messages:any[],cwd:string,instructions:string,repositoryContext:string,input:string,cfg:any,skillsContext='(none loaded)',autonomous=false,mode='build',customAgent?:any,ui?:TerminalUI|null,onQuestion?:(questions:any[],signal?:AbortSignal)=>Promise<string[][]|import('../tools/types.js').QuestionResponse>,explicitSkill?:{id:string;content:string;sha256:string},allowedTools?:string[],hookManager?:PluginHookManager){
- const skillDescriptors=await listSkillDescriptors(cwd); const agent=new Agent(provider,registry,store,cfg.maxToolRounds,cfg.maxContextTokens||12000,cfg.retryMax||4,(s:string)=>{if(ui){if(/^retry\b/i.test(s))ui.setActivity('retrying',s);else if(/^compacted context/i.test(s))ui.setActivity('compacting',s);else ui.setStatus(s)}else console.log(`\n[${s}]`)},skillDescriptors,{threshold:cfg.compactionThreshold,reserveTokens:cfg.contextReserveTokens,recentTokens:cfg.contextRecentTokens},hookManager,{maxLines:cfg.toolOutputMaxLines,maxBytes:cfg.toolOutputMaxBytes,retentionDays:cfg.toolOutputRetentionDays},cfg.postEditVerification);
- if(messages.length>cfg.maxContextMessages){messages.splice(1,messages.length-cfg.maxContextMessages);messages.unshift({role:'system',content:`Previous context was trimmed. Current working directory: ${cwd}. Preserve the active task and verify facts with tools.`})}
- if(autonomous) await store.checkpoint(session.id,messages,{label:'auto-start',agent:mode,provider:provider.id,model:provider.model})
+async function providerRun(provider:any,registry:any,store:any,session:any,messages:any[],cwd:string,instructions:string,repositoryContext:string,input:string,cfg:any,skillsContext='(none loaded)',autonomous=false,mode='build',customAgent?:any,ui?:TerminalUI|null,onQuestion?:(questions:any[],signal?:AbortSignal)=>Promise<string[][]|import('../tools/types.js').QuestionResponse>,explicitSkill?:{id:string;content:string;sha256:string},allowedTools?:string[],hookManager?:PluginHookManager,usageTelemetry?:{latest?:ProviderUsageReport}){
+ const skillDescriptors=await listSkillDescriptors(cwd); const agent=new Agent(provider,registry,store,cfg.maxToolRounds,cfg.maxContextTokens||0,cfg.retryMax||4,(s:string)=>{if(ui){if(/^retry\b/i.test(s))ui.setActivity('retrying',s);else if(/^compacted context/i.test(s))ui.setActivity('compacting',s);else ui.setStatus(s)}else console.log(`\n[${s}]`)},skillDescriptors,{threshold:cfg.compactionThreshold,reserveTokens:cfg.contextReserveTokens,recentTokens:cfg.contextRecentTokens},hookManager,{maxLines:cfg.toolOutputMaxLines,maxBytes:cfg.toolOutputMaxBytes,retentionDays:cfg.toolOutputRetentionDays},cfg.postEditVerification);
+  if(autonomous) await store.checkpoint(session.id,messages,{label:'auto-start',agent:mode,provider:provider.id,model:provider.model})
  ui?.startAssistant()
  ui?.setStatus('thinking…')
  const controller=new AbortController()
@@ -726,7 +808,7 @@ async function providerRun(provider:any,registry:any,store:any,session:any,messa
    let explorationSnapshot:any
    let explorationTelemetry:any
    const publishExploration=()=>ui?.setExploration(explorationSnapshot,explorationTelemetry)
-   await agent.run({sessionId:session.id,messages,cwd,instructions,repositoryContext,skillsContext,prompt:input,onReasoning:(s:string)=>{ui?.appendReasoning(s)},onText:(s:string)=>{ui?.appendAssistant(s);if(!ui)process.stdout.write(s)},onTool:(n:string,a:any)=>{ui?.startTool(n,a);if(!ui)toolStart(n,a)},onToolResult:(n:string,o:string,m:any)=>{ui?.endTool(n,o,m);if(!ui)toolEnd(n,o)},onQuestion,onTodo:(items:any[])=>ui?.setTodos(items),onUsage:(usage:any)=>{ui?.setContextUsage(usage.totalTokens,cfg.maxContextTokens||12000)},onExplorationState:(snapshot:any)=>{explorationSnapshot=snapshot;publishExploration()},onExplorationTelemetry:(snapshot:any)=>{explorationTelemetry=snapshot;publishExploration()},autonomous,mode,customAgent,signal:controller.signal,skillDiscoverySuppressed:Boolean(explicitSkill),explicitSkill}  as any)
+   await agent.run({sessionId:session.id,messages,cwd,instructions,repositoryContext,skillsContext,prompt:input,onReasoning:(s:string)=>{ui?.appendReasoning(s)},onText:(s:string)=>{ui?.appendAssistant(s);if(!ui)process.stdout.write(s)},onTool:(n:string,a:any)=>{ui?.startTool(n,a);if(!ui)toolStart(n,a)},onToolResult:(n:string,o:string,m:any)=>{ui?.endTool(n,o,m);if(!ui)toolEnd(n,o)},onQuestion,onTodo:(items:any[])=>ui?.setTodos(items),onUsage:(usage:ProviderUsageReport)=>{if(usageTelemetry)usageTelemetry.latest=usage;ui?.setContextUsage(usage.contextTokens??usage.inputTokens,usage.contextWindow||cfg.maxContextTokens||128000,false)},onContextEstimate:(tokens:number,limit:number)=>ui?.setContextUsage(tokens,limit,true),onExplorationState:(snapshot:any)=>{explorationSnapshot=snapshot;publishExploration()},onExplorationTelemetry:(snapshot:any)=>{explorationTelemetry=snapshot;publishExploration()},autonomous,mode,customAgent,signal:controller.signal,skillDiscoverySuppressed:Boolean(explicitSkill),explicitSkill}  as any)
    ui?.clearStatus()
  } catch(e){
    if(controller.signal.aborted){ ui?.system('interrupted','warn'); return }
@@ -741,3 +823,37 @@ async function providerRun(provider:any,registry:any,store:any,session:any,messa
 }
 
 function pathBasename(cwd:string){ return cwd.split(/[\\/]/).filter(Boolean).pop() || cwd }
+
+
+
+function formatProviderUsageAggregate(value:ReturnType<typeof aggregateProviderUsageEvents>):string{
+ const n=(count:number)=>count.toLocaleString()
+ const time=(stamp:number|undefined)=>stamp===undefined?'unknown':new Date(stamp).toLocaleString()
+ const lines=[
+  `provider usage history · ${n(value.requests)} requests (${n(value.providerReportedRequests)} provider-reported · ${n(value.estimatedRequests)} estimated)`,
+  `tokens · input ${n(value.inputTokens)} (${n(value.nonCachedInputTokens)} uncached) · output ${n(value.outputTokens)} · total ${n(value.totalTokens)}`,
+  `breakdowns · cache read ${n(value.cacheReadTokens)} · cache write ${n(value.cacheWriteTokens)} · reasoning ${n(value.reasoningTokens)} · tool-use input ${n(value.toolUsePromptTokens)}`,
+  `estimator · ${n(value.estimateInputTokens)} estimated input tokens across all requests${value.driftPercent===undefined?'':` · measured drift ${value.driftPercent>0?'+':''}${value.driftPercent}% across ${n(value.driftSamples)} measured requests`}`,
+ ]
+ if(value.contextSamples)lines.push(`final request context · average ${n(value.averageContextTokens||0)} · peak ${n(value.peakContextTokens||0)} across ${n(value.contextSamples)} measured requests`)
+ lines.push(`recorded · ${time(value.firstRecordedAt)} → ${time(value.lastRecordedAt)}`)
+ if(value.routes.length){
+  lines.push('by provider/model:')
+  for(const route of value.routes){
+   lines.push(`  ${route.provider}/${route.model} · ${n(route.requests)} requests (${n(route.estimatedRequests)} estimated) · input ${n(route.inputTokens)} · output ${n(route.outputTokens)} · total ${n(route.totalTokens)} · cache ${n(route.cacheReadTokens)} read / ${n(route.cacheWriteTokens)} write`)
+  }
+ }
+ lines.push('cache, reasoning and tool-use values are breakdowns; they are not added again to the inclusive total. No cost estimate is shown because TermAgent does not have verified pricing for every route.')
+ return lines.join('\n')
+}
+
+function formatUsageModalities(value:any):string{
+  if(!value||typeof value!=='object')return ''
+  const labels=[['prompt','prompt'],['cached','cached'],['candidates','output'],['toolUsePrompt','tool-use']] as const
+  const groups:string[]=[]
+  for(const [key,label] of labels){
+    const entries=Object.entries(value[key]||{}).filter((entry):entry is [string,number]=>typeof entry[1]==='number'&&Number.isFinite(entry[1]))
+    if(entries.length)groups.push(`${label} ${entries.map(([name,count])=>`${name}:${count.toLocaleString()}`).join(',')}`)
+  }
+  return groups.length?` · modalities ${groups.join('; ')}`:''
+}

@@ -25,7 +25,8 @@
     "CONTRIBUTING.md",
     "SECURITY.md",
     "CODE_OF_CONDUCT.md",
-    "scripts/device-smoke.mjs"
+    "scripts/device-smoke.mjs",
+    "web/app"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -34,7 +35,9 @@
     "clean": "rm -rf dist",
     "release:build": "node scripts/release.mjs",
     "device:smoke": "node scripts/device-smoke.mjs",
-    "prepublishOnly": "node scripts/verify-dist.mjs"
+    "prepublishOnly": "node scripts/verify-dist.mjs",
+    "phase14h:replay": "node tools/phase14h-controlled-replay.mjs",
+    "phase14h:provider-replay": "node tools/phase14h-provider-trace-replay.mjs"
   },
   "keywords": [
     "ai",

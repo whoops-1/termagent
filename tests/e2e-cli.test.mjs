@@ -105,12 +105,14 @@ test('CLI /auto enforces planning, edits, verification, and final completion', a
       const response = calls===1
         ? {delta:{tool_calls:[{index:0,id:'todo1',function:{name:'todo',arguments:JSON.stringify({action:'set',items:[{id:'1',task:'edit target',status:'pending'}]})}}]}}
         : calls===2
-        ? {delta:{tool_calls:[{index:0,id:'write1',function:{name:'write_file',arguments:JSON.stringify({path:'target.txt',content:'after\n'})}}]}}
+        ? {delta:{tool_calls:[{index:0,id:'read1',function:{name:'read_file',arguments:JSON.stringify({path:'target.txt'})}}]}}
         : calls===3
+        ? {delta:{tool_calls:[{index:0,id:'write1',function:{name:'write_file',arguments:JSON.stringify({path:'target.txt',content:'after\n'})}}]}}
+        : calls===4
         ? {delta:{tool_calls:[{index:0,id:'verify1',function:{name:'verify_project',arguments:'{}'}}]}}
         : {delta:{content:'Implemented, verified, and completed.'}}
       res.write('data: '+JSON.stringify({choices:[response]})+'\n\n')
-      res.write('data: '+JSON.stringify({choices:[{finish_reason:calls<4?'tool_calls':'stop',delta:{}}]})+'\n\n')
+      res.write('data: '+JSON.stringify({choices:[{finish_reason:calls<5?'tool_calls':'stop',delta:{}}]})+'\n\n')
       res.end()
     })
   })
@@ -121,7 +123,7 @@ test('CLI /auto enforces planning, edits, verification, and final completion', a
     assert.equal(result.code,0,result.err)
     assert.match(result.out,/Implemented, verified, and completed\./)
     assert.equal(await readFile(path.join(root,'target.txt'),'utf8'),'after\n')
-    assert.equal(calls,4)
+    assert.equal(calls,5)
     const firstSystem=String(requests[0].messages?.[0]?.content||'')
     assert.match(firstSystem,/AUTONOMOUS MODE/)
     assert.match(firstSystem,/planning/i)

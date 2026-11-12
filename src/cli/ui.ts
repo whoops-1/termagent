@@ -42,7 +42,7 @@ import { TranscriptRenderCache, type TranscriptRenderResult } from '../design-sy
 type Entry =
   | { kind: 'user'; text: string }
   | { kind: 'assistant'; text: string; reasoning?: string }
-  | { kind: 'tool'; name: string; args: string; output?: string; running?: boolean; waiting?: boolean; startedAt?: number; durationMs?: number; metadata?: unknown }
+  | { kind: 'tool'; name: string; args: string; callId?: string; output?: string; running?: boolean; waiting?: boolean; startedAt?: number; durationMs?: number; metadata?: unknown }
   | { kind: 'system'; text: string; tone?: 'dim' | 'warn' | 'error' }
 
 type InputState = { value: string; cursor: number }
@@ -76,7 +76,7 @@ type InspectorState =
   | { kind: 'diff'; title: string; files: InspectorFile[]; selected: number; view: 'list' | 'detail'; scroll: number }
 
 type PendingPermission = {
-  request: PermissionRequest
+  request: PermissionRequest & { toolCallId?: string }
   preview?: ToolDiff
   resolve: (choice: PermissionChoice) => void
   reject?: (error: unknown) => void
@@ -350,7 +350,8 @@ export class TerminalUI {
   private readonly entryRevisions = new WeakMap<Entry, number>()
   private queueItems: QueuedPrompt[] = []
   private contextTokens = 0
-  private contextLimit = 12000
+  private contextLimit = 128000
+  private contextEstimated = false
   private activeTools = 0
   private explorationTool = ''
   private explorationToolArgs: unknown
@@ -415,9 +416,49 @@ export class TerminalUI {
 
   hydrate(messages: any[]) {
     this.entries = []
+    this.activeTool = null
+    this.activeTools = 0
+    const tools = new Map<string, Entry & { kind: 'tool' }>()
     for (const message of messages || []) {
-      if (message?.role === 'user' && typeof message.content === 'string') this.entries.push({ kind: 'user', text: message.content })
-      else if (message?.role === 'assistant' && (typeof message.content === 'string' || typeof message.reasoning === 'string')) this.entries.push({ kind: 'assistant', text: typeof message.content === 'string' ? message.content : '', reasoning: typeof message.reasoning === 'string' ? message.reasoning : undefined })
+      if (message?.role === 'user' && typeof message.content === 'string') {
+        this.entries.push({ kind: 'user', text: message.content })
+      } else if (message?.role === 'assistant') {
+        if (typeof message.content === 'string' || typeof message.reasoning === 'string') {
+          this.entries.push({ kind: 'assistant', text: typeof message.content === 'string' ? message.content : '', reasoning: typeof message.reasoning === 'string' ? message.reasoning : undefined })
+        }
+        for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
+          const id = typeof call?.id === 'string' ? call.id : undefined
+          const name = typeof call?.function?.name === 'string' ? call.function.name : 'tool'
+          const raw = call?.function?.arguments
+          let args: unknown = raw ?? {}
+          if (typeof raw === 'string') {
+            try { args = JSON.parse(raw) } catch { args = raw }
+          }
+          const entry: Entry & { kind: 'tool' } = {
+            kind: 'tool', name, args: safeJson(args, 5000), ...(id ? { callId: id } : {}),
+            running: false, waiting: false, output: 'Awaiting tool result…',
+          }
+          this.entries.push(entry)
+          if (id) tools.set(id, entry)
+        }
+      } else if (message?.role === 'tool') {
+        const id = typeof message.tool_call_id === 'string' ? message.tool_call_id : undefined
+        let target = id ? tools.get(id) : undefined
+        if (!target && id) target = [...this.entries].reverse().find(entry => entry.kind === 'tool' && entry.callId === id) as Entry & { kind: 'tool' } | undefined
+        if (!target) {
+          target = [...this.entries].reverse().find(entry => entry.kind === 'tool' && entry.name === message.name && entry.output === 'Awaiting tool result…') as Entry & { kind: 'tool' } | undefined
+        }
+        const output = typeof message.content === 'string' ? message.content : ''
+        if (target) {
+          target.output = output
+          target.running = false
+          target.waiting = false
+          target.durationMs = target.startedAt ? Math.max(0, Date.now() - target.startedAt) : undefined
+          this.bumpEntry(target)
+        } else {
+          this.entries.push({ kind: 'tool', name: typeof message.name === 'string' ? message.name : 'tool', args: '{}', ...(id ? { callId: id } : {}), output, running: false })
+        }
+      }
     }
     this.trimEntries()
     this.scrollOffset = 0
@@ -458,9 +499,10 @@ export class TerminalUI {
 
   queuedCount() { return this.queueItems.length }
 
-  setContextUsage(inputTokens: number, limit = this.contextLimit) {
+  setContextUsage(inputTokens: number, limit = this.contextLimit, estimated = false) {
     this.contextTokens = Math.max(0, Math.round(inputTokens))
     this.contextLimit = Math.max(1, Math.round(limit))
+    this.contextEstimated = estimated
     this.scheduleRender()
   }
 
@@ -635,6 +677,7 @@ export class TerminalUI {
     this.explorationTool = ''
     this.explorationToolArgs = undefined
     this.activeTools = 0
+    this.activeTool = null
     this.completionLabel = this.entries.some(entry => entry.kind === 'tool') ? 'Turn complete · changes applied' : 'Turn complete'
     this.completionFlashUntil = Date.now() + 900
     this.scheduleRender()
@@ -667,11 +710,47 @@ export class TerminalUI {
     this.scheduleRender()
   }
 
-  startTool(name: string, args: unknown) {
-    const entry: Entry & { kind: 'tool' } = { kind: 'tool', name, args: safeJson(args, 5000), running: true, waiting: false, startedAt: Date.now() }
-    this.entries.push(entry)
+  reconcileAssistantMessage(text: string, reasoning?: string) {
+    let lastUser = -1
+    for (let index = 0; index < this.entries.length; index++) {
+      if (this.entries[index]?.kind === 'user') lastUser = index
+    }
+    let assistant: (Entry & { kind: 'assistant' }) | undefined
+    for (let index = lastUser + 1; index < this.entries.length; index++) {
+      const entry = this.entries[index]
+      if (entry?.kind === 'assistant') assistant = entry
+    }
+    if (!assistant) {
+      assistant = { kind: 'assistant', text: '', reasoning: '' }
+      this.entries.push(assistant)
+    }
+    assistant.text = text
+    if (typeof reasoning === 'string') assistant.reasoning = reasoning
+    this.bumpEntry(assistant)
+    this.trimEntries()
+    this.scheduleRender()
+  }
+
+  startTool(name: string, args: unknown, callId?: string) {
+    let entry = callId
+      ? this.entries.find(item => item.kind === 'tool' && item.callId === callId) as Entry & { kind: 'tool' } | undefined
+      : undefined
+    if (entry) {
+      const wasActive = Boolean(entry.running || entry.waiting)
+      entry.name = name
+      entry.args = safeJson(args, 5000)
+      entry.running = true
+      entry.waiting = false
+      entry.output = undefined
+      if (!entry.startedAt || !wasActive) entry.startedAt = Date.now()
+      this.bumpEntry(entry)
+      if (!wasActive) this.activeTools += 1
+    } else {
+      entry = { kind: 'tool', name, args: safeJson(args, 5000), ...(callId ? { callId } : {}), running: true, waiting: false, startedAt: Date.now() }
+      this.entries.push(entry)
+      this.activeTools += 1
+    }
     this.activeTool = entry
-    this.activeTools += 1
     if (['read_file','grep','glob','repo_map','verify_project'].includes(name)) {
       this.explorationTool = name
       this.explorationToolArgs = args
@@ -681,23 +760,67 @@ export class TerminalUI {
     this.scheduleRender()
   }
 
-  endTool(name: string, output: string, metadata?: any) {
-    const target = this.activeTool?.name === name
-      ? this.activeTool
-      : [...this.entries].reverse().find(x => x.kind === 'tool' && x.name === name) as Entry & { kind: 'tool' } | undefined
+  updateToolLifecycle(record: Record<string, any>) {
+    const callId = typeof record.callId === 'string' ? record.callId : undefined
+    const name = typeof record.name === 'string' ? record.name : typeof record.tool === 'string' ? record.tool : 'tool'
+    let args = record.parsedArguments ?? record.arguments
+    if (args === undefined && typeof record.argumentsRaw === 'string') {
+      try { args = JSON.parse(record.argumentsRaw) } catch { args = record.argumentsRaw }
+    }
+    const state = String(record.state || record.status || '')
+    if (state === 'pending') {
+      let entry = callId ? this.entries.find(item => item.kind === 'tool' && item.callId === callId) as Entry & { kind: 'tool' } | undefined : undefined
+      if (!entry) {
+        entry = { kind: 'tool', name, args: safeJson(args ?? {}, 5000), ...(callId ? { callId } : {}), running: false, waiting: true, startedAt: Date.now() }
+        this.entries.push(entry)
+        this.activeTools += 1
+      } else {
+        if (!entry.running && !entry.waiting) this.activeTools += 1
+        entry.name = name
+        entry.args = safeJson(args ?? {}, 5000)
+        entry.running = false
+        entry.waiting = true
+        this.bumpEntry(entry)
+      }
+      this.activeTool = entry
+      this.setActivity('permission', `waiting for ${name}`)
+      this.scheduleRender()
+      return
+    }
+    if (state === 'running') {
+      this.startTool(name, args ?? {}, callId)
+      return
+    }
+    if (['completed', 'error', 'interrupted'].includes(state)) {
+      const summary = typeof record.error === 'string' && record.error
+        ? record.error
+        : state === 'interrupted' ? 'Interrupted' : ''
+      this.endTool(name, summary, record.metadata, callId)
+    }
+  }
+
+  endTool(name: string, output: string, metadata?: any, callId?: string) {
+    const target = (callId
+      ? this.entries.find(x => x.kind === 'tool' && x.callId === callId)
+      : undefined) as Entry & { kind: 'tool' } | undefined
+      || (this.activeTool?.name === name
+        ? this.activeTool
+        : [...this.entries].reverse().find(x => x.kind === 'tool' && x.name === name && (x.running || x.waiting)) as Entry & { kind: 'tool' } | undefined)
     if (target) {
+      const wasActive = Boolean(target.running || target.waiting)
       target.running = false
       target.waiting = false
-      target.output = output || ''
+      if (output) target.output = output
       if (metadata !== undefined) target.metadata = metadata
       target.durationMs = target.startedAt ? Math.max(0, Date.now() - target.startedAt) : undefined
       this.bumpEntry(target)
+      if (wasActive) this.activeTools = Math.max(0, this.activeTools - 1)
     } else {
-      this.entries.push({ kind: 'tool', name, args: '{}', output: output || '', running: false, metadata })
+      this.entries.push({ kind: 'tool', name, args: '{}', ...(callId ? { callId } : {}), output: output || '', running: false, metadata })
     }
-    this.activeTool = null
-    this.activeTools = Math.max(0, this.activeTools - 1)
-    if (!this.permission) this.setActivity('thinking', 'thinking')
+    this.activeTool = [...this.entries].reverse().find(x => x.kind === 'tool' && (x.running || x.waiting)) as Entry & { kind: 'tool' } | undefined || null
+    this.activeTools = this.entries.filter(x => x.kind === 'tool' && (x.running || x.waiting)).length
+    if (!this.permission) this.setActivity(this.activeTool ? (this.activeTool.waiting ? 'permission' : 'tool') : 'thinking', this.activeTool ? (this.activeTool.waiting ? `waiting for ${this.activeTool.name}` : `running ${this.activeTool.name}`) : 'thinking')
     this.scheduleRender()
   }
 
@@ -714,7 +837,7 @@ export class TerminalUI {
   }
 
   clearStatus() { this.status = ''; this.scheduleRender() }
-  clearConversation() { this.entries = []; this.scrollOffset = 0; this.scheduleRender() }
+  clearConversation() { this.entries = []; this.activeTool = null; this.activeTools = 0; this.scrollOffset = 0; this.scheduleRender() }
   isPermissionActive() { return this.permission !== null }
   isQuestionActive() { return this.question !== null }
   isProviderManagerActive() { return this.providerManager !== null }
@@ -1318,11 +1441,46 @@ export class TerminalUI {
     pending.screen = 'menu'; pending.selected = 0; pending.error = undefined; this.scheduleRender()
   }
 
+  async requestRemotePermission(request: {
+    requestId: string
+    sessionId: string
+    tool: string
+    toolCallId?: string
+    action: string
+    resources: string[]
+    signal?: AbortSignal
+  }): Promise<PermissionChoice> {
+    const summary = [
+      `Action: ${request.action}`,
+      ...(request.resources.length ? request.resources.map(resource => `Resource: ${resource}`) : ['Resources: not specified']),
+      'Tool arguments are not included in the shared permission summary.',
+    ].join('\n')
+    const tool = {
+      name: request.tool,
+      description: 'Permission request received from the shared daemon runtime.',
+      schema: { type: 'object', properties: {} },
+      risk: request.action === 'shell' ? 'shell' : 'write',
+    } as PermissionRequest['tool']
+    return this.requestPermission({
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      tool,
+      args: {},
+      toolCallId: request.toolCallId,
+      action: request.action as PermissionRequest['action'],
+      resources: request.resources,
+      signal: request.signal,
+      remoteSummary: summary,
+      skipPreview: true,
+    } as PermissionRequest)
+  }
+
   async requestPermission(request: PermissionRequest): Promise<PermissionChoice> {
     if (!this.active || !this.inputStream.isTTY) return 'deny'
     this.closeInspector(false)
     if (this.permission) this.cancelPermission('deny')
-    const preview = await previewToolDiff(this.options.cwd, request.tool.name, request.args)
+    const extendedRequest = request as PermissionRequest & { skipPreview?: boolean }
+    const preview = extendedRequest.skipPreview ? undefined : await previewToolDiff(this.options.cwd, request.tool.name, request.args)
     return await new Promise<PermissionChoice>((resolve, reject) => {
       const pending: PendingPermission = {
         request,
@@ -1339,8 +1497,11 @@ export class TerminalUI {
       this.permission = pending
       this.promptFocused = false
       this.setActivity('permission', 'permission required')
-      const activeTool = this.activeTool
-      if (activeTool?.name === request.tool.name) {
+      const toolCallId = (request as PermissionRequest & { toolCallId?: string }).toolCallId
+      const activeTool = toolCallId
+        ? this.entries.find(entry => entry.kind === 'tool' && entry.callId === toolCallId) as Entry & { kind: 'tool' } | undefined
+        : this.activeTool
+      if (activeTool && activeTool.name === request.tool.name) {
         activeTool.waiting = true
         activeTool.running = false
         this.bumpEntry(activeTool)
@@ -1368,19 +1529,26 @@ export class TerminalUI {
     this.inputStream.off('data', this.onPermissionData)
     this.permission = null
     this.permissionEscape = ''
-    if (this.activeTool) {
+    const requestCallId = (pending.request as PermissionRequest & { toolCallId?: string }).toolCallId
+    const permissionTool = requestCallId
+      ? this.entries.find(entry => entry.kind === 'tool' && entry.callId === requestCallId) as Entry & { kind: 'tool' } | undefined
+      : this.activeTool
+    if (permissionTool) {
       if (choice === 'once' || choice === 'always') {
-        this.activeTool.waiting = false
-        this.activeTool.running = true
-        this.bumpEntry(this.activeTool)
-        this.status = `running ${this.activeTool.name}…`
-        this.setActivity('tool', `running ${this.activeTool.name}`)
+        permissionTool.waiting = false
+        permissionTool.running = true
+        this.bumpEntry(permissionTool)
+        this.activeTool = permissionTool
+        this.status = `running ${permissionTool.name}…`
+        this.setActivity('tool', `running ${permissionTool.name}`)
         this.statusTone = 'dim'
       } else {
-        this.activeTool.waiting = false
-        this.activeTool.running = false
-        this.bumpEntry(this.activeTool)
-        this.status = `permission denied for ${this.activeTool.name}`
+        permissionTool.waiting = false
+        permissionTool.running = false
+        this.bumpEntry(permissionTool)
+        this.activeTool = [...this.entries].reverse().find(entry => entry.kind === 'tool' && (entry.running || entry.waiting)) as Entry & { kind: 'tool' } | undefined || null
+        this.activeTools = this.entries.filter(entry => entry.kind === 'tool' && (entry.running || entry.waiting)).length
+        this.status = `permission denied for ${permissionTool.name}`
         this.statusTone = 'warn'
       }
     }
@@ -2495,6 +2663,7 @@ export class TerminalUI {
       mode: this.options.mode || 'build',
       contextTokens: this.contextTokens,
       contextLimit: this.contextLimit,
+      contextEstimated: this.contextEstimated,
       queuedCount: this.queueItems.length,
       activeTools: this.activeTools,
       connection: state === 'error' ? 'error' : 'connected',
@@ -2571,7 +2740,8 @@ export class TerminalUI {
     const preview = this.permission!.preview
     const content: string[] = []
     const title = tool === 'bash' ? 'Run shell command?' : `Allow ${tool}?`
-    const requestText = tool === 'bash' ? `$ ${String(request.args?.command ?? safeJson(request.args))}` : safeJson(request.args)
+    const remoteSummary = (request as PermissionRequest & { remoteSummary?: string }).remoteSummary
+    const requestText = remoteSummary || (tool === 'bash' ? `$ ${String(request.args?.command ?? safeJson(request.args))}` : safeJson(request.args))
     content.push(`${BOLD}${title}${RESET}`)
     for (const line of wrapText(requestText, inner).slice(0, compact ? 1 : 2)) content.push(`${DIM}${line}${RESET}`)
     if (preview) {

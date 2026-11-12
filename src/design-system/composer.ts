@@ -10,6 +10,7 @@ export type ComposerMeta = {
   mode?: string
   contextTokens?: number
   contextLimit?: number
+  contextEstimated?: boolean
   queuedCount?: number
   activeTools?: number
   workspace?: string
@@ -105,7 +106,7 @@ function topLine(width: number, meta: ComposerMeta, theme: Theme, capability: Co
   const queued = meta.queuedCount ?? 0
   const label = stateLabel(state, queued)
   const endpoint = meta.provider || meta.model ? `${meta.provider ? meta.provider : ''}${meta.model ? `/${meta.model}` : ''}` : 'provider/model'
-  const ctx = meta.contextLimit != null ? `ctx ${compactTokens(meta.contextTokens)}/${compactTokens(meta.contextLimit)}` : ''
+  const ctx = meta.contextLimit != null ? `ctx ${meta.contextEstimated ? '~' : ''}${compactTokens(meta.contextTokens)}/${compactTokens(meta.contextLimit)}` : ''
   const tool = (density === 'wide' && meta.activeTools) ? `${meta.activeTools} tool${meta.activeTools === 1 ? '' : 's'}` : ''
   const connection = meta.connection === 'error' ? 'offline' : ''
   const raw = density === 'small'

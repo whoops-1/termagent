@@ -12,9 +12,10 @@
 │   ↑ more  12-14 of 15  ↓ more    │    
 │ ↑↓ select · Enter run · Esc clo…      
 ╰──────────────────────────────────╯    
-╭─ ● Ready  ctx 0/12k──────────────────╮
+╭─ ● Ready  ctx 0/128k─────────────────╮
 │                                    │  
 │ Build · mock provider│                
 ╰──────────────────────────────────────╯
 esc ↑↓ select   Enter choose   Esc close
 /workspace/project                      
+ 

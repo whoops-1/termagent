@@ -1,6 +1,6 @@
 import type { ChatMessage, ToolCall } from '../session/store.js'
 import type { ToolRegistry } from '../tools/registry.js'
-import type { Provider, ProviderConfig, StreamEvent } from './types.js'
+import type { Provider, ProviderConfig, ProviderUsage, StreamEvent } from './types.js'
 import { sseLines } from './sse.js'
 import { ProviderHttpError, responseHeaders } from './errors.js'
 
@@ -13,15 +13,28 @@ export class OpenAICompatibleProvider implements Provider {
     if(!this.cfg.model) throw new Error('No model configured. Set TERMAGENT_MODEL.')
     const headers:any={'content-type':'application/json'}; if(this.cfg.apiKey) headers.authorization=`Bearer ${this.cfg.apiKey}`
     const url=this.cfg.baseUrl.replace(/\/$/,'')+'/chat/completions'
-    const body:any={model:this.cfg.model,messages,stream:true,temperature:this.cfg.temperature??0.2,tools}; if(this.cfg.reasoningEffort) body.reasoning_effort=this.cfg.reasoningEffort; if(this.cfg.extra&&typeof this.cfg.extra==='object') Object.assign(body,this.cfg.extra)
-    if(this.cfg.maxTokens) body.max_tokens=this.cfg.maxTokens
-    const res=await fetch(url,{method:'POST',headers,body:JSON.stringify(body),signal})
-    if(!res.ok){const body=await res.text();throw new ProviderHttpError(res.status,body,responseHeaders(res))}
+    const body:any={model:this.cfg.model,messages,stream:true,stream_options:{include_usage:true},temperature:this.cfg.temperature??0.2,tools}; if(this.cfg.reasoningEffort) body.reasoning_effort=this.cfg.reasoningEffort; if(this.cfg.extra&&typeof this.cfg.extra==='object') Object.assign(body,this.cfg.extra)
+    const maxOutputTokens=this.cfg.maxOutputTokens??this.cfg.maxTokens; if(maxOutputTokens) body.max_tokens=maxOutputTokens
+    let res=await fetch(url,{method:'POST',headers,body:JSON.stringify(body),signal})
+    // A few OpenAI-compatible gateways reject the optional usage extension.
+    // Retry once without it, but never hide any other authentication/request error.
+    if(!res.ok && res.status===400){
+      const errorBody=await res.clone().text()
+      if(/stream_options|include_usage|unknown parameter|unsupported parameter/i.test(errorBody)){
+        delete body.stream_options
+        res=await fetch(url,{method:'POST',headers,body:JSON.stringify(body),signal})
+      }
+    }
+    if(!res.ok){const errorBody=await res.text();throw new ProviderHttpError(res.status,errorBody,responseHeaders(res))}
     if(!res.body) throw new Error('Provider returned no stream')
     const calls=new Map<number,{id:string;name:string;args:string}>()
     for await(const payload of sseLines(res.body,signal,{idleTimeoutMs:this.cfg.streamIdleTimeoutMs??90000})){
       if(!payload)continue; if(payload==='[DONE]'){yield* flush(calls);yield {type:'done',finishReason:'stop'};return}
-      let json:any; try{json=JSON.parse(payload)}catch{continue}; const choice=json.choices?.[0]; const delta=choice?.delta
+      let json:any; try{json=JSON.parse(payload)}catch{continue};
+      const choice=json.choices?.[0]
+      const normalizedUsage=normalizeOpenAICompatibleUsage(json.usage) ?? normalizeOpenAICompatibleUsage(choice?.usage)
+      if(normalizedUsage) yield {type:'usage',usage:normalizedUsage}
+      const delta=choice?.delta
       const reasoning = extractReasoning(delta)
       if(reasoning)yield {type:'reasoning',delta:reasoning}
       const content = extractText(delta?.content)
@@ -48,4 +61,56 @@ function extractText(content:any): string {
   if(typeof content==='string') return content
   if(!Array.isArray(content)) return ''
   return content.filter((x:any)=>!x || x.type==='text' || x.type==='output_text').map((x:any)=>typeof x==='string'?x:(typeof x?.text==='string'?x.text:'' )).join('')
+}
+
+
+/**
+ * Normalize usage variants seen on OpenAI Chat-compatible routes. Input/output
+ * token totals are inclusive totals on these APIs; cache and reasoning values
+ * are detail subsets and must not be added a second time. This follows the
+ * field precedence used by established OpenAI Chat adapters while accepting
+ * Responses-style detail names some gateways surface on their compatibility
+ * endpoint.
+ */
+export function normalizeOpenAICompatibleUsage(value: unknown): ProviderUsage | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const usage = value as Record<string, any>
+  const number = (...values: unknown[]): number | undefined => {
+    for (const value of values) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) continue
+      return Math.floor(value)
+    }
+    return undefined
+  }
+
+  const inputTokens = number(usage.prompt_tokens, usage.input_tokens)
+  const outputTokens = number(usage.completion_tokens, usage.output_tokens)
+  if (inputTokens === undefined && outputTokens === undefined) return undefined
+
+  const cacheReadTokens = number(
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.input_tokens_details?.cached_tokens,
+    usage.prompt_cache_hit_tokens,
+    usage.cached_tokens,
+    usage.cache_read_input_tokens,
+  )
+  const cacheWriteTokens = number(
+    usage.prompt_tokens_details?.cache_write_tokens,
+    usage.input_tokens_details?.cache_write_tokens,
+    usage.cache_created_input_tokens,
+  )
+  const reasoningTokens = number(
+    usage.completion_tokens_details?.reasoning_tokens,
+    usage.output_tokens_details?.reasoning_tokens,
+  )
+  const totalTokens = number(usage.total_tokens)
+
+  return {
+    inputTokens: inputTokens ?? 0,
+    outputTokens: outputTokens ?? 0,
+    ...(totalTokens === undefined ? {} : { totalTokens }),
+    ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
+    ...(cacheWriteTokens === undefined ? {} : { cacheWriteTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+  }
 }

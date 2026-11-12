@@ -202,15 +202,61 @@ Run the local service with:
 termagent --serve
 ```
 
-Optional host, port, and token settings are available through the CLI and
-`TERMAGENT_SERVER_*` environment variables.
+The default listener is loopback-only (`127.0.0.1:4096`). Local use needs no
+pairing. A legacy `--token` is still supported for loopback-only integrations.
 
-Health check:
+For a remote browser, prefer a TLS-terminating reverse proxy and keep TermAgent
+bound to loopback:
+
+```sh
+termagent --serve \
+  --host 127.0.0.1 \
+  --port 4096 \
+  --require-pairing \
+  --public-origin https://agent.example.com
+```
+
+The proxy must terminate HTTPS, keep the upstream listener private, and preserve
+the public `Host` header. TermAgent validates the configured HTTPS origin and
+does not trust forwarded client-IP headers for authentication or rate limiting.
+
+TermAgent can also terminate TLS directly:
+
+```sh
+chmod 600 ./server.key
+termagent --serve \
+  --host 0.0.0.0 \
+  --port 4096 \
+  --allow-remote \
+  --tls-cert ./server.crt \
+  --tls-key ./server.key \
+  --public-origin https://agent.example.com
+```
+
+Remote binds require explicit `--allow-remote`, a certificate/key pair, and an
+HTTPS `--public-origin`. A one-time pairing code is printed to the server
+terminal. Enter it in the Web View to issue a 30-day device token. The code is
+single-use and expires after five minutes. Device tokens stay in browser memory;
+only token hashes are persisted in the owner-only auth store under
+`~/.termagent/server-auth/` by default. Use Runtime → Revoke this device to
+revoke the current browser. Revoking a different device currently requires
+stopping the server and removing that device's record from the auth-state file
+before restarting.
+
+`--auth-store <file>` overrides the auth-state path. The main server settings
+also support `TERMAGENT_SERVER_HOST`, `TERMAGENT_SERVER_PORT`,
+`TERMAGENT_SERVER_TOKEN`, `TERMAGENT_SERVER_ALLOW_REMOTE`,
+`TERMAGENT_SERVER_REQUIRE_PAIRING`, `TERMAGENT_SERVER_TLS_CERT`,
+`TERMAGENT_SERVER_TLS_KEY`, `TERMAGENT_SERVER_PUBLIC_ORIGIN`, and
+`TERMAGENT_SERVER_AUTH_STORE`.
+
+Local health check:
 
 ```sh
 curl http://127.0.0.1:4096/health
 ```
 
+In pairing mode, API/runtime data (including health) requires a bearer token.
 The service exposes sessions, prompts, messages, events, tasks, models, agents,
 skills, tools, diffs, checkpoints, and streaming events. The `termagent/client`
 export provides a typed JavaScript client for the API.

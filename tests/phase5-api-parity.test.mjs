@@ -75,7 +75,7 @@ test('phase 5: API exposes context, commands, abort alias, and interactive quest
     const headers = { authorization: 'Bearer secret' }
 
     let r = await req(base, 'GET', '/api/v1/commands', null, headers)
-    assert.equal(r.status, 200); assert.match(r.body, /"checkpoint"/); assert.match(r.body, /"resume"/)
+    assert.equal(r.status, 200); assert.match(r.body, /"session\.compact"/); assert.match(r.body, /"session\.undo"/)
     r = await req(base, 'GET', '/api/v1/info', null, headers)
     assert.equal(r.status, 200); assert.match(r.body, /"context"/); assert.match(r.body, /"questions"/)
     r = await req(base, 'POST', '/api/v1/sessions', {}, headers)
@@ -83,7 +83,7 @@ test('phase 5: API exposes context, commands, abort alias, and interactive quest
     r = await req(base, 'GET', `/api/v1/sessions/${session.id}/context`, null, headers)
     assert.equal(r.status, 200); const context = JSON.parse(r.body); assert.equal(context.sessionId, session.id); assert.ok('limit' in context)
     r = await req(base, 'POST', `/api/v1/sessions/${session.id}/abort`, {}, headers)
-    assert.equal(r.status, 409)
+    assert.equal(r.status, 200)
 
     const questionResponse = new Promise((resolve, reject) => {
       const payload = JSON.stringify({ prompt: 'ask me', stream: true })

@@ -36,6 +36,8 @@ export interface ContextMutationEvidence {
   deletions?: number
 }
 
+export interface ContextInstructionReference { path: string; sha256: string; scope: string }
+
 export interface ContextMachineState {
   version: number
   sessionId: string
@@ -53,7 +55,8 @@ export interface ContextMachineState {
   workflow?: unknown
   todo: Array<{ id: string; task: string; status: string; priority?: string }>
   mutations: ContextMutationEvidence[]
-  loadedSkills?: Array<{id:string;sha256?:string}>
+  loadedSkills?: Array<{id:string;sha256?:string;path?:string}>
+  instructions?: ContextInstructionReference[]
   answeredQuestions?: Array<{requestId:string;status:string;answers:string[][]}>
   continuation?: { lastUserPrompt?: string; nextAction?: string }
   createdAt: number
@@ -132,7 +135,8 @@ export function machineStateFromRuntime(input: {
   workflow?: unknown
   todo?: readonly { id: string; task: string; status: string; priority?: string }[]
   mutations?: readonly ContextMutationEvidence[]
-  loadedSkills?: readonly {id:string;sha256?:string}[]
+  loadedSkills?: readonly {id:string;sha256?:string;path?:string}[]
+  instructions?: readonly ContextInstructionReference[]
   answeredQuestions?: readonly {requestId:string;status:string;answers:string[][]}[]
   continuation?: ContextMachineState['continuation']
 }): ContextMachineState {
@@ -162,7 +166,7 @@ export function machineStateFromRuntime(input: {
   const mutations = [...(input.mutations ?? [])].slice(-24)
   const reads = [...(input.readStates ?? [])]
     .sort((a, b) => b.lastUse - a.lastUse)
-    .slice(0, 16)
+    .slice(0, 64)
     .map(state => ({
       canonicalPath: state.canonicalPath,
       mtimeMs: state.mtimeMs,
@@ -189,7 +193,8 @@ export function machineStateFromRuntime(input: {
     activeTaskIds,
     workflow: input.workflow,
     todo: [...(input.todo ?? [])].map(item => ({ id: item.id, task: item.task, status: item.status, ...(item.priority ? {priority:item.priority} : {}) })),
-    loadedSkills: [...(input.loadedSkills ?? [])].map(item => ({id:String(item.id), ...(item.sha256 ? {sha256:String(item.sha256)} : {})})).slice(-24),
+    loadedSkills: [...(input.loadedSkills ?? [])].map(item => ({id:String(item.id), ...(item.sha256 ? {sha256:String(item.sha256)} : {}), ...(item.path ? {path:String(item.path)} : {})})).slice(-32),
+    instructions: [...(input.instructions ?? [])].filter(item => item.path && item.sha256).slice(-48).map(item => ({path:String(item.path),sha256:String(item.sha256),scope:String(item.scope||'nested')})),
     answeredQuestions: [...(input.answeredQuestions ?? [])].map(item => ({requestId:String(item.requestId),status:String(item.status),answers:Array.isArray(item.answers)?item.answers.map(a=>Array.isArray(a)?a.map(String):[]):[]})).slice(-16),
     mutations,
     continuation: input.continuation,
@@ -210,7 +215,20 @@ export function renderMachineState(state: ContextMachineState, tokenBudget = 700
       lines.push(`- ${item.canonicalPath} [${ranges}]${item.contentHash ? ` sha256=${item.contentHash}` : ''}`)
     }
   } else lines.push('- none')
-  if (state.exploration) lines.push(`exploration=progress:${state.exploration.progressRevision} files:${state.exploration.discoveredFiles.length} reads:${state.exploration.reads.length} searches:${state.exploration.searches.length} symbols:${state.exploration.symbols.length}`)
+  if (state.exploration) {
+    lines.push(`exploration=progress:${state.exploration.progressRevision} files:${state.exploration.discoveredFiles.length} reads:${state.exploration.reads.length} searches:${state.exploration.searches.length} symbols:${state.exploration.symbols.length}`)
+    lines.push('discoveredFiles= (indexed/search candidates; not proof of full file inspection)')
+    for (const file of state.exploration.discoveredFiles.slice(-24)) lines.push(`- ${file}`)
+    lines.push('inspectionRule=only readCoverage ranges count as inspected; discovered/indexed files remain candidates until read')
+    lines.push('recentSearches=')
+    for (const search of state.exploration.searches.slice(-8)) lines.push(`- ${search.kind} ${search.query || search.path || search.include || search.signature} -> ${search.discoveredFiles.slice(0, 8).join(', ')}`)
+    lines.push('importantSymbols=')
+    for (const symbol of state.exploration.symbols.slice(-20)) lines.push(`- ${symbol.name}${symbol.path ? ` ${symbol.path}` : ''}${symbol.line ? `:${symbol.line}` : ''}${symbol.kind ? ` (${symbol.kind})` : ''}`)
+    if (state.exploration.settledVerificationFacts?.length) {
+      lines.push('verificationFacts=')
+      for (const fact of state.exploration.settledVerificationFacts.slice(-12)) lines.push(`- ${fact}`)
+    }
+  }
   if (state.evidenceLedger) {
     const lspCount = Array.isArray(state.evidenceLedger.lspDiagnostics) ? state.evidenceLedger.lspDiagnostics.length : 0
     const lsp = lspCount ? ` lsp:${lspCount}` : ''
@@ -220,7 +238,10 @@ export function renderMachineState(state: ContextMachineState, tokenBudget = 700
   if (state.toolOutputReferences.length) for (const item of state.toolOutputReferences.slice(-10)) lines.push(`- ${item.callId} ${item.reference}`)
   else lines.push('- none')
   lines.push(`activeTaskIds=${state.activeTaskIds.length ? state.activeTaskIds.join(', ') : 'none'}`)
-  lines.push(`loadedSkills=${state.loadedSkills?.length ? state.loadedSkills.map(x=>x.id).join(', ') : 'none'}`)
+  lines.push(`loadedSkills=${state.loadedSkills?.length ? state.loadedSkills.map(x=>`${x.id}${x.path ? `@${x.path}` : ''}`).join(', ') : 'none'}`)
+  lines.push('instructions=')
+  if (state.instructions?.length) for (const item of state.instructions.slice(-16)) lines.push(`- ${item.path} (${item.scope}; sha256=${item.sha256.slice(0, 16)})`)
+  else lines.push('- none')
   lines.push(`answeredQuestions=${state.answeredQuestions?.length ? state.answeredQuestions.map(x=>x.requestId+':'+x.status).join(', ') : 'none'}`)
   lines.push(`todo=${state.todo.length ? JSON.stringify(state.todo) : 'none'}`)
   lines.push(`workflow=${state.workflow ? JSON.stringify(state.workflow) : 'none'}`)

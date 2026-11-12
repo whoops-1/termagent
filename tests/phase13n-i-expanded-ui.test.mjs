@@ -104,6 +104,8 @@ test('13N-I responsive composer exposes state, context, model identity, and pres
     if (width >= 52) assert.match(plain, /Build · claude\/test/)
     if (width < 52) assert.equal(rows.length <= 5, true)
   }
+  const estimatedRows = renderComposer({ width: 80, inputLines: ['hello world'], inputCursor: { row: 0, column: 5 }, showCursor: true, meta: { ...meta, contextEstimated: true }, theme, capability: noColor })
+  assert.match(estimatedRows.map(stripAnsi).join('\n'), /ctx ~6k\/12k/, 'locally recomputed post-compaction usage must be visibly marked as estimated')
 })
 test('13N-I user transcript surface stays visually separate from the composer', async () => {
   const input = new (await import('node:events')).EventEmitter()

@@ -19,6 +19,7 @@ export interface ContextBudget {
   toolSchemaTokens: number
   skillDescriptorTokens: number
   explicitSkillTokens: number
+  safetyReserveTokens: number
 }
 
 export interface ContextSectionBudget {
@@ -156,6 +157,11 @@ export interface ContextAccounting {
   summaries: number
   skills: number
   systemNotices: number
+  instructions: number
+  repository: number
+  skillDescriptors: number
+  loadedSkills: number
+  multimodal: number
   other: number
   total: number
 }
@@ -177,18 +183,31 @@ export function accountContext(
   const systemMessages = messages.filter(message => message.role === 'system')
   const toolResults = messageCategoryTokens(messages, message => message.role === 'tool')
   const toolCalls = messageCategoryTokens(messages, message => message.role === 'assistant' && Boolean(message.tool_calls?.length))
+  // These are mutually exclusive accounting buckets. A single system prompt
+  // can contain both a skill section and a summary heading (for example, the
+  // compacted prompt's `## Next Move` after `## Skills`). Counting the full
+  // message in both buckets made the breakdown exceed the request total.
+  const isSkillMessage = (message: ChatMessage) =>
+    typeof message.content === 'string' && /## Skills|skill discovery|explicit skill/i.test(message.content || '')
+  const isSummaryMessage = (message: ChatMessage) =>
+    typeof message.content === 'string' && /Earlier conversation summary|## (?:Objective|Important Details|Work State|Todo|Next Move|Relevant Files)/i.test(message.content || '')
   const summaries = systemMessages
-    .filter(message => typeof message.content === 'string' && /Earlier conversation summary|## (?:Objective|Important Details|Work State|Todo|Next Move|Relevant Files)/i.test(message.content || ''))
+    .filter(message => isSummaryMessage(message) && !isSkillMessage(message))
     .reduce((sum, message) => sum + estimateMessageTokens(message), 0)
   const skills = systemMessages
-    .filter(message => summaries === 0 && typeof message.content === 'string' && /## Skills|skill discovery|explicit skill/i.test(message.content || ''))
+    .filter(isSkillMessage)
     .reduce((sum, message) => sum + estimateMessageTokens(message), 0)
+  const instructionTokens = systemMessages.filter(message => /Project instructions:/i.test(message.content || '')).reduce((sum, message) => sum + estimateTokens((message.content || '').split('Repository context:')[0]), 0)
+  const repositoryTokens = systemMessages.filter(message => /Repository context:/i.test(message.content || '')).reduce((sum, message) => sum + estimateTokens((message.content || '').split('Repository context:')[1] || ''), 0)
+  const skillDescriptorTokens = systemMessages.filter(message => /Relevant skills \(descriptors only\):/i.test(message.content || '')).reduce((sum, message) => sum + estimateTokens((message.content || '').split('Relevant skills (descriptors only):')[1] || ''), 0)
+  const loadedSkillTokens = systemMessages.filter(message => /<restored_skill|<skill>/i.test(message.content || '')).reduce((sum, message) => sum + estimateMessageTokens(message), 0)
+  const multimodal = messages.reduce((sum, message) => sum + (Array.isArray((message as any).images) ? estimateTokens((message as any).images) : 0), 0)
   const systemTotal = messageCategoryTokens(systemMessages, () => true)
   const systemNotices = Math.max(0, systemTotal - summaries - skills)
   const toolDefinitions = estimateToolSchemasTokens(tools)
   const other = Math.max(0, estimateMessagesTokens(messages) - toolResults - toolCalls - messageCategoryTokens(systemMessages, () => true))
-  const total = estimateMessagesTokens(messages) + toolDefinitions
-  return { toolDefinitions, toolCalls, toolResults, summaries, skills, systemNotices, other, total }
+  const total = estimateMessagesTokens(messages) + toolDefinitions + multimodal
+  return { toolDefinitions, toolCalls, toolResults, summaries, skills, systemNotices, instructions:instructionTokens, repository:repositoryTokens, skillDescriptors:skillDescriptorTokens, loadedSkills:loadedSkillTokens, multimodal, other, total }
 }
 export function estimateToolSchemasTokens(
   tools: readonly Record<string, unknown>[],
@@ -197,29 +216,57 @@ export function estimateToolSchemasTokens(
 }
 
 export function createContextBudget(options: ContextBudgetOptions): ContextBudget {
-  const maxContextTokens = Math.max(256, Math.floor(options.maxContextTokens || 12000))
-  const maxOutputTokens = options.maxOutputTokens === undefined ? 2048 : Math.max(0, Math.floor(options.maxOutputTokens))
+  const maxContextTokens = Math.max(256, Math.floor(options.maxContextTokens || 128_000))
+  const outputHardLimit = Math.max(128, Math.floor(maxContextTokens * 0.40))
+  const maxOutputTokens = options.maxOutputTokens === undefined
+    ? Math.min(outputHardLimit, 32_768, Math.max(512, Math.floor(maxContextTokens * 0.08)))
+    : Math.min(outputHardLimit, Math.max(0, Math.floor(options.maxOutputTokens)))
   const threshold = normalizeThreshold(options.threshold)
-  const reserveTokens = options.reserveTokens === undefined ? Math.max(512, Math.ceil(maxContextTokens * 0.08)) : Math.max(0, Math.floor(options.reserveTokens))
-  const recentTokens = options.recentTokens === undefined ? Math.min(8000, Math.max(2000, Math.floor(maxContextTokens * 0.28))) : Math.max(0, Math.floor(options.recentTokens))
+  const safetyReserveTokens = options.reserveTokens === undefined || options.reserveTokens <= 0
+    ? Math.min(Math.floor(maxContextTokens * 0.20), Math.max(512, Math.min(65_536, Math.ceil(maxContextTokens * 0.05))))
+    : Math.min(Math.floor(maxContextTokens * 0.35), Math.max(0, Math.floor(options.reserveTokens)))
+  const reserveTokens = Math.max(maxOutputTokens, safetyReserveTokens)
   const thresholdLimit = Math.floor(maxContextTokens * threshold)
-  const usableTokens = Math.max(1, thresholdLimit - Math.max(maxOutputTokens, reserveTokens))
-  const compactTargetTokens = Math.max(1, Math.floor(Math.min(usableTokens * 0.68, maxContextTokens * 0.55)))
-  const toolSchemaTokens = Math.max(256, Math.floor(usableTokens * 0.32))
-  const skillDescriptorTokens = Math.max(96, Math.floor(usableTokens * 0.08))
-  const explicitSkillTokens = Math.max(256, Math.floor(usableTokens * 0.18))
-  return {
-    maxContextTokens,
-    maxOutputTokens,
-    threshold,
-    reserveTokens,
-    recentTokens,
-    usableTokens,
-    compactTargetTokens,
-    toolSchemaTokens,
-    skillDescriptorTokens,
-    explicitSkillTokens,
-  }
+  const usableTokens = Math.max(1, thresholdLimit - reserveTokens)
+  // Keep a meaningful recent tail on large models. The 128k hard ceiling is a
+  // memory-safety limit for retained transcript data, not a model context cap.
+  const recentTokens = options.recentTokens === undefined || options.recentTokens <= 0
+    ? Math.min(usableTokens, 128_000, Math.max(256, Math.floor(maxContextTokens * 0.24)))
+    : Math.min(Math.floor(maxContextTokens * 0.55), usableTokens, Math.max(0, Math.floor(options.recentTokens)))
+  const compactTargetTokens = Math.max(1, Math.floor(Math.min(usableTokens * 0.72, maxContextTokens * 0.62)))
+  const toolSchemaTokens = Math.min(32_000, Math.max(256, Math.floor(usableTokens * 0.12)))
+  const skillDescriptorTokens = Math.min(8_000, Math.max(128, Math.floor(usableTokens * 0.025)))
+  const explicitSkillTokens = Math.min(48_000, Math.max(256, Math.floor(usableTokens * 0.14)))
+  return { maxContextTokens, maxOutputTokens, threshold, reserveTokens, recentTokens, usableTokens, compactTargetTokens, toolSchemaTokens, skillDescriptorTokens, explicitSkillTokens, safetyReserveTokens }
+}
+
+export interface RepositoryContextBudget {
+  mapTokens: number
+  mapPaths: number
+  retrievalTokens: number
+  retrievalBytes: number
+  retrievalFiles: number
+  retrievalFileBytes: number
+}
+
+/** Scale repository context with the actual model window while retaining hard
+ * output bounds that keep indexing/retrieval safe on low-memory devices. */
+export function deriveRepositoryContextBudget(maxContextTokens: number, options: { mapTokens?: number; maxBytes?: number; repositoryFiles?: number } = {}): RepositoryContextBudget {
+  const window = Math.max(256, Math.floor(maxContextTokens || 128_000))
+  const mapCeiling = Math.min(64_000, Math.max(256, Math.floor(window * 0.40)))
+  const autoMap = Math.min(32_000, mapCeiling, Math.max(Math.min(2_600, Math.floor(window * 0.12)), Math.floor(window * 0.055)))
+  const mapTokens = options.mapTokens && options.mapTokens > 0 ? Math.min(mapCeiling, Math.floor(options.mapTokens)) : autoMap
+  const retrievalCeiling = Math.min(48_000, Math.max(256, Math.floor(window * 0.25)))
+  const autoRetrieval = Math.min(retrievalCeiling, Math.max(Math.min(7_000, retrievalCeiling), Math.floor(window * 0.075)))
+  const retrievalTokens = options.maxBytes && options.maxBytes > 0
+    ? Math.min(retrievalCeiling, Math.max(256, Math.floor(options.maxBytes / 4)))
+    : autoRetrieval
+  const retrievalBytes = Math.min(192 * 1024, retrievalCeiling * 4, options.maxBytes && options.maxBytes > 0 ? Math.max(1_024, Math.floor(options.maxBytes)) : retrievalTokens * 4)
+  const repositoryFiles = Math.max(0, Math.floor(options.repositoryFiles || 0))
+  const retrievalFiles = Math.min(24, Math.max(2, Math.ceil(window / 48_000)), repositoryFiles || 24)
+  const retrievalFileBytes = Math.min(64 * 1024, Math.max(8 * 1024, Math.floor(retrievalBytes / Math.max(1, retrievalFiles))))
+  const mapPaths = Math.min(800, Math.max(32, Math.ceil(mapTokens / 24)), repositoryFiles || 800)
+  return { mapTokens, mapPaths, retrievalTokens, retrievalBytes, retrievalFiles, retrievalFileBytes }
 }
 
 export function allocateContextSections(

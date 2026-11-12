@@ -12,6 +12,7 @@ import { createContextBudget, estimateMessagesTokens, estimateTokens as estimate
 import { Agent } from '../dist/agent/agent.js'
 import { SessionStore } from '../dist/session/store.js'
 import { ToolRegistry } from '../dist/tools/registry.js'
+import { PermissionGate } from '../dist/tools/permissions.js'
 
 async function temp(prefix){return await mkdtemp(path.join(tmpdir(),prefix))}
 async function cleanup(root){await rm(root,{recursive:true,force:true})}
@@ -169,7 +170,7 @@ test('phase 2: compaction remains bounded with huge tool output and preserves a 
 
 test('phase 2: agent compacts against request budget including tool schemas', async()=>{
   const root=await temp('termagent-p2-agent-budget-');const store=new SessionStore(path.join(root,'sessions'));const session=await store.create(root,'mock')
-  const registry=new ToolRegistry();registry.add({name:'giant_tool',description:'x'.repeat(2400),risk:'read',schema:{type:'object',properties:{q:{type:'string',description:'x'.repeat(1200)}}},execute:async()=>({output:'ok'})})
+  const registry=new ToolRegistry(new PermissionGate('auto'));registry.add({name:'giant_tool',description:'x'.repeat(2400),risk:'read',schema:{type:'object',properties:{q:{type:'string',description:'x'.repeat(1200)}}},execute:async()=>({output:'ok'})})
   const provider={id:'mock',model:'mock',config:{maxTokens:1000},calls:0,seen:[],async *stream(messages,tools){this.calls++;this.seen.push({messages,tools});yield {type:'text',delta:'ok'};yield {type:'done',finishReason:'stop'}}}
   const agent=new Agent(provider,registry,store,0,5000,1,undefined,[],{threshold:0.9,reserveTokens:200,recentTokens:500})
   await agent.run({sessionId:session.id,messages:[{role:'user',content:'x'.repeat(12_000)}],cwd:root,instructions:'test',prompt:'hello'})
@@ -256,7 +257,7 @@ test('phase 2 hardening: token estimator is conservative for dense Unicode text'
 
 test('phase 2 hardening: tool schema bytes are part of the hard request budget', async()=>{
   const root=await temp('termagent-p2-schema-hard-');const store=new SessionStore(path.join(root,'sessions'));const session=await store.create(root,'mock')
-  const registry=new ToolRegistry();registry.add({name:'huge_tool',description:'d'.repeat(7000),risk:'read',schema:{type:'object',properties:{q:{type:'string',description:'q'.repeat(5000)}}},execute:async()=>({output:'ok'})})
+  const registry=new ToolRegistry(new PermissionGate('auto'));registry.add({name:'huge_tool',description:'d'.repeat(7000),risk:'read',schema:{type:'object',properties:{q:{type:'string',description:'q'.repeat(5000)}}},execute:async()=>({output:'ok'})})
   const provider={id:'mock',model:'mock',config:{maxTokens:200},calls:0,seen:[],async *stream(messages,tools){this.calls++;this.seen.push({messages,tools});yield {type:'text',delta:'ok'};yield {type:'done',finishReason:'stop'}}}
   const agent=new Agent(provider,registry,store,0,6000,1,undefined,[],{threshold:0.9,reserveTokens:200,recentTokens:600})
   await agent.run({sessionId:session.id,messages:[{role:'user',content:'x'.repeat(18000)}],cwd:root,instructions:'test',prompt:'hello'})
@@ -355,21 +356,21 @@ test('phase 2 hardening: compaction preserves the exact system prompt when the b
 test('phase 2 hardening: a new oversized user prompt is compacted before the provider request', async()=>{
   const root=await temp('termagent-p2-prompt-overflow-');const store=new SessionStore(path.join(root,'sessions'));const session=await store.create(root,'mock')
   const provider={id:'mock',model:'mock',config:{maxTokens:100},calls:0,seen:[],async *stream(messages,tools){this.calls++;this.seen.push({messages,tools});yield {type:'text',delta:'ok'};yield {type:'done',finishReason:'stop'}}}
-  const registry=new ToolRegistry()
+  const registry=new ToolRegistry(new PermissionGate('auto'))
   const existing=[{role:'user',content:'old context '+('x'.repeat(1800))}]
-  const agent=new Agent(provider,registry,store,0,1800,1,undefined,[],{threshold:1,reserveTokens:0,recentTokens:260})
+  const agent=new Agent(provider,registry,store,0,3000,1,undefined,[],{threshold:1,reserveTokens:0,recentTokens:260})
   const prompt='new task '+('y'.repeat(2600))
   await agent.run({sessionId:session.id,messages:existing,cwd:root,instructions:'test',prompt})
   assert.equal(provider.calls,1)
   const seen=provider.seen[0]
-  assert.ok(estimateMessagesTokens(seen.messages)+estimateTokens(seen.tools)<=1800-100)
+  assert.ok(estimateMessagesTokens(seen.messages)+estimateTokens(seen.tools)<=3000-100)
   assert.equal([...seen.messages].reverse().find(m=>m.role==='user')?.content,prompt)
   await cleanup(root)
 })
 
 test('phase 2 hardening: oversized tool schemas fail before provider execution instead of overflowing the request', async()=>{
   const root=await temp('termagent-p2-schema-fail-');const store=new SessionStore(path.join(root,'sessions'));const session=await store.create(root,'mock')
-  const registry=new ToolRegistry();registry.add({name:'huge',description:'x'.repeat(30000),risk:'read',schema:{type:'object'},execute:async()=>({output:'ok'})})
+  const registry=new ToolRegistry(new PermissionGate('auto'));registry.add({name:'huge',description:'x'.repeat(30000),risk:'read',schema:{type:'object'},execute:async()=>({output:'ok'})})
   const provider={id:'mock',model:'mock',config:{maxTokens:50},calls:0,async *stream(){this.calls++;yield {type:'text',delta:'should-not-run'};yield {type:'done',finishReason:'stop'}}}
   const agent=new Agent(provider,registry,store,0,2000,1)
   await assert.rejects(()=>agent.run({sessionId:session.id,messages:[],cwd:root,instructions:'test',prompt:'hello'}),/Tool definitions exceed the configured context budget/)

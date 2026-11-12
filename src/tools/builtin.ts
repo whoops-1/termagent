@@ -433,7 +433,22 @@ export function builtinTools(opts: { timeout: number; maxOutput: number; toolOut
       return {title:`git ${analysis.operation}`,output:`${result.backgrounded?`Git command moved to background as task ${handle.task.id}.`:`git ${analysis.operation} ${result.termination}.`}${result.outputPreview?`\n${shellPreview(result.outputPreview)}`:''}`,metadata:{git:{...analysis,taskId:handle.task.id,status:result.termination,exitCode:result.code,signal:result.signal,outputPath:result.outputPath,outputBytes:result.outputBytes,outputTruncated:result.outputTruncated,background:result.backgrounded}}}
     }
   }
-  const repoMap: ToolDefinition = { name:'repo_map', risk:'read', parallelSafe:true, description:'Show a token-bounded structural map of the repository. Use focusFiles or focusSymbols for a specific area.', schema:{type:'object',properties:{tokens:{type:'integer',minimum:256},focusFiles:{type:'array',items:{type:'string'}},focusSymbols:{type:'array',items:{type:'string'}}}}, async execute(a,c){ const map=await buildRepositoryMap(c.cwd); const tokens=Math.max(256,Math.min(Number(a.tokens)||2048,8192)); const output= formatRepositoryMap(map,180,tokens,{focusFiles:Array.isArray(a.focusFiles)?a.focusFiles.map(String):[],focusSymbols:Array.isArray(a.focusSymbols)?a.focusSymbols.map(String):[]}); return {title:'Repository map',output:output.slice(0,opts.maxOutput),metadata:{repositoryMap:{files:map.files.map(file=>path.resolve(c.cwd,file.path)),symbols:map.files.flatMap(file=>file.symbols.map(symbol=>symbol.name)).slice(0,512)}}} } }
+  const repoMap: ToolDefinition = {
+    name:'repo_map',risk:'read',parallelSafe:true,
+    description:'Show a token-bounded structural map of the repository. The default and maximum scale with the active model context. Use focusFiles or focusSymbols for a specific area.',
+    schema:{type:'object',properties:{tokens:{type:'integer',minimum:256,maximum:64000},focusFiles:{type:'array',items:{type:'string'}},focusSymbols:{type:'array',items:{type:'string'}}}},
+    async execute(a,c){
+      const map=await buildRepositoryMap(c.cwd)
+      const contextWindow=Math.max(256,Number(c.contextWindow)||128_000)
+      const defaultTokens=Math.min(32_000,Math.max(1_024,Math.floor(contextWindow*0.055)))
+      const maxTokens=Math.min(64_000,Math.max(256,Math.floor(contextWindow*0.40)))
+      const tokens=Math.max(256,Math.min(Number(a.tokens)||defaultTokens,maxTokens))
+      const maxPaths=Math.min(800,Math.max(32,Math.ceil(tokens/24)))
+      const output= formatRepositoryMap(map,maxPaths,tokens,{focusFiles:Array.isArray(a.focusFiles)?a.focusFiles.map(String):[],focusSymbols:Array.isArray(a.focusSymbols)?a.focusSymbols.map(String):[]})
+      const maxOutputBytes=Math.min(256*1024,Math.max(opts.maxOutput,tokens*5))
+      return {title:'Repository map',output:output.slice(0,maxOutputBytes),metadata:{repositoryMap:{files:map.files.map(file=>path.resolve(c.cwd,file.path)),symbols:map.files.flatMap(file=>file.symbols.map(symbol=>symbol.name)).slice(0,512),contextWindow,mapTokens:tokens,truncated:Buffer.byteLength(output,'utf8')>maxOutputBytes}}}
+    }
+  }
   const applyPatch = applyPatchTool()
   return [read,write,edit,applyPatch,grep,glob,bash,git,repoMap]
 }

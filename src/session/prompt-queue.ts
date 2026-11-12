@@ -199,6 +199,16 @@ export class SessionPromptQueue {
     })
   }
 
+  async requeue(sessionId: string, id: string) {
+    return await this.store.withSessionMutation(sessionId, async () => {
+      const item = (await this.current(sessionId, false)).find(value => value.id === id)
+      if (!item || item.status !== 'executing') return item
+      const next = { ...item, status: 'queued' as const, error: undefined, completedAt: undefined }
+      await this.append(sessionId, 'queued', next)
+      return next
+    })
+  }
+
   async complete(sessionId: string, id: string) {
     return await this.store.withSessionMutation(sessionId, async () => {
       const item = (await this.current(sessionId, false)).find(value => value.id === id)

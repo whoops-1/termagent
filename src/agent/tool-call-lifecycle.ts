@@ -3,7 +3,7 @@ import type { SessionStore } from '../session/store.js'
 import type { ToolKind, ToolProvenance } from '../tools/types.js'
 
 export type ToolCallLifecycleState = 'pending' | 'running' | 'completed' | 'error' | 'interrupted'
-export type ToolCallLifecycleOutcome = 'success' | 'error' | 'permission_denied' | 'question_rejected' | 'interrupted' | 'provider_hosted'
+export type ToolCallLifecycleOutcome = 'success' | 'error' | 'permission_denied' | 'question_rejected' | 'interrupted' | 'provider_hosted' | 'deferred'
 
 export interface ToolCallLifecycleRecord {
   sessionId: string

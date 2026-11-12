@@ -22,6 +22,152 @@ function streamResponse(lines) {
   return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
 }
 
+
+test('14H OpenAI-compatible usage normalizes Chat cache/reasoning details and Responses-style aliases', async () => {
+  const oldFetch = global.fetch
+  const fixtures = [
+    {
+      usage: {
+        prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200,
+        prompt_tokens_details: { cached_tokens: 500, cache_write_tokens: 25 },
+        completion_tokens_details: { reasoning_tokens: 40 },
+      },
+      choices: [],
+    },
+    {
+      choices: [{ usage: {
+        input_tokens: 300, output_tokens: 50, total_tokens: 350,
+        input_tokens_details: { cached_tokens: 100, cache_write_tokens: 20 },
+        output_tokens_details: { reasoning_tokens: 15 },
+      } }],
+    },
+    {
+      usage: {
+        prompt_tokens: 80, completion_tokens: 12, total_tokens: 92,
+        prompt_cache_hit_tokens: 60, cache_created_input_tokens: 4,
+      },
+      choices: [],
+    },
+  ]
+  global.fetch = async () => streamResponse([...fixtures, '[DONE]'])
+  try {
+    const provider = new OpenAICompatibleProvider({ model: 'usage-model', baseUrl: 'https://gateway.test/v1' })
+    const events = []
+    for await (const event of provider.stream([], [], abortSignal)) if (event.type === 'usage') events.push(event.usage)
+    assert.deepEqual(events, [
+      { inputTokens: 1000, outputTokens: 200, totalTokens: 1200, cacheReadTokens: 500, cacheWriteTokens: 25, reasoningTokens: 40 },
+      { inputTokens: 300, outputTokens: 50, totalTokens: 350, cacheReadTokens: 100, cacheWriteTokens: 20, reasoningTokens: 15 },
+      { inputTokens: 80, outputTokens: 12, totalTokens: 92, cacheReadTokens: 60, cacheWriteTokens: 4 },
+    ])
+  } finally {
+    global.fetch = oldFetch
+  }
+})
+
+test('14H Gemini usage includes thinking tokens in output totals without double-counting cached prompt tokens', async () => {
+  const oldFetch = global.fetch
+  global.fetch = async () => streamResponse([{
+    usageMetadata: {
+      promptTokenCount: 100, cachedContentTokenCount: 40,
+      candidatesTokenCount: 10, thoughtsTokenCount: 6, totalTokenCount: 116,
+    },
+    candidates: [{ content: { parts: [] }, finishReason: 'STOP' }],
+  }])
+  try {
+    const provider = new GeminiProvider({ model: 'gemini-usage', baseUrl: 'https://gemini.test', apiKey: 'key' })
+    const events = []
+    for await (const event of provider.stream([], [], abortSignal)) if (event.type === 'usage') events.push(event.usage)
+    assert.deepEqual(events, [{ inputTokens: 100, contextTokens: 100, outputTokens: 16, totalTokens: 116, cacheReadTokens: 40, reasoningTokens: 6 }])
+  } finally {
+    global.fetch = oldFetch
+  }
+})
+
+test('14H Anthropic final usage delta updates cumulative cache and reasoning fields', async () => {
+  const oldFetch = global.fetch
+  global.fetch = async () => streamResponse([
+    { type: 'message_start', message: { usage: { input_tokens: 50, cache_read_input_tokens: 10, cache_creation_input_tokens: 5, output_tokens: 0, output_tokens_details: { thinking_tokens: 0 } } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'complete' } },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { input_tokens: 60, cache_read_input_tokens: 20, cache_creation_input_tokens: 7, output_tokens: 18, output_tokens_details: { thinking_tokens: 6 } } },
+    { type: 'message_stop' },
+  ])
+  try {
+    const provider = new AnthropicProvider({ model: 'claude-usage', baseUrl: 'https://anthropic.test/v1', apiKey: 'key' })
+    const events = []
+    for await (const event of provider.stream([], [], abortSignal)) if (event.type === 'usage') events.push(event.usage)
+    assert.deepEqual(events, [{ inputTokens: 60, outputTokens: 18, totalTokens: 105, contextTokens: 87, cacheReadTokens: 20, cacheWriteTokens: 7, reasoningTokens: 6, cacheTokensExcludedFromInput: true }])
+  } finally {
+    global.fetch = oldFetch
+  }
+})
+
+test('14H Anthropic empty usage snapshots do not masquerade as a zero-token provider report', async () => {
+  const oldFetch = global.fetch
+  global.fetch = async () => streamResponse([
+    { type: 'message_start', message: { usage: {} } },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: {} },
+  ])
+  try {
+    const provider = new AnthropicProvider({ model: 'claude-empty-usage', baseUrl: 'https://anthropic.test/v1', apiKey: 'key' })
+    const events = []
+    for await (const event of provider.stream([], [], abortSignal)) if (event.type === 'usage') events.push(event.usage)
+    assert.deepEqual(events, [])
+  } finally {
+    global.fetch = oldFetch
+  }
+})
+
+test('14H Anthropic iteration usage sums billed work but keeps final request context separate', async () => {
+  const oldFetch = global.fetch
+  global.fetch = async () => streamResponse([{
+    type: 'message_delta',
+    delta: { stop_reason: 'end_turn' },
+    usage: { iterations: [
+      { type: 'message', input_tokens: 80, cache_read_input_tokens: 10, cache_creation_input_tokens: 5, output_tokens: 20, output_tokens_details: { thinking_tokens: 3 } },
+      { type: 'compaction', input_tokens: 40, cache_read_input_tokens: 4, cache_creation_input_tokens: 1, output_tokens: 8, output_tokens_details: { thinking_tokens: 2 } },
+    ] },
+  }])
+  try {
+    const provider = new AnthropicProvider({ model: 'claude-iterations', baseUrl: 'https://anthropic.test/v1', apiKey: 'key' })
+    const events = []
+    for await (const event of provider.stream([], [], abortSignal)) if (event.type === 'usage') events.push(event.usage)
+    assert.deepEqual(events, [{ inputTokens: 120, outputTokens: 28, totalTokens: 168, contextTokens: 45, cacheReadTokens: 14, cacheWriteTokens: 6, reasoningTokens: 5, cacheTokensExcludedFromInput: true }])
+  } finally {
+    global.fetch = oldFetch
+  }
+})
+
+test('14H Gemini usage accounts for tool-use prompt tokens and modality breakdowns', async () => {
+  const oldFetch = global.fetch
+  global.fetch = async () => streamResponse([{
+    usageMetadata: {
+      promptTokenCount: 90, cachedContentTokenCount: 30, toolUsePromptTokenCount: 12,
+      candidatesTokenCount: 20, thoughtsTokenCount: 5, totalTokenCount: 127,
+      promptTokensDetails: [{ modality: 'TEXT', tokenCount: 70 }, { modality: 'IMAGE', tokenCount: 20 }],
+      cacheTokensDetails: [{ modality: 'TEXT', tokenCount: 30 }],
+      candidatesTokensDetails: [{ modality: 'TEXT', tokenCount: 19 }, { modality: 'IMAGE', tokenCount: 1 }],
+      toolUsePromptTokensDetails: [{ modality: 'TEXT', tokenCount: 12 }],
+    },
+    candidates: [{ content: { parts: [] }, finishReason: 'STOP' }],
+  }])
+  try {
+    const provider = new GeminiProvider({ model: 'gemini-modal-usage', baseUrl: 'https://gemini.test', apiKey: 'key' })
+    const events = []
+    for await (const event of provider.stream([], [], abortSignal)) if (event.type === 'usage') events.push(event.usage)
+    assert.deepEqual(events, [{
+      inputTokens: 102, contextTokens: 102, outputTokens: 25, totalTokens: 127,
+      cacheReadTokens: 30, reasoningTokens: 5, toolUsePromptTokens: 12,
+      modalityTokens: {
+        prompt: { text: 70, image: 20 }, cached: { text: 30 },
+        candidates: { text: 19, image: 1 }, toolUsePrompt: { text: 12 },
+      },
+    }])
+  } finally {
+    global.fetch = oldFetch
+  }
+})
+
 function createOpenAiServer() {
   let calls = 0
   const server = http.createServer((req, res) => {

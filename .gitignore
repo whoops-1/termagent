@@ -4,3 +4,5 @@ dist/
 .env
 *.log
 release/
+.agents/
+skills-lock.json

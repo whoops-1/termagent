@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { EventEmitter } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -81,6 +82,31 @@ async function openEventStream(base, pathname, onFrame) {
 }
 
 
+test('14F SSE writer waits for drain and stops waiting when the response closes', async () => {
+  const { writeSse } = await import('../dist/server/http.js')
+  class SlowResponse extends EventEmitter {
+    writableEnded = false
+    destroyed = false
+    frames = []
+    write(frame) { this.frames.push(frame); return false }
+  }
+
+  const response = new SlowResponse()
+  let settled = false
+  const pending = writeSse(response, 'event', { sequence: 7 }).then(value => { settled = true; return value })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(settled, false, 'writer must not advance while the socket is backpressured')
+  assert.match(response.frames[0], /event: event\ndata: \{\"sequence\":7\}\n\n/)
+  response.emit('drain')
+  assert.equal(await pending, true)
+
+  const closed = new SlowResponse()
+  const waiting = writeSse(closed, 'event', { sequence: 8 })
+  closed.destroyed = true
+  closed.emit('close')
+  assert.equal(await waiting, false)
+})
+
 test('14B durable event stream replays then tails without a polling gap', async () => {
   const root = await tempRoot()
   const { SessionEventBus } = await import('../dist/session/event-bus.js')
@@ -97,7 +123,7 @@ test('14B durable event stream replays then tails without a polling gap', async 
     server = undefined
   }
   try {
-    await store.append(id, { type: 'meta', ts: Date.now(), data: { id } })
+    await store.append(id, { type: 'meta', ts: Date.now(), data: { id, cwd: root } })
     await store.append(id, { type: 'provider.turn', ts: Date.now(), data: { n: 1 } })
 
     const runtime = fakeRuntime(store, events, root)
@@ -175,7 +201,7 @@ test('14B disconnect and reconnect resume from the last durable sequence without
     server = undefined
   }
   try {
-    await store.append(id, { type: 'meta', ts: Date.now(), data: { id } })
+    await store.append(id, { type: 'meta', ts: Date.now(), data: { id, cwd: root } })
     await store.append(id, { type: 'provider.turn', ts: Date.now(), data: { n: 1 } })
     server = await startServer(fakeRuntime(store, events, root), { host: '127.0.0.1', port: 0 })
     const base = `http://127.0.0.1:${server.address().port}`
@@ -227,6 +253,98 @@ test('14B disconnect and reconnect resume from the last durable sequence without
 })
 
 
+test('14F SSE tail observes durable writes from an independent SessionStore without a shared EventBus', async () => {
+  const root = await tempRoot()
+  const { SessionEventBus } = await import('../dist/session/event-bus.js')
+  const { SessionStore } = await import('../dist/session/store.js')
+  const { startServer } = await import('../dist/server/http.js')
+  const events = new SessionEventBus()
+  const rootPath = path.join(root, 'sessions')
+  const daemonStore = new SessionStore(rootPath, events)
+  const workerStore = new SessionStore(rootPath)
+  const id = 'cross-process-tail'
+  let server
+  try {
+    await daemonStore.append(id, { type: 'meta', ts: Date.now(), data: { id, cwd: root } })
+    server = await startServer(fakeRuntime(daemonStore, events, root), { host: '127.0.0.1', port: 0 })
+    const base = `http://127.0.0.1:${server.address().port}`
+    const received = new Promise((resolve, reject) => {
+      openEventStream(base, `/api/v1/sessions/${id}/events/stream?after=1`, (frame, req) => {
+        if (frame.event === 'event' && frame.data.sequence === 2) {
+          req.destroy()
+          resolve(frame.data)
+        }
+        if (frame.event === 'error') reject(new Error(frame.data.message))
+      }).catch(reject)
+    })
+    await waitForSubscriberCount(events, id, 1)
+
+    // The worker has its own SessionStore and deliberately has no shared event
+    // bus reference. The SSE durable cursor must still discover the append.
+    await workerStore.append(id, { type: 'provider.turn', ts: Date.now(), data: { source: 'worker-process' } })
+    const event = await Promise.race([
+      received,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('cross-process durable event was not tailed')), 3500)),
+    ])
+    assert.equal(event.kind, 'session.provider.updated')
+    assert.equal(event.payload.source, 'worker-process')
+  } finally {
+    if (server) {
+      server.closeAllConnections?.()
+      await new Promise(resolve => server.close(resolve))
+    }
+    await waitForSubscriberCount(events, id, 0)
+    assert.equal(events.subscriberCount(), 0)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('14F SSE explicitly signals transient live-buffer overflow for client reconciliation', async () => {
+  const root = await tempRoot()
+  const { SessionEventBus } = await import('../dist/session/event-bus.js')
+  const { SessionStore } = await import('../dist/session/store.js')
+  const { toLiveEventEnvelope } = await import('../dist/protocol/session-events.js')
+  const { startServer } = await import('../dist/server/http.js')
+  const events = new SessionEventBus()
+  const store = new SessionStore(path.join(root, 'sessions'), events)
+  const id = 'live-overflow-session'
+  let server
+  try {
+    await store.append(id, { type: 'meta', ts: Date.now(), data: { id, cwd: root } })
+    server = await startServer(fakeRuntime(store, events, root), { host: '127.0.0.1', port: 0 })
+    const base = `http://127.0.0.1:${server.address().port}`
+    const gapReceived = new Promise((resolve, reject) => {
+      openEventStream(base, `/api/v1/sessions/${id}/events/stream?after=1`, (frame, req) => {
+        if (frame.event === 'gap') {
+          req.destroy()
+          resolve(frame.data)
+        }
+        if (frame.event === 'error') reject(new Error(frame.data.message))
+      }).catch(reject)
+    })
+    await waitForSubscriberCount(events, id, 1)
+    for (let i = 0; i < 140; i += 1) {
+      const kind = i % 2 ? 'session.text.delta' : 'session.reasoning.delta'
+      events.publishLive(toLiveEventEnvelope(id, `overflow-${i}`, kind, { streamId: `run-${i}`, delta: String(i) }))
+    }
+    const gap = await Promise.race([
+      gapReceived,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('SSE overflow gap was not delivered')), 2000)),
+    ])
+    assert.equal(gap.reason, 'live-buffer-overflow')
+    assert.equal(gap.snapshotRequired, true)
+    assert.equal(gap.currentSequence, 1)
+  } finally {
+    if (server) {
+      server.closeAllConnections?.()
+      await new Promise(resolve => server.close(resolve))
+    }
+    await waitForSubscriberCount(events, id, 0)
+    assert.equal(events.subscriberCount(), 0)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('14B stream cursor ahead of durable state fails explicitly', async () => {
   const root = await tempRoot()
   const { SessionStore } = await import('../dist/session/store.js')
@@ -243,7 +361,7 @@ test('14B stream cursor ahead of durable state fails explicitly', async () => {
     server = undefined
   }
   try {
-    await store.append(id, { type: 'meta', ts: Date.now(), data: { id } })
+    await store.append(id, { type: 'meta', ts: Date.now(), data: { id, cwd: root } })
     server = await startServer(fakeRuntime(store, events, root), { host: '127.0.0.1', port: 0 })
     const port = server.address().port
     const res = await fetch(`http://127.0.0.1:${port}/api/v1/sessions/${id}/events/stream?after=99`)

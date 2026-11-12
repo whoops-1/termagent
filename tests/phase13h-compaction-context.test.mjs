@@ -22,8 +22,8 @@ test('13H micro-prune reduces old tool payloads while keeping recent tool pairs 
   const { microPruneToolResults } = await import('../dist/agent/compaction.js')
   const old = [
     { role: 'user', content: 'old request' },
-    { role: 'assistant', content: null, tool_calls: [toolCall('old-1', 'bash', { command: 'npm test' })] },
-    { role: 'tool', tool_call_id: 'old-1', name: 'bash', content: 'old output ' + 'x'.repeat(1600) },
+    { role: 'assistant', content: null, tool_calls: [toolCall('old-1', 'read_file', { path: 'src/old.ts' })] },
+    { role: 'tool', tool_call_id: 'old-1', name: 'read_file', content: 'old output ' + 'x'.repeat(1600) },
   ]
   const recent = pairedTurn('recent-1')
   const messages = [
@@ -31,15 +31,53 @@ test('13H micro-prune reduces old tool payloads while keeping recent tool pairs 
     ...old,
     ...recent,
   ]
-  const refs = new Map([['old-1', 'tool-output://abc']])
-  const result = microPruneToolResults(messages, 300, { preserveRecentTurns: 1, minToolTokens: 20, references: refs })
+  const refs = new Map([['old-1', `tool-output://${'a'.repeat(64)}`]])
+  const result = microPruneToolResults(messages, 300, { preserveRecentTurns: 1, minToolTokens: 20, references: refs, clearableToolNames: new Set(['read_file']) })
   assert.equal(result.pruned, 1)
-  assert.match(result.messages.find(m => m.tool_call_id === 'old-1').content, /full_output=tool-output:\/\/abc/)
+  assert.match(result.messages.find(m => m.tool_call_id === 'old-1').content, /full_output=tool-output:\/\/[a-f0-9]{64}/)
   assert.match(result.messages.find(m => m.tool_call_id === 'old-1').content, /call_id=old-1/)
   const ai = result.messages.findIndex(m => m.tool_calls?.[0]?.id === 'recent-1')
   const tool = result.messages.findIndex(m => m.tool_call_id === 'recent-1')
   assert.equal(ai + 1, tool)
   assert.ok(result.remainingTokens <= 300)
+  const repeated = microPruneToolResults(result.messages, 1, { preserveRecentTurns: 1, minToolTokens: 20, references: refs, clearableToolNames: new Set(['read_file']) })
+  assert.equal(repeated.pruned, 0)
+  assert.equal(repeated.messages.find(m => m.tool_call_id === 'old-1').content, result.messages.find(m => m.tool_call_id === 'old-1').content)
+})
+
+test('14H micro-prune never removes shell/write outputs or results without a durable output reference', async () => {
+  const { microPruneToolResults } = await import('../dist/agent/compaction.js')
+  const messages = [
+    { role: 'user', content: 'inspect and update the project' },
+    { role: 'assistant', content: null, tool_calls: [toolCall('read-no-ref', 'read_file', { path: 'src/a.ts' })] },
+    { role: 'tool', tool_call_id: 'read-no-ref', name: 'read_file', content: 'unarchived read ' + 'a'.repeat(900) },
+    { role: 'assistant', content: null, tool_calls: [toolCall('shell-1', 'bash', { command: 'npm test' })] },
+    { role: 'tool', tool_call_id: 'shell-1', name: 'bash', content: 'shell output ' + 'b'.repeat(900) },
+    { role: 'assistant', content: null, tool_calls: [toolCall('write-1', 'write_file', { path: 'src/a.ts' })] },
+    { role: 'tool', tool_call_id: 'write-1', name: 'write_file', content: 'write output ' + 'c'.repeat(900) },
+    { role: 'user', content: 'continue' },
+  ]
+  const durableRef = `tool-output://${'a'.repeat(64)}`
+  const refs = new Map([['shell-1', durableRef], ['write-1', durableRef]])
+  const result = microPruneToolResults(messages, 100, { preserveRecentTurns: 1, minToolTokens: 20, references: refs, clearableToolNames: new Set(['read_file']) })
+  assert.equal(result.pruned, 0)
+  assert.equal(result.messages.find(message => message.tool_call_id === 'read-no-ref').content, messages.find(message => message.tool_call_id === 'read-no-ref').content)
+  assert.equal(result.messages.find(message => message.tool_call_id === 'shell-1').content, messages.find(message => message.tool_call_id === 'shell-1').content)
+  assert.equal(result.messages.find(message => message.tool_call_id === 'write-1').content, messages.find(message => message.tool_call_id === 'write-1').content)
+})
+
+test('14H micro-prune preserves non-success lifecycle results even when their tool is read-only and archived', async () => {
+  const { microPruneToolResults } = await import('../dist/agent/compaction.js')
+  const messages = [
+    { role: 'user', content: 'inspect the project' },
+    { role: 'assistant', content: null, tool_calls: [toolCall('failed-read', 'grep', { pattern: 'TODO' })] },
+    { role: 'tool', tool_call_id: 'failed-read', name: 'grep', content: 'ERROR: permission denied ' + 'x'.repeat(900) },
+    { role: 'user', content: 'continue' },
+  ]
+  const refs = new Map([['failed-read', `tool-output://${'b'.repeat(64)}`]])
+  const result = microPruneToolResults(messages, 100, { preserveRecentTurns: 1, minToolTokens: 20, references: refs, clearableToolNames: new Set(['grep']), protectedCallIds: new Set(['failed-read']) })
+  assert.equal(result.pruned, 0)
+  assert.match(result.messages.find(message => message.tool_call_id === 'failed-read').content, /permission denied/)
 })
 
 test('13H full compaction preserves tool-call anchors, exact errors, verification evidence, and read ranges', async () => {

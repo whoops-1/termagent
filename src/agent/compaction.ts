@@ -30,6 +30,19 @@ function groups(messages:readonly ChatMessage[]):ChatMessage[][] {
   return result
 }
 
+function uniqueRecent(values:string[],limit:number):string[] {
+  const seen=new Set<string>()
+  const unique:string[]=[]
+  for(const value of values){
+    const normalized=String(value||'').replace(/\s+/g,' ').trim()
+    const key=normalized.toLocaleLowerCase()
+    if(!normalized||seen.has(key))continue
+    seen.add(key)
+    unique.push(normalized)
+  }
+  return unique.slice(-Math.max(1,limit))
+}
+
 function summarySection(text:string,title:string):string[] {
   const lines=text.split(/\r?\n/)
   const wanted=new RegExp(`^#{2,3} ${title.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}\\s*$`,'i')
@@ -69,25 +82,33 @@ function buildSummary(removed:ChatMessage[], previousSummary='', context:Compact
     try { const args=JSON.parse(call.function?.arguments||'{}'); const start=Number(args?.startLine); const end=Number(args?.endLine??args?.startLine); const file=typeof args?.path==='string'?args.path:undefined; return file&&Number.isInteger(start)&&start>0?[`${file}#L${start}-${Number.isInteger(end)&&end>=start?end:start}`]:[] } catch { return [] }
   }):[]).slice(-12)
   const previousObjective=summarySection(previousSummary,'Objective')[0]
+  const previousRequirements=summarySection(previousSummary,'Requirements')
+  const previousDecisions=summarySection(previousSummary,'Decisions')
   const previousDetails=summarySection(previousSummary,'Important Details')
   const previousActive=summarySection(previousSummary,'Active')
   const lines:string[]=[]
   const objective=context.activeObjective?.trim() || users.at(-1) || previousObjective || '(none)'
   lines.push('## Objective',`- ${oneLine(objective,500)}`)
+  lines.push('','## Requirements')
+  const requirements=uniqueRecent([...previousRequirements,...users.filter(value=>/\b(?:must|should|never|do not|don't|only|always|preserve|retain|avoid|required|requirement)\b/i.test(value))],8)
+  if(requirements.length)for(const item of requirements)lines.push(`- ${oneLine(item,600)}`);else lines.push('- (none)')
+  lines.push('','## Decisions')
+  const decisions=uniqueRecent([...previousDecisions,...assistants.filter(value=>/\b(?:decided|decision|we will|we should|use the|chosen|choose|selected|adopt)\b/i.test(value))],8)
+  if(decisions.length)for(const item of decisions)lines.push(`- ${oneLine(item,600)}`);else lines.push('- (none)')
   lines.push('','## Important Details')
-  for(const detail of [...previousDetails,...previousActive,...users.slice(0,-1).slice(-4),...exactCalls,...exactErrors,...verification].slice(-12))lines.push(`- ${oneLine(detail,650)}`)
+  for(const detail of uniqueRecent([...previousDetails,...previousActive,...users.slice(0,-1).slice(-4),...exactCalls,...exactErrors,...verification],12))lines.push(`- ${oneLine(detail,650)}`)
   if(ranges.length) for(const range of ranges) lines.push(`- continuation range: ${range}`)
   if(!previousDetails.length&&users.length<=1&&!exactCalls.length&&!exactErrors.length)lines.push('- (none)')
   const previousCompletedLines=summarySection(previousSummary,'Completed')
   const previousBlockedLines=summarySection(previousSummary,'Blocked')
   lines.push('','## Work State','### Completed')
-  const completed=[...previousCompletedLines,...successes].slice(-10)
+  const completed=uniqueRecent([...previousCompletedLines,...successes],10)
   if(completed.length)for(const item of completed)lines.push(`- ${item}`);else lines.push('- (none)')
   lines.push('','### Active')
-  const active=assistants.slice(-3)
+  const active=uniqueRecent(assistants.slice(-3),3)
   if(active.length)for(const a of active)lines.push(`- ${a}`);else lines.push('- (none)')
   lines.push('','### Blocked')
-  const blocked=[...previousBlockedLines,...errors].slice(-10)
+  const blocked=uniqueRecent([...previousBlockedLines,...errors],10)
   if(blocked.length)for(const e of blocked)lines.push(`- ${e}`);else lines.push('- (none)')
   lines.push('','## Todo')
   if(context.todo?.length){
@@ -96,6 +117,8 @@ function buildSummary(removed:ChatMessage[], previousSummary='', context:Compact
     lines.push('- (not available)')
   }
   if(context.completionState) lines.push(`- Completion state: ${oneLine(context.completionState,300)}`)
+  lines.push('','## Important Context')
+  for(const item of [...exactCalls,...exactErrors,...verification].slice(-8)) lines.push(`- ${oneLine(item,650)}`)
   lines.push('','## Next Move',`1. ${active.at(-1)||'Continue the current task and verify changes.'}`,'','## Relevant Files')
   if(files.length)for(const f of files)lines.push(`- ${f}`);else lines.push('- (none)')
   return lines.join('\n')
@@ -105,24 +128,61 @@ function fitText(text:string,maxTokens:number):string {
   if(maxTokens<=0)return ''
   if(estimateTokens(text)<=maxTokens)return text
   const lines=text.split(/\r?\n/)
-  const priority=(line:string) =>
-    /^## Objective|^## Important Details|^### (?:Completed|Active|Blocked)|^## Next Move|^## Relevant Files/.test(line) ? 0 :
-    /^- /.test(line) ? 1 : 2
-  const scored=lines.map((line,index)=>({line,index,priority:priority(line)}))
-  const keep=new Set<number>()
-  for(const item of scored.filter(x=>x.priority===0)) keep.add(item.index)
-  const candidates=scored.filter(x=>x.priority===1).sort((a,b)=>a.index-b.index)
-  let built=[...keep].sort((a,b)=>a-b).map(i=>lines[i])
-  let remaining=maxTokens-estimateTokens(built.join('\n'))
-  if(remaining>0){
-    for(const item of candidates){
-      const next=[...built,item.line].join('\n')
-      if(estimateTokens(next)>maxTokens)break
-      built.push(item.line); remaining=maxTokens-estimateTokens(next); if(remaining<=0)break
-    }
+  const sectionPriority:Record<string,number>={
+    Objective:0,
+    Requirements:1,
+    Decisions:2,
+    Todo:3,
+    'Work State/Active':4,
+    'Work State/Blocked':5,
+    'Work State/Completed':6,
+    'Next Move':7,
+    'Relevant Files':8,
+    'Important Details':9,
+    'Important Context':10,
   }
-  if(!built.length)return truncateToBudgetFallback(text,maxTokens)
-  return `${built.join('\n')}\n…[summary truncated]`
+  const heading=/^## (Objective|Requirements|Decisions|Important Details|Work State|Todo|Important Context|Next Move|Relevant Files)$|^### (Completed|Active|Blocked)$/
+  const sectionLines=lines.map((line,index)=>({line,index,section:''}))
+  let section=''
+  for(const item of sectionLines){
+    const match=item.line.match(heading)
+    if(match){
+      if(item.line.startsWith('### '))section=`Work State/${match[2]}`
+      else section=match[1]
+    }
+    item.section=section
+  }
+
+  // Always preserve the full structural skeleton. For the content that does
+  // not fit, keep state-bearing sections before explanatory detail, then
+  // restore original line order so bullets remain under their headings.
+  const keep=new Set<number>()
+  for(const item of sectionLines)if(heading.test(item.line))keep.add(item.index)
+  const candidates=sectionLines.filter(item=>!keep.has(item.index)&&item.line.trim()).map(item=>({
+    ...item,
+    priority:sectionPriority[item.section]??11,
+  })).sort((a,b)=>{
+    const priority=a.priority-b.priority
+    if(priority)return priority
+    // Under tight budgets, preserve the newest completed/blocked evidence,
+    // rather than allowing the oldest work item to crowd out current state.
+    const recentFirst=a.section==='Work State/Completed'||a.section==='Work State/Blocked'
+    return recentFirst?b.index-a.index:a.index-b.index
+  })
+
+  let selected=[...keep].sort((a,b)=>a-b)
+  let current=selected.map(index=>lines[index]).join('\n')
+  for(const item of candidates){
+    const nextIndexes=[...selected,item.index].sort((a,b)=>a-b)
+    const next=nextIndexes.map(index=>lines[index]).join('\n')
+    if(estimateTokens(next)+estimateTokens('\n…[summary truncated]')>maxTokens)continue
+    selected=nextIndexes
+    current=next
+  }
+  if(!selected.length)return truncateToBudgetFallback(text,maxTokens)
+  const fitted=`${current}\n…[summary truncated]`
+  if(estimateTokens(fitted)<=maxTokens)return fitted
+  return truncateToBudgetFallback(text,maxTokens)
 }
 
 function truncateToBudgetFallback(text:string,maxTokens:number):string {
@@ -216,7 +276,12 @@ function preserveTailWithinBudget(tail:ChatMessage[],budgetTokens:number):ChatMe
 export type MicroPruneOptions = {
   preserveRecentTurns?: number
   minToolTokens?: number
+  /** Only tools whose registry contract explicitly marks them read-only may be pruned. */
+  clearableToolNames?: ReadonlySet<string>
+  /** Full outputs must remain addressable in the durable ToolOutputStore. */
   references?: ReadonlyMap<string,string>
+  /** Preserve errors, interrupted calls, deferred calls, and non-success outcomes. */
+  protectedCallIds?: ReadonlySet<string>
 }
 
 export type MicroPruneResult = {
@@ -227,14 +292,14 @@ export type MicroPruneResult = {
 }
 
 function isPruneMarker(content:string):boolean {
-  return content.includes('[Older tool result pruned from active context;')
+  return content.includes('[Older tool result pruned from active context;') || content.includes('[Older read-only tool result pruned from active context;')
 }
 
 /**
- * established style staged reduction: trim old tool-result payloads before asking
- * the summarizer to remove conversation history. Tool messages remain paired
- * with their assistant tool calls, and the complete output stays in the
- * durable ToolOutputStore when a reference is available.
+ * Staged reduction follows selective API microcompaction principles:
+ * prune only older read-only tool results, only when the complete output has a
+ * durable ToolOutputStore reference. Mutating, shell, recent, failed, deferred,
+ * and otherwise protected results stay verbatim in the active prompt.
  */
 export function microPruneToolResults(messages:ChatMessage[], targetTokens:number, options:MicroPruneOptions={}):MicroPruneResult {
   const preservedTurns=Math.max(1,Math.floor(options.preserveRecentTurns??2))
@@ -247,7 +312,17 @@ export function microPruneToolResults(messages:ChatMessage[], targetTokens:numbe
   const protectedMessages=new Set(turnGroups.slice(-preservedTurns).flat())
   const candidates=messages
     .map((message,index)=>({message,index}))
-    .filter(item=>item.message.role==='tool' && typeof item.message.content==='string' && item.message.content && !protectedMessages.has(item.message) && !isPruneMarker(item.message.content))
+    .filter(item=>{
+      const message=item.message
+      if(message.role!=='tool'||typeof message.content!=='string'||!message.content)return false
+      if(protectedMessages.has(message)||isPruneMarker(message.content))return false
+      const callId=typeof message.tool_call_id==='string'?message.tool_call_id:''
+      if(!callId||options.protectedCallIds?.has(callId))return false
+      if(!message.name||!options.clearableToolNames?.has(message.name))return false
+      const reference=options.references?.get(callId)
+      if(!reference||!/^tool-output:\/\/[a-f0-9]{64}$/.test(reference))return false
+      return true
+    })
     .map(item=>({
       ...item,
       cost:estimateMessageTokens(item.message),
@@ -264,9 +339,10 @@ export function microPruneToolResults(messages:ChatMessage[], targetTokens:numbe
   let savedTokens=0
   for(const candidate of candidates){
     if(remaining<=targetTokens) break
-    const callId=candidate.message.tool_call_id||'unknown'
-    const ref=options.references?.get(callId)
-    const marker=`[Older tool result pruned from active context; call_id=${callId}${ref ? `; full_output=${ref}` : ''}]`
+    const callId=candidate.message.tool_call_id!
+    const ref=options.references!.get(callId)!
+    const toolName=candidate.message.name||'tool'
+    const marker=`[Older read-only tool result pruned from active context; tool=${toolName}; call_id=${callId}; full_output=${ref}]`
     const next={...out[candidate.index],content:marker}
     const nextCost=estimateMessageTokens(next)
     const saved=candidate.cost-nextCost
@@ -280,7 +356,7 @@ export function microPruneToolResults(messages:ChatMessage[], targetTokens:numbe
 }
 
 export function compactMessages(messages:ChatMessage[], maxTokens:number, options:Partial<ContextBudgetOptions>={}, context:CompactionContext={}):{messages:ChatMessage[];summary:string;removed:number;budget:ContextBudget} {
-  const budget=createContextBudget(Object.keys(options).length ? {maxContextTokens:maxTokens,...options} : {maxContextTokens:maxTokens,maxOutputTokens:0,threshold:1,reserveTokens:0,recentTokens:Math.max(0,Math.min(8000,Math.floor(maxTokens*0.28)))})
+  const budget=createContextBudget({maxContextTokens:maxTokens,maxOutputTokens:0,threshold:1,reserveTokens:0,...options})
   if(estimateMessagesTokens(messages)<=budget.usableTokens)return {messages,summary:'',removed:0,budget}
   const system=messages.find(m=>m.role==='system');
   const previousSummaryMessages=messages.filter(m=>m!==system&&m.role==='system'&&typeof m.content==='string'&&m.content.startsWith('Earlier conversation summary.'))

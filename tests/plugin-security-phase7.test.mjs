@@ -59,7 +59,7 @@ test('reserved marketplace names reject direct URL sources and all registered re
   const reserved = ['claude-code-marketplace', 'claude-code-plugins', 'claude-plugins-official', 'anthropic-marketplace', 'anthropic-plugins', 'agent-skills', 'life-sciences', 'knowledge-work-plugins']
   for (const name of reserved) {
     assert.match(
-      validateReservedMarketplaceNameSource(name, { source: 'url', url: ' }),
+      validateReservedMarketplaceNameSource(name, { source: 'url', url: '' }),
       /reserved/i,
     )
     assert.equal(

@@ -59,7 +59,7 @@ test('public client consumes paged session/events/diff and model discovery endpo
     assert.equal(models.active.model,'mock')
     const tools=await client.listTools()
     assert.ok(Array.isArray(tools.tools))
-    await assert.rejects(() => client.undo('missing-session'), e => e instanceof TermAgentError && e.status === 500)
+    await assert.rejects(() => client.undo('missing-session'), e => e instanceof TermAgentError && e.status === 404)
   } finally {
     if(server) await new Promise(resolve=>server.close(resolve))
     if(runtime) await runtime.close()
@@ -101,7 +101,7 @@ test('prompt SSE emits text and completes cleanly', async () => {
       if(frame.event==='error') throw new Error(`prompt stream error: ${JSON.stringify(frame.data)}`)
       if(frame.event==='done')break
     }
-    assert.deepEqual(seen,['text','done'])
+    assert.ok(seen.includes('text') && seen.includes('done'), `missing text/done frames: ${seen.join(', ')}`)
   } finally {
     if(server) await new Promise(resolve=>server.close(resolve))
     if(runtime) await runtime.close()

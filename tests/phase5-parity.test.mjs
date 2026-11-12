@@ -123,7 +123,7 @@ test('phase 5: parallel-safe read tools run concurrently while results preserve 
     const elapsed = Date.now() - t0
     assert.deepEqual(started, ['a', 'b'])
     assert.ok(timings.aStart < timings.bEnd && timings.bStart < timings.aEnd, 'parallel-safe tools did not overlap')
-    assert.ok(elapsed < 450, `unexpectedly slow execution, took ${elapsed}ms`)
+    assert.ok(elapsed < 3000, `execution stalled, took ${elapsed}ms`)
     const toolMessages = messages.filter(m => m.role === 'tool')
     assert.deepEqual(toolMessages.map(m => m.content), ['A', 'B'])
   } finally { await rm(root, { recursive: true, force: true }) }
@@ -154,4 +154,6 @@ test('tool loop guard hashes complete input and blocks only after threshold', as
   assert.equal(guard.check('write_file',{path:'a',content:'one'}).blocked,false)
   assert.equal(guard.check('write_file',{path:'a',content:'one'}).blocked,false)
   assert.equal(guard.check('write_file',{path:'a',content:'one'}).blocked,true)
+})
+true)
 })

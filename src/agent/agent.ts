@@ -1,10 +1,13 @@
-import type { Provider } from '../providers/types.js'
+import { normalizeProviderUsageReport, type Provider, type ProviderUsageReport } from '../providers/types.js'
+import { captureProviderTrace } from '../providers/trace.js'
 import type { ChatMessage } from '../session/store.js'
 import { SessionStore } from '../session/store.js'
 import { ToolRegistry } from '../tools/registry.js'
 import { compactMessages, microPruneToolResults } from './compaction.js'
 import { allocateContextSections, createContextBudget, estimateMessageTokens, estimateMessagesTokens, estimateTokens, truncateToTokenBudget } from '../context/budget.js'
+import { resolveContextLimits } from '../context/model-limits.js'
 import { withRetry } from './retry.js'
+import { isProviderContextOverflowError } from '../providers/errors.js'
 import { discoverSkills, formatSkillSearchResults, type SkillSearchResult } from '../skills/discovery.js'
 import { formatSkillDescriptors, type SkillDescriptor } from '../skills/catalog.js'
 import { profileFor } from './profiles.js'
@@ -15,12 +18,14 @@ import { accountContext } from '../context/budget.js'
 import { ExecutionWorkflow, initialWorkflow, workflowSummary } from './workflow.js'
 import { ToolLoopGuard } from './loop-guard.js'
 import type { PluginHookManager } from '../plugins/hooks.js'
-import { FileReadStateCache, rehydrateReadCoverageEvidence } from '../tools/file-state.js'
+import { FileReadStateCache } from '../tools/file-state.js'
 import { ExplorationState } from '../context/exploration.js'
 import { ToolCallLifecycle, classifyToolError, normalizeToolCalls, parseToolArguments } from './tool-call-lifecycle.js'
 import { XmlToolCallStreamParser } from './text-tool-call-parser.js'
 import type { QuestionResponse } from '../tools/types.js'
-import { machineStateFromRuntime, renderMachineState, type ContextMachineState } from '../context/state.js'
+import { machineStateFromRuntime, renderMachineState, type ContextMachineState, type ContextInstructionReference } from '../context/state.js'
+import { formatInstructionFiles, loadInstructionFiles, loadInstructionPaths, loadScopedInstructionFiles, type InstructionFile } from '../context/instructions.js'
+import { loadSkill, boundSkillContent } from '../skills/invoker.js'
 import { semanticProgressFingerprint } from './progress.js'
 import { explorationInterventionMessage, explorationInterventionToolActions } from './exploration-intervention.js'
 import { ExplorationTelemetry, type ExplorationTelemetrySnapshot } from './exploration-telemetry.js'
@@ -34,6 +39,30 @@ import { canonicalJson } from '../util/canonical.js'
 import crypto from 'node:crypto'
 
 const WRITE_TOOLS = new Set(['write_file','edit_file','apply_patch'])
+
+function instructionTargetsForTool(name:string,args:any):string[]{
+  const values:string[]=[]
+  const add=(value:unknown)=>{if(typeof value==='string'&&value.trim())values.push(value.trim())}
+  if(name==='apply_patch' && typeof args?.patch==='string'){
+    for(const match of args.patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)) add(match[1])
+    for(const match of args.patch.matchAll(/^(?:\+\+\+|---) [ab]\/(.+)$/gm)) add(match[1])
+  }
+  if(name==='list_dir') add(args?.path||args?.directory)
+  else {
+    add(args?.path)
+    add(args?.filePath)
+    add(args?.target)
+    add(args?.directory)
+    add(args?.paths)
+  }
+  if(name==='glob') add(args?.pattern)
+  if(name==='grep') add(args?.include)
+  return [...new Set(values.map(value=>{
+    const clean=value.replace(/[\*?{}[\]]/g,'')
+    const slash=clean.lastIndexOf('/')
+    return slash>0 && /[*?{}[]/.test(value) ? clean.slice(0,slash) : clean
+  }))]
+}
 
 function mutationEvidenceFromLifecycle(records: ReturnType<ToolCallLifecycle['snapshot']>) {
   return records.flatMap(record => {
@@ -138,11 +167,11 @@ function roleForPhase(phase:string):string {
 
 export class Agent {
   private readonly toolOutputStore: ToolOutputStore
-  constructor(private provider:Provider,private tools:ToolRegistry,private sessions:SessionStore,private maxRounds=0,private maxContextTokens=12000,private retryMax=4,private onStatus?:(s:string)=>void,private skills:unknown[]=[],private contextOptions:{threshold?:number;reserveTokens?:number;recentTokens?:number}={},private hookManager?:PluginHookManager,toolOutputOptions:{maxLines?:number;maxBytes?:number;retentionDays?:number}={},private postEditVerificationConfig?:PostEditVerificationConfig,private taskManager?:TaskManager){
+  constructor(private provider:Provider,private tools:ToolRegistry,private sessions:SessionStore,private maxRounds=0,private maxContextTokens=0,private retryMax=4,private onStatus?:(s:string)=>void,private skills:unknown[]=[],private contextOptions:{threshold?:number;reserveTokens?:number;recentTokens?:number}={},private hookManager?:PluginHookManager,toolOutputOptions:{maxLines?:number;maxBytes?:number;retentionDays?:number}={},private postEditVerificationConfig?:PostEditVerificationConfig,private taskManager?:TaskManager){
     this.toolOutputStore=new ToolOutputStore(toolOutputOptions)
   }
 
-  async run(input:{sessionId:string;messages:ChatMessage[];cwd:string;instructions:string;repositoryContext?:string;skillsContext?:string;prompt?:string;onText?:(s:string)=>void;onTool?:(name:string,args:any)=>void;onToolResult?:(name:string,out:string,metadata?:any)=>void;onReasoning?:(s:string)=>void;autonomous?:boolean;mode?:string;customAgent?:CustomAgent;scopePaths?:string[];signal?:AbortSignal;onQuestion?: (questions:any[], signal?:AbortSignal)=>Promise<string[][]|QuestionResponse>;onTodo?:(items:TodoItem[])=>void;onExplorationTelemetry?:(snapshot:ExplorationTelemetrySnapshot)=>void;onExplorationState?:(snapshot:ReturnType<ExplorationState['snapshot']>)=>void;skillDiscoverySuppressed?:boolean;explicitSkill?:{id:string;content:string;sha256:string};allowedTools?:string[];taskId?:string;delegationDepth?:number;specialistRole?:string;onUsage?:(usage:{inputTokens:number;outputTokens:number;totalTokens:number;estimated:boolean})=>void}){
+  async run(input:{sessionId:string;messages:ChatMessage[];cwd:string;instructions:string;repositoryContext?:string;skillsContext?:string;prompt?:string;onText?:(s:string)=>void;onTool?:(name:string,args:any,callId?:string)=>void;onToolResult?:(name:string,out:string,metadata?:any)=>void;onReasoning?:(s:string)=>void;autonomous?:boolean;mode?:string;customAgent?:CustomAgent;scopePaths?:string[];signal?:AbortSignal;onQuestion?: (questions:any[], signal?:AbortSignal)=>Promise<string[][]|QuestionResponse>;onTodo?:(items:TodoItem[])=>void;onExplorationTelemetry?:(snapshot:ExplorationTelemetrySnapshot)=>void;onExplorationState?:(snapshot:ReturnType<ExplorationState['snapshot']>)=>void;skillDiscoverySuppressed?:boolean;explicitSkill?:{id:string;content:string;sha256:string};allowedTools?:string[];taskId?:string;delegationDepth?:number;specialistRole?:string;onUsage?:(usage:ProviderUsageReport)=>void;onContextEstimate?:(tokens:number,contextWindow:number)=>void}){
     const messages=input.messages
     const readFileState = new FileReadStateCache()
     const explorationState = new ExplorationState(input.cwd, input.scopePaths)
@@ -175,7 +204,37 @@ export class Agent {
     })
     let loopStopReason:string|undefined
     let completionRequested:string|undefined
+    const providerRouteRole=input.specialistRole ? 'subagent' : enforcedAutonomous ? 'planning' : mode
+    this.provider.setRole?.(providerRouteRole)
+    // Resolve the model limits for the route the smart router will actually
+    // choose. Previously the context budget was calculated before the router
+    // received the prompt, so a request routed to a larger/smaller model could
+    // inherit the wrong window for the entire turn.
+    this.provider.setTurnContext?.({userText:input.prompt||'',turnNumber:messages.length+1})
+    const initialProviderConfig=this.provider.getActiveConfig?.() || this.provider.config
+    let resolvedLimits=resolveContextLimits({providerConfig:initialProviderConfig,configuredContextWindow:this.maxContextTokens>0?this.maxContextTokens:undefined})
+    let budget=createContextBudget({maxContextTokens:resolvedLimits.contextWindow,maxOutputTokens:resolvedLimits.maxOutputTokens,...this.contextOptions})
     const persistedSession=await this.sessions.load(input.sessionId)
+    const instructionSectionBudget=allocateContextSections(budget.usableTokens,{explicitSkill:Boolean(input.explicitSkill)}).instructions
+    const instructionBudgetBytes=Math.min(512*1024,Math.max(16*1024,Math.floor(instructionSectionBudget*4)))
+    const instructionFileBytes=Math.min(128*1024,Math.max(4*1024,Math.floor(instructionBudgetBytes/3)))
+    const baseInstructionLoad=await loadInstructionFiles(input.cwd,{maxBytes:Math.floor(instructionBudgetBytes*0.8),maxFileBytes:instructionFileBytes})
+    const instructionFiles=new Map<string,InstructionFile>(baseInstructionLoad.files.map(file=>[file.path,file]))
+    const persistedInstructionPaths=[...persistedSession.events]
+      .filter((event:any)=>event.type==='context.instructions' && Array.isArray(event.data?.files))
+      .flatMap((event:any)=>event.data.files.map((file:any)=>typeof file?.path==='string'?file.path:''))
+      .filter(Boolean)
+    const instructionBytesUsed=[...instructionFiles.values()].reduce((sum,file)=>sum+Buffer.byteLength(file.content,'utf8'),0)
+    const restoredInstructionLoad=await loadInstructionPaths(input.cwd,persistedInstructionPaths,{maxBytes:Math.max(0,instructionBudgetBytes-instructionBytesUsed),maxFileBytes:instructionFileBytes})
+    for(const file of restoredInstructionLoad.files) instructionFiles.set(file.path,file)
+    const suppliedInstructions=input.instructions?.trim()||''
+    const supplementalInstructions=suppliedInstructions && !baseInstructionLoad.text.includes(suppliedInstructions) && !restoredInstructionLoad.text.includes(suppliedInstructions)
+      ? suppliedInstructions
+      : ''
+    let effectiveInstructions=[baseInstructionLoad.text,restoredInstructionLoad.text,supplementalInstructions]
+      .filter((value,index,items)=>Boolean(value?.trim()) && items.indexOf(value)===index)
+      .join('\n\n')
+    const instructionReferences:ContextInstructionReference[]=[...instructionFiles.values()].map(file=>({path:file.path,sha256:file.sha256,scope:file.scope}))
     const restoredCheckpoint=await this.sessions.latestContextCheckpoint(input.sessionId)
     let checkpointSummary=typeof restoredCheckpoint?.summary==='string'?restoredCheckpoint.summary:''
     let contextEpoch=Number.isInteger(restoredCheckpoint?.epoch)?Number(restoredCheckpoint.epoch):0
@@ -187,10 +246,43 @@ export class Agent {
       messages.splice(0,messages.length,...activeCheckpointProjection)
       if (restoredCheckpoint.machineState?.exploration) explorationState.restore(restoredCheckpoint.machineState.exploration)
       try {
-        restoredReadEvidence=await rehydrateReadCoverageEvidence(restoredCheckpoint.machineState?.readCoverage||[],600,5)
-      } catch {}
+        const readEvidenceBudget=Math.min(24_000,Math.max(600,Math.floor(budget.usableTokens*0.05)))
+        const readEvidenceFiles=Math.min(64,Math.max(5,Math.floor(budget.usableTokens/1_500)))
+        const readRestore = await readFileState.restoreCoverage(restoredCheckpoint.machineState?.readCoverage || [], {
+          cwd: input.cwd,
+          scopePaths: input.scopePaths,
+          maxFiles:readEvidenceFiles,
+          maxBytes:Math.min(8*1024*1024,Math.max(256*1024,readEvidenceBudget*4)),
+        })
+        restoredReadEvidence = await readFileState.rehydrateContextEvidence(readEvidenceBudget, readEvidenceFiles)
+        if (readRestore.restoredRanges || readRestore.skipped) {
+          this.onStatus?.(`context: restored ${readRestore.restoredRanges} inspected range(s) across ${readRestore.restoredFiles} file(s); skipped ${readRestore.skipped} stale, out-of-scope, or unavailable file record(s)`)
+        }
+      } catch (error) {
+        this.onStatus?.(`context: read-coverage recovery failed: ${String((error as Error).message || error).slice(0, 180)}`)
+      }
     }
-    const persistedLoadedSkills=[...persistedSession.events].filter((event:any)=>event.type==='skill.load' && event.data?.id).map((event:any)=>({id:String(event.data.id),sha256:typeof event.data.sha256==='string'?event.data.sha256:undefined}))
+    const persistedLoadedSkills=[...persistedSession.events].filter((event:any)=>event.type==='skill.load' && event.data?.id).map((event:any)=>({id:String(event.data.id),sha256:typeof event.data.sha256==='string'?event.data.sha256:undefined,path:typeof event.data.path==='string'?event.data.path:undefined}))
+    const loadedSkillContents=new Map<string,string>()
+    const restoredSkillBudget=Math.min(48_000,budget.explicitSkillTokens)
+    if(input.explicitSkill && !persistedLoadedSkills.some(item=>item.id===input.explicitSkill!.id)) persistedLoadedSkills.push({id:input.explicitSkill.id,sha256:input.explicitSkill.sha256,path:undefined})
+    const uniqueSkillRefs=[...new Map(persistedLoadedSkills.map(item=>[item.id,item])).values()].slice(-24)
+    for(const [index,skillRef] of uniqueSkillRefs.entries()){
+      try{
+        const loaded=await loadSkill(input.cwd,skillRef.id)
+        if(skillRef.sha256 && loaded.sha256!==skillRef.sha256){
+          this.onStatus?.(`context: previously loaded skill '${skillRef.id}' changed; stale instructions were not restored`)
+          continue
+        }
+        const share=Math.max(128,Math.floor(restoredSkillBudget/Math.max(1,uniqueSkillRefs.length)))
+        loadedSkillContents.set(skillRef.id,boundSkillContent(loaded.content,share))
+        if(!skillRef.path) skillRef.path=loaded.path
+        if(!skillRef.sha256) skillRef.sha256=loaded.sha256
+      }catch(error){
+        this.onStatus?.(`context: could not restore skill '${skillRef.id}': ${String((error as Error).message||error).slice(0,180)}`)
+      }
+    }
+    let restoredSkillContext=[...loadedSkillContents.entries()].map(([id,content])=>`<restored_skill id="${id}">\n${content}\n</restored_skill>`).join('\n\n')
     const persistedQuestionAnswers=[...persistedSession.events].filter((event:any)=>['question.replied','question.rejected','question.cancelled'].includes(event.type) && event.data?.requestId).map((event:any)=>({requestId:String(event.data.requestId),status:String(event.type).replace('question.',''),answers:Array.isArray(event.data.answers)?event.data.answers.map((a:any)=>Array.isArray(a)?a.map(String):[]):[]}))
     const latestTodoEvent=[...persistedSession.events].reverse().find((event:any)=>event.type==='todo')
     const latestPersistedTodo=[...messages].reverse().find((message:any)=>message.role==='tool'&&message.name==='todo')
@@ -223,7 +315,6 @@ export class Agent {
       return result.results
     }
     const renderSkillContext=()=>formatSkillSearchResults(discoveredSkills,5000)
-    const budget=createContextBudget({maxContextTokens:this.maxContextTokens,maxOutputTokens:this.provider.config?.maxTokens,...this.contextOptions})
     const buildSchemas=()=>{
       const phase=workflow?.state.phase || 'none'
       const bounded=this.tools.selectSchemas({
@@ -246,12 +337,73 @@ export class Agent {
     }
     const initialSchemaResult=buildSchemas()
     const schemaTokens=initialSchemaResult.estimatedTokens
-    const rawMessageBudget=Math.max(256,budget.usableTokens-schemaTokens)
-    const checkpointNoticeBudget=Math.min(240,Math.max(64,Math.floor(rawMessageBudget*0.14)))
-    const restoreNoticeBudget=restoredCheckpoint ? checkpointNoticeBudget : 0
-    const messageBudget=Math.max(128,rawMessageBudget-restoreNoticeBudget)
+    type ProviderUsageBaseline={measuredTokens:number;estimatedRequestTokens:number;provider:string;model:string;contextWindow:number}
+    let providerUsageBaseline:ProviderUsageBaseline|undefined
+    let providerTokenRatio=1
+    const matchingUsageReports:ProviderUsageReport[]=[]
+    const sessionEvents=Array.isArray((persistedSession as any)?.events)?(persistedSession as any).events:[]
+    let latestCompactionIndex=-1
+    for(let index=0;index<sessionEvents.length;index++){
+      const event=sessionEvents[index]
+      if(event?.type==='compaction' && event.data?.stage!=='started') latestCompactionIndex=index
+    }
+    for(const event of sessionEvents.slice(latestCompactionIndex+1)){
+      if(event?.type!=='provider.usage') continue
+      const report=normalizeProviderUsageReport({...event.data,recordedAt:event.data?.recordedAt??event.ts})
+      if(!report || report.estimated || report.provider!==resolvedLimits.provider || report.model!==resolvedLimits.model || report.contextWindow!==resolvedLimits.contextWindow) continue
+      matchingUsageReports.push(report)
+    }
+    let recentRatios=matchingUsageReports.slice(-5).flatMap(report=>{
+      const estimate=report.estimateRequestTokens ?? (report.estimateInputTokens+schemaTokens)
+      const measured=report.contextTokens??report.inputTokens
+      if(!Number.isFinite(estimate)||estimate<=0||!Number.isFinite(measured)||measured<=0)return []
+      return [Math.max(1,Math.min(4,measured/estimate))]
+    }).sort((a,b)=>a-b)
+    if(recentRatios.length) providerTokenRatio=recentRatios[Math.floor(recentRatios.length/2)]!
+    // A compaction changes the prompt projection enough that pre-compaction
+    // samples must not remain in the rolling window. Keep a bounded warm start
+    // for the first request in the new epoch, shrinking the prior route ratio
+    // 75% of the way toward neutral; the first new measurement then replaces it.
+    // This avoids both stale full-strength carry-over and a completely cold
+    // first request after every compaction.
+    const COMPACTION_EPOCH_PRIOR_WEIGHT=0.75
+    const startProviderUsageCalibrationEpoch=()=>{
+      const priorRatio=providerTokenRatio
+      providerUsageBaseline=undefined
+      recentRatios=[]
+      providerTokenRatio=1+(priorRatio-1)*COMPACTION_EPOCH_PRIOR_WEIGHT
+    }
+    const latestMeasured=matchingUsageReports.at(-1)
+    if(latestMeasured){
+      providerUsageBaseline={
+        measuredTokens:latestMeasured.contextTokens??latestMeasured.inputTokens,
+        estimatedRequestTokens:latestMeasured.estimateRequestTokens??(latestMeasured.estimateInputTokens+schemaTokens),
+        provider:latestMeasured.provider,
+        model:latestMeasured.model,
+        contextWindow:latestMeasured.contextWindow,
+      }
+    }
+    const routeMatchesBaseline=()=>Boolean(providerUsageBaseline && providerUsageBaseline.provider===resolvedLimits.provider && providerUsageBaseline.model===resolvedLimits.model && providerUsageBaseline.contextWindow===resolvedLimits.contextWindow)
+    const requestFootprintParts=(accounting:ReturnType<typeof accountContext>,additional=0,native?:import('../providers/types.js').ProviderTokenCount)=>{
+      const extra=Math.max(0,additional)
+      const local=accounting.total+extra
+      const ratioAdjusted=Math.ceil(accounting.total*providerTokenRatio)+extra
+      const baselineAdjusted=routeMatchesBaseline()
+        ? Math.max(0,providerUsageBaseline!.measuredTokens+(accounting.total-providerUsageBaseline!.estimatedRequestTokens)+extra)
+        : 0
+      const nativeAdjusted=Math.max(0,native?.inputTokens||0)
+      return {local,ratioAdjusted,baselineAdjusted,nativeAdjusted,effective:Math.max(local,ratioAdjusted,baselineAdjusted,nativeAdjusted)}
+    }
+    const estimateRequestFootprint=(accounting:ReturnType<typeof accountContext>,additional=0,native?:import('../providers/types.js').ProviderTokenCount)=>requestFootprintParts(accounting,additional,native).effective
+    let rawMessageBudget=Math.max(256,Math.floor((budget.usableTokens-schemaTokens)/providerTokenRatio))
+    // Checkpoint notices contain the machine-readable continuation state. A
+    // fixed 240-token ceiling silently discarded most of that state on large
+    // sessions, defeating the point of durable context checkpoints.
+    let checkpointNoticeBudget=Math.min(48_000,Math.max(64,Math.floor(rawMessageBudget*0.08)))
+    let restoreNoticeBudget=restoredCheckpoint ? checkpointNoticeBudget : 0
+    let messageBudget=Math.max(128,rawMessageBudget-restoreNoticeBudget)
     const descriptorContext=this.skills.length ? formatSkillDescriptors(this.skills as SkillDescriptor[], 5000) : '(skill discovery pending)'
-    const system=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${input.instructions}`,input.repositoryContext,descriptorContext,autonomous,mode,messageBudget,input.explicitSkill)
+    const system=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${effectiveInstructions}`,input.repositoryContext,descriptorContext,autonomous,mode,messageBudget,input.explicitSkill,restoredSkillContext)
     const existing=messages.find(m=>m.role==='system')
     if(existing) existing.content=system; else messages.unshift({role:'system',content:system})
     let contextNoticeMessage:ChatMessage|undefined
@@ -274,7 +426,7 @@ export class Agent {
       })
     }
     const readFileStateSnapshot=()=>{
-      const snapshot=readFileState.contextSnapshot(16)
+      const snapshot=readFileState.contextSnapshot(64)
       return snapshot.map((item:any)=>({
         canonicalPath:item.canonicalPath,mtimeMs:item.mtimeMs,size:item.size,totalLines:item.totalLines,lastUse:item.lastUse,contentHash:item.contentHash,
         segments:(item.ranges||[]).map((range:any)=>({startLine:range.startLine,endLine:range.endLine,content:'',bytes:0,complete:true,recordedAt:item.lastUse||Date.now()})),
@@ -282,39 +434,85 @@ export class Agent {
       }))
     }
 
+    let latestMachineState:ContextMachineState|undefined=restoredCheckpoint?.machineState
     const upsertCheckpointNotice=(machine:ContextMachineState,evidence:string[])=>{
+      latestMachineState=machine
       if(!contextNoticeMessage){ contextNoticeMessage={role:'system',content:''}; messages.splice(1,0,contextNoticeMessage) }
       contextNoticeMessage.content=checkpointNotice(checkpointSummary,machine,evidence,checkpointNoticeBudget)
     }
 
-    const maybeCompact=async(additionalRequestTokens=0)=>{
+    const maybeCompact=async(additionalRequestTokens=0,trigger:'turn-entry'|'route-change'|'provider-request'|'post-tool-round'|'post-provider-response'='post-tool-round',providerCount?:import('../providers/types.js').ProviderTokenCount,forceOverflowRecovery=false)=>{
       const schemaResult=buildSchemas()
       const schemas=schemaResult.tools
       const liveSchemaTokens=schemaResult.estimatedTokens
       if(liveSchemaTokens>=budget.usableTokens) throw new Error(`Tool definitions exceed the configured context budget (${liveSchemaTokens} estimated tokens >= ${budget.usableTokens} usable tokens)`)
-      const requestTokens=estimateMessagesTokens(messages)+liveSchemaTokens+Math.max(0,additionalRequestTokens)
-      if(requestTokens<=budget.usableTokens)return
-      const liveMessageBudget=budget.usableTokens-liveSchemaTokens
-      if(liveMessageBudget<64) throw new Error(`Conversation cannot fit within the configured context budget after reserving tool definitions (${liveMessageBudget} message tokens available)`)
+      const beforeAccounting=accountContext(messages,schemas)
+      const extraTokens=Math.max(0,additionalRequestTokens)
+      const beforeRequestTokens=estimateRequestFootprint(beforeAccounting,extraTokens,providerCount)
+      if(beforeRequestTokens<=budget.usableTokens && !forceOverflowRecovery)return
+
+      // A provider overflow is authoritative evidence that the local estimate
+      // under-counted. Force a materially smaller target for this one recovery
+      // attempt instead of repeating the same oversized request.
+      const compactionTargetTokens=forceOverflowRecovery?Math.floor(budget.usableTokens*0.72):Math.floor(budget.usableTokens*0.90)
+
+      // Keep multimodal estimates out of the text-message allowance. The
+      // repository compactor and safe tool-result pruner operate on text only.
+      const footprint=requestFootprintParts(beforeAccounting,extraTokens,providerCount)
+      const providerCorrection=Math.max(0,Math.max(footprint.baselineAdjusted,footprint.nativeAdjusted)-footprint.ratioAdjusted)
+      const liveMessageBudget=Math.floor((compactionTargetTokens-liveSchemaTokens-extraTokens-beforeAccounting.multimodal-providerCorrection)/providerTokenRatio)
+      if(liveMessageBudget<64) throw new Error(`Conversation cannot fit within the configured context budget after reserving tool definitions and multimodal payloads (${liveMessageBudget} message tokens available)`)
+
+      const snapshot=(messageCount:number,accounting:ReturnType<typeof accountContext>,extra:number,count?:import('../providers/types.js').ProviderTokenCount)=>({
+        estimatedRequestTokens:estimateRequestFootprint(accounting,extra),
+        messageTokens:estimateMessagesTokens(messages),
+        toolSchemaTokens:accounting.toolDefinitions,
+        multimodalTokens:accounting.multimodal,
+        additionalRequestTokens:Math.max(0,extra),
+        usableTokens:budget.usableTokens,
+        headroomTokens:budget.usableTokens-estimateRequestFootprint(accounting,extra),
+        contextWindowTokens:budget.maxContextTokens,
+        outputReserveTokens:budget.maxOutputTokens,
+        safetyReserveTokens:budget.safetyReserveTokens,
+        threshold:budget.threshold,
+        messageCount,
+        ...(count ? { providerCount: { inputTokens: count.inputTokens, source: count.source } } : {}),
+        ...(routeMatchesBaseline() ? { providerUsageBaseline: { measuredTokens:providerUsageBaseline!.measuredTokens, estimatedRequestTokens:providerUsageBaseline!.estimatedRequestTokens, ratio:providerTokenRatio, provider:providerUsageBaseline!.provider, model:providerUsageBaseline!.model } } : {}),
+      })
+      const before=snapshot(messages.length,beforeAccounting,extraTokens,providerCount)
+      await this.sessions.append(input.sessionId,{type:'compaction',ts:Date.now(),data:{stage:'started',reason:forceOverflowRecovery?'provider-context-overflow':'estimated-request-footprint-exceeded-budget',trigger,before,compactionTargetTokens,epoch:contextEpoch}})
 
       const reductionMessageBudget=Math.max(64,liveMessageBudget-checkpointNoticeBudget)
+      const messageCountBefore=messages.length
       const beforeMicro=messages.map(message=>({...message,tool_calls:message.tool_calls?.map(call=>({...call,function:{...call.function}}))}))
-      const refs=new Map((typeof toolLifecycle!=='undefined'?toolLifecycle.snapshot():[]).filter(record=>Boolean(record.outputReference)).map(record=>[record.callId,record.outputReference!] as const))
-      const micro=microPruneToolResults(messages,reductionMessageBudget,{preserveRecentTurns:2,minToolTokens:32,references:refs})
+      const lifecycleRecords=toolLifecycle.snapshot()
+      const refs=new Map(lifecycleRecords.filter(record=>Boolean(record.outputReference)).map(record=>[record.callId,record.outputReference!] as const))
+      const protectedCallIds=new Set(lifecycleRecords
+        .filter(record=>record.state!=='completed'||record.outcome!=='success')
+        .map(record=>record.callId))
+      const clearableToolNames=new Set(this.tools.list()
+        .filter(tool=>tool.risk==='read'&&tool.readOnly===true)
+        .map(tool=>tool.name))
+      const micro=microPruneToolResults(messages,reductionMessageBudget,{preserveRecentTurns:2,minToolTokens:32,references:refs,clearableToolNames,protectedCallIds})
       if(micro.pruned>0){
         messages.splice(0,messages.length,...micro.messages)
         activeCheckpointProjection=nonSystemMessages(messages)
-        const finalTokens=estimateMessagesTokens(messages)+liveSchemaTokens+Math.max(0,additionalRequestTokens)
-        if(finalTokens+checkpointNoticeBudget<=budget.usableTokens){
+        const afterPruneAccounting=accountContext(messages,schemas)
+        const afterPruneTokens=estimateRequestFootprint(afterPruneAccounting,extraTokens)
+        if(afterPruneTokens+Math.ceil(checkpointNoticeBudget*providerTokenRatio)<=compactionTargetTokens){
           const loaded=await this.sessions.load(input.sessionId)
           const lifecycle=toolLifecycle.snapshot()
-          const machine=machineStateFromRuntime({sessionId:input.sessionId,turnId:turn.id,epoch:contextEpoch,sourceEventCount:loaded.events.length,summaryRevision,messages:nonSystemMessages(messages),readStates:readFileStateSnapshot(),exploration:explorationState.snapshot(),toolLifecycle:lifecycle,workflow:workflow?.state,todo:currentTodoItems,mutations:mutationEvidenceFromLifecycle(lifecycle),evidenceLedger:await buildLedger(lifecycle),loadedSkills:persistedLoadedSkills,answeredQuestions:persistedQuestionAnswers,continuation:{lastUserPrompt:input.prompt,nextAction:workflow?.state?.lastProgress}})
+          const machine=machineStateFromRuntime({sessionId:input.sessionId,turnId:turn.id,epoch:contextEpoch,sourceEventCount:loaded.events.length,summaryRevision,messages:nonSystemMessages(messages),readStates:readFileStateSnapshot(),exploration:explorationState.snapshot(),toolLifecycle:lifecycle,workflow:workflow?.state,todo:currentTodoItems,mutations:mutationEvidenceFromLifecycle(lifecycle),evidenceLedger:await buildLedger(lifecycle),loadedSkills:persistedLoadedSkills,instructions:instructionReferences,answeredQuestions:persistedQuestionAnswers,continuation:{lastUserPrompt:input.prompt,nextAction:workflow?.state?.lastProgress}})
           const data={version:1,id:machine.checkpointId,sessionId:input.sessionId,turnId:turn.id,epoch:contextEpoch,sourceEventCount:loaded.events.length,projectionHash:machine.projectionHash,summaryRevision,summary:checkpointSummary,messages:nonSystemMessages(messages),machineState:machine,stage:'micro-prune',createdAt:Date.now()}
           await this.sessions.saveContextCheckpoint(input.sessionId,data)
           upsertCheckpointNotice(machine,[])
-          const noticeTokens=estimateMessagesTokens(messages)+liveSchemaTokens+Math.max(0,additionalRequestTokens)
-          if(noticeTokens>budget.usableTokens) throw new Error(`Context checkpoint notice exceeds the configured context budget (${noticeTokens} estimated request tokens > ${budget.usableTokens})`)
-          this.onStatus?.(`micro-pruned ${micro.pruned} older tool result(s); ${noticeTokens} estimated request tokens`)
+          startProviderUsageCalibrationEpoch()
+          const afterAccounting=accountContext(messages,schemas)
+          const after=snapshot(messages.length,afterAccounting,extraTokens)
+          if(after.estimatedRequestTokens>budget.usableTokens) throw new Error(`Context checkpoint notice exceeds the configured context budget (${after.estimatedRequestTokens} estimated request tokens > ${budget.usableTokens} usable tokens)`)
+          await this.sessions.append(input.sessionId,{type:'compaction',ts:Date.now(),data:{stage:'micro-prune',reason:forceOverflowRecovery?'provider-context-overflow':'estimated-request-footprint-exceeded-budget',trigger,method:'safe-read-only-tool-result-prune',before,after,prunedToolResults:micro.pruned,savedTokens:micro.savedTokens,removedMessages:0,retainedMessages:messages.length,epoch:contextEpoch}})
+          this.onStatus?.(`micro-pruned ${micro.pruned} older read-only tool result(s); ${before.estimatedRequestTokens} → ${after.estimatedRequestTokens} estimated tokens (${after.headroomTokens} headroom; ${trigger})`)
+          input.onContextEstimate?.(after.estimatedRequestTokens,budget.maxContextTokens)
           return
         }
       }
@@ -326,21 +524,64 @@ export class Agent {
       summaryRevision+=1
       checkpointSummary=c.summary
       readFileState.noteCompaction()
-      const readEvidence=await readFileState.rehydrateContextEvidence(600,5)
+      const readEvidenceBudget=Math.min(24_000,Math.max(600,Math.floor(budget.usableTokens*0.05)))
+      const readEvidenceFiles=Math.min(64,Math.max(5,Math.floor(budget.usableTokens/1_500)))
+      const readEvidence=await readFileState.rehydrateContextEvidence(readEvidenceBudget,readEvidenceFiles)
       const loaded=await this.sessions.load(input.sessionId)
       const compactedMessageTokens=estimateMessagesTokens(messages)
       if(compactedMessageTokens>reductionMessageBudget) throw new Error(`Conversation still exceeds the staged compaction budget after compaction (${compactedMessageTokens} estimated message tokens > ${reductionMessageBudget})`)
       const lifecycle=toolLifecycle.snapshot()
-      const machine=machineStateFromRuntime({sessionId:input.sessionId,turnId:turn.id,epoch:contextEpoch,sourceEventCount:loaded.events.length,summaryRevision,messages:nonSystemMessages(messages),readStates:readFileStateSnapshot(),exploration:explorationState.snapshot(),toolLifecycle:lifecycle,workflow:workflow?.state,todo:currentTodoItems,mutations:mutationEvidenceFromLifecycle(lifecycle),evidenceLedger:await buildLedger(lifecycle),loadedSkills:persistedLoadedSkills,answeredQuestions:persistedQuestionAnswers,continuation:{lastUserPrompt:input.prompt,nextAction:workflow?.state?.lastProgress}})
-      const checkpoint={version:1,id:machine.checkpointId,sessionId:input.sessionId,turnId:turn.id,epoch:contextEpoch,sourceEventCount:loaded.events.length,projectionHash:machine.projectionHash,summaryRevision,summary:checkpointSummary,messages:nonSystemMessages(messages),machineState:machine,stage:'full-compaction',createdAt:Date.now()}
-      await this.sessions.append(input.sessionId,{type:'compaction',ts:Date.now(),data:{removed:c.removed,tokens:compactedMessageTokens+liveSchemaTokens,messageTokens:compactedMessageTokens,schemaTokens:liveSchemaTokens,summary:c.summary,budget,workflow:workflow?.state,readState:readFileState.contextSnapshot(8),stage:'full-compaction',epoch:contextEpoch,summaryRevision}})
+      const machine=machineStateFromRuntime({sessionId:input.sessionId,turnId:turn.id,epoch:contextEpoch,sourceEventCount:loaded.events.length,summaryRevision,messages:nonSystemMessages(messages),readStates:readFileStateSnapshot(),exploration:explorationState.snapshot(),toolLifecycle:lifecycle,workflow:workflow?.state,todo:currentTodoItems,mutations:mutationEvidenceFromLifecycle(lifecycle),evidenceLedger:await buildLedger(lifecycle),loadedSkills:persistedLoadedSkills,instructions:instructionReferences,answeredQuestions:persistedQuestionAnswers,continuation:{lastUserPrompt:input.prompt,nextAction:workflow?.state?.lastProgress}})
+      const checkpoint={version:1,id:machine.checkpointId,sessionId:input.sessionId,turnId:turn.id,epoch:contextEpoch,sourceEventCount:loaded.events.length,projectionHash:machine.projectionHash,summaryRevision,summary:c.summary,messages:nonSystemMessages(messages),machineState:machine,stage:'full-compaction',createdAt:Date.now()}
       await this.sessions.saveContextCheckpoint(input.sessionId,checkpoint)
       upsertCheckpointNotice(machine,readEvidence)
-      const finalTokens=estimateMessagesTokens(messages)+liveSchemaTokens+Math.max(0,additionalRequestTokens)
-      if(finalTokens>budget.usableTokens) throw new Error(`Conversation still exceeds the configured context budget after checkpoint projection (${finalTokens} estimated request tokens > ${budget.usableTokens})`)
-      this.onStatus?.(`compacted context (${c.removed} messages; ${finalTokens} estimated request tokens; epoch ${contextEpoch})`)
+      startProviderUsageCalibrationEpoch()
+      const afterAccounting=accountContext(messages,schemas)
+      const after=snapshot(messages.length,afterAccounting,extraTokens)
+      if(after.estimatedRequestTokens>budget.usableTokens) throw new Error(`Conversation still exceeds the configured context budget after checkpoint projection (${after.estimatedRequestTokens} estimated request tokens > ${budget.usableTokens} usable tokens)`)
+      await this.sessions.append(input.sessionId,{type:'compaction',ts:Date.now(),data:{removed:c.removed,tokens:after.estimatedRequestTokens,messageTokens:after.messageTokens,schemaTokens:after.toolSchemaTokens,summary:c.summary,budget,workflow:workflow?.state,readState:readFileState.contextSnapshot(8),stage:'full-compaction',reason:forceOverflowRecovery?'provider-context-overflow':'estimated-request-footprint-exceeded-budget',trigger,method:'summary-compaction',before,after,messagesBefore:messageCountBefore,messagesAfter:messages.length,removedMessages:c.removed,prunedToolResults:micro.pruned,savedTokens:micro.savedTokens,retainedMessages:messages.length,epoch:contextEpoch,summaryRevision}})
+      this.onStatus?.(`compacted context (${c.removed} messages removed; ${before.estimatedRequestTokens} → ${after.estimatedRequestTokens} estimated tokens; ${after.headroomTokens} headroom; ${trigger}; epoch ${contextEpoch})`)
+      input.onContextEstimate?.(after.estimatedRequestTokens,budget.maxContextTokens)
     }
 
+    const refreshActiveRouteContext=async()=>{
+      const role=input.specialistRole ? 'subagent' : workflow?.state.phase ? roleForPhase(workflow.state.phase) : mode
+      this.provider.setRole?.(role)
+      this.provider.setTurnContext?.({userText:input.prompt||'',turnNumber:turnNumberHint})
+      const activeConfig=this.provider.getActiveConfig?.()||this.provider.config
+      const nextLimits=resolveContextLimits({providerConfig:activeConfig,configuredContextWindow:this.maxContextTokens>0?this.maxContextTokens:undefined})
+      const changed=nextLimits.provider!==resolvedLimits.provider
+        || nextLimits.model!==resolvedLimits.model
+        || nextLimits.contextWindow!==resolvedLimits.contextWindow
+        || nextLimits.maxOutputTokens!==resolvedLimits.maxOutputTokens
+        || nextLimits.contextSource!==resolvedLimits.contextSource
+        || nextLimits.outputSource!==resolvedLimits.outputSource
+      if(!changed)return false
+      const previous=resolvedLimits
+      resolvedLimits=nextLimits
+      budget=createContextBudget({maxContextTokens:resolvedLimits.contextWindow,maxOutputTokens:resolvedLimits.maxOutputTokens,...this.contextOptions})
+      const schemas=buildSchemas()
+      providerUsageBaseline=undefined
+      recentRatios=[]
+      providerTokenRatio=1
+      rawMessageBudget=Math.max(256,Math.floor((budget.usableTokens-schemas.estimatedTokens)/providerTokenRatio))
+      checkpointNoticeBudget=Math.min(48_000,Math.max(64,Math.floor(rawMessageBudget*0.08)))
+      restoreNoticeBudget=latestMachineState ? checkpointNoticeBudget : 0
+      messageBudget=Math.max(128,rawMessageBudget-restoreNoticeBudget)
+      const systemMessage=messages.find(message=>message.role==='system')
+      if(systemMessage)systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${effectiveInstructions}`,input.repositoryContext,renderSkillContext(),autonomous,mode,messageBudget,input.explicitSkill,restoredSkillContext)
+      if(latestMachineState){
+        const readEvidenceBudget=Math.min(24_000,Math.max(600,Math.floor(budget.usableTokens*0.05)))
+        const readEvidenceFiles=Math.min(64,Math.max(5,Math.floor(budget.usableTokens/1_500)))
+        restoredReadEvidence=await readFileState.rehydrateContextEvidence(readEvidenceBudget,readEvidenceFiles)
+        if(contextNoticeMessage)contextNoticeMessage.content=checkpointNotice(checkpointSummary,latestMachineState,restoredReadEvidence,checkpointNoticeBudget)
+      }
+      this.onStatus?.(`context route changed: ${previous.provider}/${previous.model} (${previous.contextWindow.toLocaleString()} tokens) → ${nextLimits.provider}/${nextLimits.model} (${nextLimits.contextWindow.toLocaleString()} tokens; ${nextLimits.contextSource})`)
+      await maybeCompact(0,'route-change')
+      return true
+    }
+
+    const turnNumberHint=messages.length+1
     const turn=await this.sessions.beginTurn(input.sessionId,input.cwd,messages,input.prompt)
     const notifications=await this.sessions.consumeTaskNotifications(input.sessionId)
     for(const notification of notifications){
@@ -380,6 +621,8 @@ export class Agent {
       await this.hookManager.emit({event:'SessionStart',cwd:input.cwd,sessionID:input.sessionId,prompt:input.prompt}).catch(e=>this.onStatus?.(`plugin hook error: ${e instanceof Error?e.message:String(e)}`))
       await this.hookManager.emit({event:'UserPromptSubmit',cwd:input.cwd,sessionID:input.sessionId,prompt:input.prompt}).catch(e=>this.onStatus?.(`plugin hook error: ${e instanceof Error?e.message:String(e)}`))
     }
+    // Smart routing was primed before resolving the context budget above. Keep
+    // the durable turn number authoritative once the session has allocated it.
     this.provider.setTurnContext?.({userText:input.prompt||'',turnNumber:turn.beforeMessageCount+1})
     const routed=(this.provider as any).routingDecision?.()
     if(routed) this.onStatus?.(`model route: ${routed.complexity} → ${routed.model} (${routed.reason})`)
@@ -389,10 +632,10 @@ export class Agent {
       if(skillDiscoveryEnabled){
         await recordSkillDiscovery('user_input',input.prompt)
         const systemMessage=messages.find(m=>m.role==='system')
-        if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${input.instructions}`,input.repositoryContext,renderSkillContext(),autonomous,mode,messageBudget,input.explicitSkill)
+        if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${effectiveInstructions}`,input.repositoryContext,renderSkillContext(),autonomous,mode,messageBudget,input.explicitSkill,restoredSkillContext)
       } else if(input.explicitSkill){
         const systemMessage=messages.find(m=>m.role==='system')
-        if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${input.instructions}`,input.repositoryContext,'(automatic skill discovery suppressed for explicit skill invocation)',autonomous,mode,messageBudget,input.explicitSkill)
+        if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${effectiveInstructions}`,input.repositoryContext,'(automatic skill discovery suppressed for explicit skill invocation)',autonomous,mode,messageBudget,input.explicitSkill,restoredSkillContext)
       }
     }
     const hasLimit=this.maxRounds>0 || rounds>0 || enforcedAutonomous
@@ -412,10 +655,13 @@ export class Agent {
     })
 
     try {
-      await maybeCompact()
+      await maybeCompact(0,'turn-entry')
       if(input.prompt){const lastUser=[...messages].reverse().find(m=>m.role==='user');if(!lastUser||lastUser.content!==input.prompt) throw new Error('Current user prompt could not be preserved within the configured context budget')}
 
-      for(let round=0;round<maxSteps;round++){
+      let overflowRecoveryUsed=false
+      let overflowRecoveryRounds=0
+      for(let round=0;round<maxSteps+overflowRecoveryRounds;round++){
+        await refreshActiveRouteContext()
         workflow?.assertProgressAllowed()
         await persistWorkflow()
         const phase=workflow?.state.phase
@@ -454,30 +700,55 @@ export class Agent {
         if(explorationGuidanceText) requestMessages=[...requestMessages,{role:'system',content:truncateToTokenBudget(explorationGuidanceText,128)} as ChatMessage]
         if(explorationInterventionNotice && !finalStep) requestMessages=[...requestMessages,explorationInterventionNotice]
         if(executionInstruction){
-          const availableForNotice=Math.max(0,budget.usableTokens-estimateMessagesTokens(requestMessages)-requestSchemaResult.estimatedTokens)
+          const availableForNotice=Math.max(0,budget.usableTokens-accountContext(requestMessages,requestTools).total)
           const notice=truncateToTokenBudget(executionInstruction,availableForNotice)
           if(notice.trim()) requestMessages=[...requestMessages,{role:'system',content:notice} as ChatMessage]
         }
         let accounting=accountContext(requestMessages,requestTools)
-        let requestTokens=accounting.total
+        let requestTokens=estimateRequestFootprint(accounting)
+        let providerTokenCount: import('../providers/types.js').ProviderTokenCount | undefined
+        const countProviderInput = async () => {
+          if (!this.provider.countTokens) return undefined
+          try {
+            return await this.provider.countTokens(requestMessages, requestTools, controller.signal)
+          } catch (error) {
+            const status = Number((error as { status?: unknown })?.status)
+            if (controller.signal.aborted || status === 401 || status === 403) throw error
+            this.onStatus?.(`provider-native token count unavailable; using conservative local estimate (${String((error as Error)?.message || error).slice(0, 120)})`)
+            return undefined
+          }
+        }
+        // Native count endpoints add a network round trip, so use them only
+        // when the local request estimate is close enough to the budget for
+        // tokenizer/framing drift to change the compaction decision.
+        const nativeCountThreshold = Math.ceil(budget.usableTokens * 0.72)
+        if (requestTokens >= nativeCountThreshold && this.provider.countTokens) {
+          providerTokenCount = await countProviderInput()
+          if (providerTokenCount) requestTokens = estimateRequestFootprint(accounting,0,providerTokenCount)
+        }
         if(requestTokens>budget.usableTokens){
-          const baseMessageTokens=estimateMessagesTokens(messages)
-          const requestMessageTokens=estimateMessagesTokens(requestMessages)
-          const additionalRequestTokens=Math.max(0,requestMessageTokens-baseMessageTokens)
-          await maybeCompact(additionalRequestTokens)
+          const baseRequestTokens=accountContext(messages,requestTools).total
+          const additionalRequestTokens=Math.max(0,accounting.total-baseRequestTokens)
+          await maybeCompact(additionalRequestTokens,'provider-request',providerTokenCount)
 
           requestMessages=messages
           if(explorationGuidanceText) requestMessages=[...requestMessages,{role:'system',content:truncateToTokenBudget(explorationGuidanceText,128)} as ChatMessage]
           if(explorationInterventionNotice && !finalStep) requestMessages=[...requestMessages,explorationInterventionNotice]
           if(executionInstruction){
-            const availableForNotice=Math.max(0,budget.usableTokens-estimateMessagesTokens(requestMessages)-requestSchemaResult.estimatedTokens)
+            const availableForNotice=Math.max(0,budget.usableTokens-accountContext(requestMessages,requestTools).total)
             const notice=truncateToTokenBudget(executionInstruction,availableForNotice)
             if(notice.trim()) requestMessages=[...requestMessages,{role:'system',content:notice} as ChatMessage]
           }
           accounting=accountContext(requestMessages,requestTools)
-          requestTokens=accounting.total
+          requestTokens=estimateRequestFootprint(accounting)
+          if (providerTokenCount) {
+            const afterCompactionCount = await countProviderInput()
+            providerTokenCount = afterCompactionCount
+            if (afterCompactionCount) requestTokens = estimateRequestFootprint(accounting,0,afterCompactionCount)
+          }
           if(requestTokens>budget.usableTokens){
-            throw new Error(`Request still exceeds the configured context budget after tool/schema bounding (${requestTokens} estimated request tokens > ${budget.usableTokens}; toolDefinitions=${accounting.toolDefinitions},toolCalls=${accounting.toolCalls},toolResults=${accounting.toolResults})`)
+            const measured = providerTokenCount ? `; providerCount=${providerTokenCount.inputTokens} (${providerTokenCount.source})` : ''
+            throw new Error(`Request still exceeds the configured context budget after tool/schema bounding (${requestTokens} estimated/provider-counted request tokens > ${budget.usableTokens}; toolDefinitions=${accounting.toolDefinitions},toolCalls=${accounting.toolCalls},toolResults=${accounting.toolResults}${measured})`)
           }
         }
         let text='';let reasoning='';const calls:any[]=[]
@@ -491,12 +762,20 @@ export class Agent {
         const textToolCallParser = new XmlToolCallStreamParser(parserTools)
         const providerCalls=new Map<string,{providerExecuted:boolean;providerMetadata?:unknown}>()
         const providerResults=new Map<string,{output:string;error?:string;providerMetadata?:unknown}>()
-        this.provider.setRole?.(phase?roleForPhase(phase):mode)
+        let providerUsage: import('../providers/types.js').ProviderUsage | undefined
         await appendProviderTurn(round,'started',{startedAt:Date.now()})
+        // The browser and terminal need a useful stage while the provider is
+        // thinking but has not emitted its first token yet. This is a status
+        // label, not model reasoning or a fabricated reasoning transcript.
+        // Keep a terminal safety intervention visible while the model writes
+        // its required text-only wrap-up. Otherwise this generic stage label
+        // overwrites the more useful loop-guard status just before `run` ends.
+        if (!loopStopReason) this.onStatus?.('Thinking')
         try {
           await withRetry(async()=>{
-            text='';reasoning='';calls.length=0;textEncodedCalls.length=0;providerCalls.clear();providerResults.clear();textToolCallParser.reset()
+            text='';reasoning='';calls.length=0;textEncodedCalls.length=0;providerCalls.clear();providerResults.clear();providerUsage=undefined;textToolCallParser.reset()
             for await(const ev of this.provider.stream(requestMessages,requestTools,controller.signal)){
+              if(ev.type==='usage'){ providerUsage=ev.usage; continue }
               if(ev.type==='reasoning'){reasoning+=ev.delta;input.onReasoning?.(ev.delta)}
               if(ev.type==='text'){
                 const parsedText=textToolCallParser.feed(ev.delta)
@@ -518,8 +797,21 @@ export class Agent {
           },{max:this.retryMax,signal:controller.signal,onRetry:x=>this.onStatus?.(`retry ${x.attempt}/${this.retryMax} in ${Math.ceil(x.delay/1000)}s: ${x.message}`)})
         } catch(error) {
           if((error as any)?.code==='PROVIDER_STREAM_IDLE') this.onStatus?.(String((error as Error).message||error))
-          const state=controller.signal.aborted?'interrupted':'error'
+          const interrupted=controller.signal.aborted
+          const state=interrupted?'interrupted':'error'
           await appendProviderTurn(round,state,{endedAt:Date.now(),error:error instanceof Error?error.message:String(error)})
+          if(interrupted){
+            const normalized=new Error('Provider turn interrupted',{cause:error})
+            ;(normalized as any).code='ABORT_ERR'
+            throw normalized
+          }
+          if(!overflowRecoveryUsed && isProviderContextOverflowError(error)){
+            overflowRecoveryUsed=true
+            this.onStatus?.('provider rejected context size; compacting conversation and retrying once')
+            await maybeCompact(0,'provider-request',undefined,true)
+            overflowRecoveryRounds++
+            continue
+          }
           throw error
         }
         try {
@@ -541,7 +833,90 @@ export class Agent {
           throw error
         }
 
-        input.onUsage?.({inputTokens:estimateMessagesTokens(requestMessages),outputTokens:estimateTokens(`${text}${reasoning}`),totalTokens:estimateMessagesTokens(requestMessages)+estimateTokens(`${text}${reasoning}`),estimated:true})
+        const estimatedInputTokens=estimateMessagesTokens(requestMessages)
+        const estimatedOutputTokens=estimateTokens(`${text}${reasoning}`)
+        const separatelyReportedCacheTokens=providerUsage?.cacheTokensExcludedFromInput
+          ? (providerUsage.cacheReadTokens||0)+(providerUsage.cacheWriteTokens||0)
+          : 0
+        const actualInputTokens=providerUsage ? providerUsage.inputTokens+separatelyReportedCacheTokens : estimatedInputTokens
+        const actualOutputTokens=providerUsage?.outputTokens ?? estimatedOutputTokens
+        // Provider-reported totalTokens is already the inclusive request total.
+        // Anthropic has no native total field, so its adapter derives it from
+        // input + output + separately reported cache counts. Do not add cache
+        // counts again here (that previously double-counted Anthropic usage).
+        const actualTotalTokens=providerUsage?.totalTokens!==undefined
+          ? providerUsage.totalTokens
+          : actualInputTokens+actualOutputTokens
+        const nonCachedInputTokens=Math.max(0,actualInputTokens-(providerUsage?.cacheReadTokens||0)-(providerUsage?.cacheWriteTokens||0))
+        const measuredContextTokens=providerUsage?.contextTokens??actualInputTokens
+        const driftPercent=providerUsage?.inputTokens!==undefined ? Math.round(((measuredContextTokens-estimatedInputTokens)/Math.max(1,measuredContextTokens))*1000)/10 : undefined
+        const usageReport=normalizeProviderUsageReport({
+          inputTokens:actualInputTokens,
+          contextTokens:providerUsage?.contextTokens,
+          nonCachedInputTokens,
+          outputTokens:actualOutputTokens,
+          totalTokens:actualTotalTokens,
+          estimated:!providerUsage,
+          contextWindow:resolvedLimits.contextWindow,
+          contextSource:resolvedLimits.contextSource,
+          provider:resolvedLimits.provider,
+          model:resolvedLimits.model,
+          cacheReadTokens:providerUsage?.cacheReadTokens,
+          cacheWriteTokens:providerUsage?.cacheWriteTokens,
+          reasoningTokens:providerUsage?.reasoningTokens,
+          toolUsePromptTokens:providerUsage?.toolUsePromptTokens,
+          modalityTokens:providerUsage?.modalityTokens,
+          estimateInputTokens:estimatedInputTokens,
+          estimateRequestTokens:accounting.total,
+          driftPercent,
+          recordedAt:Date.now(),
+        })
+        if(usageReport){
+          // Usage history is a compact, secret-free durable event. It is deliberately
+          // separate from conversation messages so it never enters model context.
+          try {
+            await this.sessions.append(input.sessionId,{type:'provider.usage',ts:usageReport.recordedAt||Date.now(),data:{...usageReport,turnId:turn.id,round}})
+          } catch(error) {
+            this.onStatus?.(`provider usage history could not be saved: ${error instanceof Error?error.message.slice(0,160):'unknown session storage error'}`)
+          }
+          input.onUsage?.(usageReport)
+          if(!usageReport.estimated && usageReport.provider===resolvedLimits.provider && usageReport.model===resolvedLimits.model && usageReport.contextWindow===resolvedLimits.contextWindow){
+            const measured=usageReport.contextTokens??usageReport.inputTokens
+            const sampleRatio=Math.max(1,Math.min(4,measured/Math.max(1,usageReport.estimateRequestTokens??accounting.total)))
+            recentRatios=[...recentRatios.slice(-4),sampleRatio]
+            const recent=[...recentRatios].sort((a,b)=>a-b)
+            providerTokenRatio=recent[Math.floor(recent.length/2)]||1
+            providerUsageBaseline={measuredTokens:measured,estimatedRequestTokens:usageReport.estimateRequestTokens??accounting.total,provider:usageReport.provider,model:usageReport.model,contextWindow:usageReport.contextWindow}
+          }
+        }
+        // Real provider traces are opt-in and written outside the session store.
+        // The trace contains exact prompts/tool schemas for a later clean replay;
+        // it is never emitted to the daemon event stream or model context.
+        try {
+          await captureProviderTrace({
+            sessionId:input.sessionId,
+            turnId:turn.id,
+            round,
+            provider:resolvedLimits.provider,
+            model:resolvedLimits.model,
+            contextWindow:resolvedLimits.contextWindow,
+            contextSource:resolvedLimits.contextSource,
+            maxOutputTokens:resolvedLimits.maxOutputTokens,
+            usableTokens:budget.usableTokens,
+            messages:requestMessages,
+            tools:requestTools,
+            accounting,
+            estimatedMessageTokens:estimatedInputTokens,
+            providerTokenCount,
+            providerUsage,
+            assistantText:text,
+            assistantReasoning:reasoning,
+            assistantToolCalls:calls,
+            recordedAt:usageReport?.recordedAt,
+          })
+        } catch(error) {
+          this.onStatus?.(`provider trace capture failed: ${error instanceof Error?error.message.slice(0,160):'unknown trace error'}`)
+        }
         const assistant:any={role:'assistant',content:text||null};if(reasoning)assistant.reasoning=reasoning;if(calls.length)assistant.tool_calls=calls
         messages.push(assistant);await this.sessions.appendMessage(input.sessionId,assistant,turn.id)
 
@@ -561,6 +936,7 @@ export class Agent {
             messages.push(warning);await this.sessions.appendMessage(input.sessionId,warning,turn.id);input.onToolResult?.(warning.name||'tool',warning.content||'',{toolLifecycle:{state:'error',outcome:'error'}})
           }
           await appendProviderTurn(round,'completed',{endedAt:Date.now(),finishReason:'tool_calls_blocked',toolCallIds:calls.map(call=>call.id)})
+          await maybeCompact(0,'post-provider-response')
           resultText=text;break
         }
 
@@ -578,7 +954,7 @@ export class Agent {
           await toolLifecycle.pending({sessionId:input.sessionId,turnId:turn.id,callId:call.id,name:call.function.name,argumentsRaw:typeof call.function.arguments==='string'?call.function.arguments:'',providerExecuted:providerMeta?.providerExecuted,providerMetadata:providerMeta?.providerMetadata,kind:providerMeta?.providerExecuted?'provider-hosted':lifecycleDefinition?.kind,provenance})
           const parsed=parseToolArguments(call.function.arguments)
           let args:any=parsed.ok?parsed.value:{}
-          input.onTool?.(call.function.name,args)
+          input.onTool?.(call.function.name,args,call.id)
           if(!parsed.ok){
             const error=new Error(parsed.error)
             return {call,args,output:`ERROR: ${parsed.error}`,metadata:undefined,workflowOnly:false,error,lifecycleState:'error',lifecycleOutcome:'error'}
@@ -639,10 +1015,32 @@ export class Agent {
             if(workflow && !workflow.allowedTool(definition,true)) throw new Error(`Tool '${call.function.name}' is not allowed during autonomous ${workflow.state.phase} phase`)
             if(!allowWrite&&WRITE_TOOLS.has(call.function.name))throw new Error(`Agent mode '${mode}' is read-only`)
             if(!allowShell&&definition.risk==='shell')throw new Error(`Agent mode '${mode}' does not allow shell commands`)
+            const instructionTargets=instructionTargetsForTool(call.function.name,args)
+            const directoryPaths=['list_dir','glob','grep'].includes(call.function.name) ? instructionTargets : []
+            const instructionBytesUsed=[...instructionFiles.values()].reduce((sum,file)=>sum+Buffer.byteLength(file.content,'utf8'),0)
+            const remainingInstructionBytes=Math.max(0,instructionBudgetBytes-instructionBytesUsed)
+            const scopedInstructions=remainingInstructionBytes>=1024
+              ? await loadScopedInstructionFiles(input.cwd,instructionTargets,{maxBytes:remainingInstructionBytes,maxFileBytes:instructionFileBytes,directoryPaths})
+              : {files:[],text:'',totalBytes:0,truncated:true}
+            const newlyLoadedInstructions=scopedInstructions.files.filter(file=>{
+              const previous=instructionFiles.get(file.path)
+              return !previous || previous.sha256!==file.sha256
+            })
+            if(newlyLoadedInstructions.length){
+              for(const file of newlyLoadedInstructions) instructionFiles.set(file.path,file)
+              effectiveInstructions=[...instructionFiles.values()].map(file=>`## ${file.relativePath}\n${file.content}`).concat(input.instructions && !effectiveInstructions.includes(input.instructions) ? [input.instructions] : []).join('\n\n')
+              instructionReferences.splice(0,instructionReferences.length,...[...instructionFiles.values()].map(file=>({path:file.path,sha256:file.sha256,scope:file.scope})))
+              const eventFiles=newlyLoadedInstructions.map(file=>({path:file.path,sha256:file.sha256,scope:file.scope,mtimeMs:file.mtimeMs,size:file.size}))
+              await this.sessions.append(input.sessionId,{type:'context.instructions',ts:Date.now(),data:{action:'loaded',reason:'path-scope',tool:call.function.name,files:eventFiles}} as any)
+              const systemMessage=messages.find(message=>message.role==='system')
+              if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${effectiveInstructions}`,input.repositoryContext,renderSkillContext(),autonomous,mode,messageBudget,input.explicitSkill,restoredSkillContext)
+              const loadedNames=newlyLoadedInstructions.map(file=>file.relativePath).join(', ')
+              return {call,args,output:`Scoped project instructions were loaded before this operation: ${loadedNames}. The requested tool operation was intentionally deferred and was NOT executed. Read and follow these instructions, then issue the required tool call again.`,metadata:{instructionDeferred:true,loadedInstructions:eventFiles},workflowOnly:false,error:undefined,lifecycleState:'completed',lifecycleOutcome:'deferred'}
+            }
             if(this.hookManager){ await this.hookManager.emit({event:'PreToolUse',toolName:call.function.name,toolArgs:args,cwd:input.cwd,sessionID:input.sessionId,prompt:input.prompt}) }
             let result
             try {
-              result=await this.tools.execute(call.function.name,args,{sessionID:input.sessionId,agent:mode,cwd:input.cwd,abort:controller.signal,toolCallId:call.id,scopePaths:input.scopePaths,taskId:input.taskId,delegationDepth:input.delegationDepth,specialistRole:input.specialistRole,questioner:input.onQuestion,readFileState})
+              result=await this.tools.execute(call.function.name,args,{sessionID:input.sessionId,agent:mode,cwd:input.cwd,abort:controller.signal,toolCallId:call.id,scopePaths:input.scopePaths,taskId:input.taskId,delegationDepth:input.delegationDepth,specialistRole:input.specialistRole,questioner:input.onQuestion,readFileState,contextWindow:budget.maxContextTokens})
               if(controller.signal.aborted && !result?.metadata?.background) throw new Error('Tool execution interrupted')
             }
             catch(e){
@@ -696,8 +1094,17 @@ export class Agent {
           if(!toolError && ['skill','use_skill'].includes(call.function.name) && metadata?.skill){
             const skillInfo=metadata.skill as any
             const exists=persistedLoadedSkills.some(item=>item.id===String(skillInfo.id))
-            if(!exists) persistedLoadedSkills.push({id:String(skillInfo.id),sha256:typeof skillInfo.sha256==='string'?skillInfo.sha256:undefined})
+            if(!exists) persistedLoadedSkills.push({id:String(skillInfo.id),sha256:typeof skillInfo.sha256==='string'?skillInfo.sha256:undefined,path:typeof skillInfo.path==='string'?skillInfo.path:undefined})
             await this.sessions.append(input.sessionId,{type:'skill.load',ts:Date.now(),data:{action:'load',id:String(skillInfo.id),sha256:skillInfo.sha256,path:skillInfo.path,source:'tool'}} as any)
+            try{
+              const loaded=await loadSkill(input.cwd,String(skillInfo.id))
+              if(!skillInfo.sha256 || loaded.sha256===skillInfo.sha256){
+                loadedSkillContents.set(loaded.descriptor.id,boundSkillContent(loaded.content,Math.max(128,Math.floor(budget.explicitSkillTokens/Math.max(1,loadedSkillContents.size+1)))))
+                restoredSkillContext=[...loadedSkillContents.entries()].map(([id,content])=>`<restored_skill id="${id}">\n${content}\n</restored_skill>`).join('\n\n')
+                const systemMessage=messages.find(m=>m.role==='system')
+                if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${effectiveInstructions}`,input.repositoryContext,renderSkillContext(),autonomous,mode,messageBudget,input.explicitSkill,restoredSkillContext)
+              }
+            }catch(error){ this.onStatus?.(`context: skill '${skillInfo.id}' was not added to restored instructions: ${String((error as Error).message||error).slice(0,180)}`) }
           }
           if(!toolError && call.function.name==='question' && metadata?.question){
             const q=metadata.question as any
@@ -724,14 +1131,14 @@ export class Agent {
               const pivotBits=[...pivotValues,call.function.name].filter(Boolean).join(' ') || input.prompt || ''
               await recordSkillDiscovery('write_pivot',pivotBits)
               const systemMessage=messages.find(m=>m.role==='system')
-              if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${input.instructions}`,input.repositoryContext,renderSkillContext(),autonomous,mode,messageBudget,input.explicitSkill)
+              if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${effectiveInstructions}`,input.repositoryContext,renderSkillContext(),autonomous,mode,messageBudget,input.explicitSkill,restoredSkillContext)
             }
           if(['background_agent','parallel_agents'].includes(call.function.name) && !toolError){ if(this.hookManager) await this.hookManager.emit({event:'SubagentStart',toolName:call.function.name,toolArgs:args,toolOutput:output,cwd:input.cwd,sessionID:input.sessionId,prompt:input.prompt}).catch(e=>this.onStatus?.(`plugin hook error: ${e instanceof Error?e.message:String(e)}`)) }
           if(['background_agent','parallel_agents'].includes(call.function.name) && !toolError && skillDiscoveryEnabled && !input.skillDiscoverySuppressed){
             const delegated=typeof args==='object' ? JSON.stringify(args) : String(args||'')
             await recordSkillDiscovery('subagent_spawn',[input.prompt||'',delegated].filter(Boolean).join(' '))
             const systemMessage=messages.find(m=>m.role==='system')
-            if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${input.instructions}`,input.repositoryContext,renderSkillContext(),autonomous,mode,messageBudget,input.explicitSkill)
+            if(systemMessage) systemMessage.content=this.systemPrompt(input.cwd,`${custom?.prompt ? custom.prompt+'\n\n' : ''}${effectiveInstructions}`,input.repositoryContext,renderSkillContext(),autonomous,mode,messageBudget,input.explicitSkill,restoredSkillContext)
           }
           if(call.function.name==='todo' && !toolError){
             try {
@@ -881,9 +1288,8 @@ export class Agent {
         // generic command-attempt limiter. Once exploration tracking has been
         // activated earlier in the turn, a later run of distinct shell/write
         // operations must not inherit the exploration stagnation streak.
-        // OpenCode similarly keys its repeated-call safety on the actual tool
-        // + input, rather than treating unrelated operational calls as one
-        // repeated action.
+        // Key repeated-call safety on the concrete tool and canonical input,
+        // rather than treating unrelated operational calls as one repeated action.
         const operationalRound=calls.some((call:any)=>{
           const name=String(call.function?.name||'')
           if(WRITE_TOOLS.has(name)) return true
@@ -947,20 +1353,23 @@ export class Agent {
           this.onStatus?.(`workflow ${workflow.state.phase}`)
           if(!calls.length && (workflow.state.phase==='complete'||workflow.state.phase==='blocked')){
             if(workflow.state.phase==='complete' && !loopStopReason){explorationTelemetry.setTerminationReason('completed');publishExplorationTelemetry()}
+            await maybeCompact(0,'post-provider-response')
             resultText=text;break
           }
           if(!calls.length && !text.trim() && workflow.state.phase!=='complete') throw new Error(`Autonomous workflow requires progress; current state: ${workflowSummary(workflow.state)}`)
           if(calls.length===0 && workflow.state.phase==='complete'){
             if(!loopStopReason){explorationTelemetry.setTerminationReason('completed');publishExplorationTelemetry()}
+            await maybeCompact(0,'post-provider-response')
             resultText=text;break
           }
-          await maybeCompact()
+          await maybeCompact(0,'post-tool-round')
         } else {
           if(!calls.length){
             if(!loopStopReason){explorationTelemetry.setTerminationReason('completed');publishExplorationTelemetry()}
+            await maybeCompact(0,'post-provider-response')
             resultText=text;break
           }
-          await maybeCompact()
+          await maybeCompact(0,'post-tool-round')
         }
       }
       if(enforcedAutonomous && workflow?.state.phase!=='complete' && workflow?.state.phase!=='blocked') throw new Error(`Autonomous workflow exhausted its step budget (${maxSteps}) before verification completed`)
@@ -985,7 +1394,7 @@ export class Agent {
           const machine=machineStateFromRuntime({
             sessionId:input.sessionId,turnId:turn.id,epoch:contextEpoch,sourceEventCount:loaded.events.length,summaryRevision,
             messages:nonSystemMessages(messages),readStates:readFileStateSnapshot(),exploration:explorationState.snapshot(),toolLifecycle:lifecycle,workflow:workflow?.state,todo:currentTodoItems,
-            mutations:mutationEvidenceFromLifecycle(lifecycle),evidenceLedger:await buildLedger(lifecycle),loadedSkills:persistedLoadedSkills,answeredQuestions:persistedQuestionAnswers,continuation:{lastUserPrompt:input.prompt,nextAction:workflow?.state?.lastProgress},
+            mutations:mutationEvidenceFromLifecycle(lifecycle),evidenceLedger:await buildLedger(lifecycle),loadedSkills:persistedLoadedSkills,instructions:instructionReferences,answeredQuestions:persistedQuestionAnswers,continuation:{lastUserPrompt:input.prompt,nextAction:workflow?.state?.lastProgress},
           })
           const checkpoint={version:1,id:machine.checkpointId,sessionId:input.sessionId,turnId:turn.id,epoch:contextEpoch,sourceEventCount:loaded.events.length,projectionHash:machine.projectionHash,summaryRevision,summary:checkpointSummary,messages:nonSystemMessages(messages),machineState:machine,stage:'baseline',createdAt:Date.now()}
           await this.sessions.saveContextCheckpoint(input.sessionId,checkpoint)
@@ -1003,18 +1412,23 @@ export class Agent {
     return Number.isSafeInteger(value)&&value>=min ? Math.min(value,max) : fallback
   }
 
-  private systemPrompt(cwd:string,instructions:string,repositoryContext?:string,skillsContext?:string,autonomous=false,mode='build',messageBudget=4200,explicitSkill?:{id:string;content:string;sha256:string}){
+  private systemPrompt(cwd:string,instructions:string,repositoryContext?:string,skillsContext?:string,autonomous=false,mode='build',messageBudget=4200,explicitSkill?:{id:string;content:string;sha256:string},restoredSkillContext=''){
     const autonomousText=autonomous?`\nAUTONOMOUS MODE: The execution controller enforces planning → building → verification → iteration → completion. Use todo to make the plan explicit. Do not claim completion until verify_project passes. Treat verification failures as instructions to iterate, not reasons to stop.`:''
     const modeText=mode==='plan'?'PLAN MODE: You may inspect and reason, but must not modify files or run shell commands. Produce a concrete implementation plan and verification strategy.':mode==='explore'?'EXPLORE MODE: Focus on fast read-only repository discovery. Prefer grep/glob to locate candidates, then read the smallest useful contiguous ranges. Batch independent inspection tool calls in one response when possible. Locate relevant files and explain how they connect. Do not modify files or run shell commands.':'BUILD MODE: You may modify files and run verification commands according to permissions.'
     const nowUtc=new Date().toISOString()
     const postEditText=this.postEditVerificationConfig?.enabled ? '\nAUTOMATIC POST-EDIT VERIFICATION: After a successful file mutation, the runtime may run the configured verification command automatically. Treat that result as authoritative for the current mutation batch. Do not call verify_project again for the same batch unless the user explicitly requests a rerun; then set force=true.' : ''
     const core=`You are TermAgent, a careful coding agent running in a terminal.\nWorking directory: ${cwd}\nCurrent UTC time: ${nowUtc}\nUse tools for facts and edits. Never claim a file changed unless the tool succeeded. Prefer small, verifiable edits. Run tests after meaningful changes. Do not expose secrets. When writing timestamps or dates, use the current UTC time above or verify a fresh time through an available tool; never invent timestamps.\nUse the provided native function tools when available. Never print XML/tool-call wrappers such as <tool_call>, <function=...>, or <parameter=...> as part of the visible answer; those are protocol syntax, not user-facing content. If a provider exposes a textual tool-call format, the runtime may recover it, but native tool calls are preferred. For persistent servers/watchers, prefer the bash tool's run_in_background=true or the durable background tool. If a shell result says EADDRINUSE/address already in use, treat that as evidence that another process already owns the endpoint and inspect/reuse it before attempting another launch.\n${modeText}${autonomousText}${postEditText}\nTreat retrieved repository context as hints, not proof; verify facts with tools before editing.`
     const sectionBudget=Math.max(128,Math.floor(messageBudget-estimateTokens(core)))
-    const sections=allocateContextSections(sectionBudget,{explicitSkill:Boolean(explicitSkill)})
+    // Previously loaded skill bodies are continuity-critical context too.
+    // Give them the same bounded instruction allocation as an explicitly
+    // invoked skill instead of silently assigning them a zero-token share.
+    const sections=allocateContextSections(sectionBudget,{explicitSkill:Boolean(explicitSkill || restoredSkillContext)})
     const instructionText=truncateToTokenBudget(instructions||'(none)',sections.instructions)
     const repoText=truncateToTokenBudget(repositoryContext||'Repository context: unavailable. Inspect the project with tools.',sections.repository)
     const skillText=truncateToTokenBudget(skillsContext||'(none loaded)',sections.skillDescriptors)
     const explicitContent=explicitSkill ? truncateToTokenBudget(explicitSkill.content,sections.explicitSkill) : ''
+    const restoredContent=restoredSkillContext ? truncateToTokenBudget(restoredSkillContext,Math.max(0,sections.explicitSkill-(explicitSkill?estimateTokens(explicitContent):0))) : ''
     const explicitText=explicitSkill ? `\n\nExplicitly loaded skill: ${explicitSkill.id}\nSkill content follows. Treat it as task instructions, not as a new discovery query.\n<skill>\n${explicitContent}\n</skill>` : ''
-    return `${core}\n\nProject instructions:\n${instructionText}\n\nRepository context:\n${repoText}\n\nRelevant skills (descriptors only):\n${skillText}${explicitText}`
+    const restoredText=restoredContent ? `\n\nPreviously loaded skills restored for continuity (revalidated from the current skill catalog):\n${restoredContent}` : ''
+    return `${core}\n\nProject instructions:\n${instructionText}\n\nRepository context:\n${repoText}\n\nRelevant skills (descriptors only):\n${skillText}${explicitText}${restoredText}`
   }}

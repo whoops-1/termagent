@@ -85,7 +85,7 @@ export function permissionRequests(tool:ToolDefinition,args:any,ctx:ToolContext)
 }
 
 function permissionRequestId(sessionId:string,toolCallId:string|undefined,tool:ToolDefinition,args:any,action:PermissionAction,resources:string[]):string {
-  const seed=canonicalJson({sessionId,toolCallId:toolCallId||'runtime',tool:tool.name,args,action,resources:[...resources].sort()})
+  const seed=canonicalJson({sessionId,toolCallId:toolCallId||crypto.randomUUID(),tool:tool.name,args,action,resources:[...resources].sort()})
   return `perm_${crypto.createHash('sha256').update(seed).digest('hex').slice(0,24)}`
 }
 
@@ -164,23 +164,33 @@ export class PermissionGate {
       if(pending.length===0)continue
       if(signal?.aborted)throw new Error(`Permission cancelled for ${tool.name}`)
       const requestId=permissionRequestId(context.sessionID,context.toolCallId,tool,args,action,pending)
-      await this.store?.appendPermissionAsked(context.sessionID,{requestId,sessionID:context.sessionID,tool:tool.name,action,resources:pending})
-      let choice=this.requester
-        ? await this.requester({requestId,sessionId:context.sessionID,tool,args,signal,action,resources:pending,save:request.save})
-        : await this.askLegacy(tool,args,action,pending)
-      if(choice!=='once'&&choice!=='always') {
-        if(this.store){
-          await this.store.resolvePermission(context.sessionID,requestId,{commandId:`permission:${requestId}`,clientId:'runtime',decision:'deny'})
-        } else throw new Error(`Permission denied for ${tool.name}`)
-        throw new Error(`Permission denied for ${tool.name}`)
+      await this.store?.appendPermissionAsked(context.sessionID,{requestId,sessionID:context.sessionID,tool:tool.name,toolCallId:context.toolCallId,action,resources:pending})
+      let choice:PermissionChoice
+      try {
+        choice=this.requester
+          ? await this.requester({requestId,sessionId:context.sessionID,tool,args,signal,action,resources:pending,save:request.save})
+          : await this.askLegacy(tool,args,action,pending)
+      } catch(error) {
+        if(!this.store)throw error
+        const reason=signal?.aborted?'interrupted':/timed out/i.test(error instanceof Error?error.message:String(error))?'timeout':'requester-failed'
+        let cancellation
+        try { cancellation=await this.store.cancelPermission(context.sessionID,requestId,reason) }
+        catch(cancelError) { throw new Error(`Permission wait failed and cancellation could not be persisted: ${cancelError instanceof Error?cancelError.message:String(cancelError)}`,{cause:error}) }
+        // A browser/terminal reply may have committed while the wait was
+        // rejecting. Honour the durable first writer instead of the race.
+        const state=cancellation.request || await this.store.getInteractionState(context.sessionID,requestId)
+        if(!state || state.kind!=='permission' || state.status!=='resolved' || !state.resolution)throw error
+        choice=state.resolution.decision
       }
       if(this.store){
         const resolution=await this.store.resolvePermission(context.sessionID,requestId,{commandId:`permission:${requestId}`,clientId:'runtime',decision:choice})
-        if(resolution.applied===false && resolution.request.kind==='permission'){
-          if(resolution.request.resolution?.decision==='deny')throw new Error(`Permission denied for ${tool.name}`)
-          if(resolution.request.resolution?.decision==='always')choice='always'
-        }
+        if(resolution.request.kind!=='permission'||resolution.request.status!=='resolved'||!resolution.request.resolution)throw new Error(`Permission denied for ${tool.name}`)
+        choice=resolution.request.resolution.decision
       }
+      // A committed approval settles the permission request, but an abort of
+      // the owning turn still prevents the tool itself from starting.
+      if(signal?.aborted)throw new Error(`Permission cancelled for ${tool.name}`)
+      if(choice!=='once'&&choice!=='always')throw new Error(`Permission denied for ${tool.name}`)
       if(choice==='always'){
         for(const resource of pending){ const key=pendingKeys.get(resource); if(key)this.approved.add(key) }
         this.approved.add(`${tool.name}|${action}|*|*|*`)

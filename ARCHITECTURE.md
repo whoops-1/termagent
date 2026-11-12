@@ -4,7 +4,28 @@
 
 TermAgent is a general-purpose coding-agent platform with a zero-dependency foundation. Mobile/Termux compatibility is a supported deployment target and portability requirement, not a ceiling on feature scope or architectural ambition. New capabilities should be evaluated on correctness, security, maintainability, extensibility, and value. Resource cost should be engineered and bounded where appropriate, but should not by itself be used to discard a mature, high-value capability.
 
-The architecture therefore prefers full semantic implementations with clean extension points over deliberately degraded feature subsets. Optional integrations such as LSP, Web View, VS Code, network tools, richer indexing, and advanced plugin capabilities may be layered onto the same core without changing the authoritative runtime model.
+The architecture therefore prefers full semantic implementations with clean extension points over deliberately degraded feature subsets. Optional integrations such as LSP, Web View, network tools, richer indexing, and advanced plugin capabilities may be layered onto the same core without changing the authoritative runtime model. VS Code remains a possible future host, but its Phase 15 implementation is discontinued/deferred indefinitely.
+
+## Runtime-state root and storage ownership
+
+The user-scoped runtime root is `~/.termagent/` (or an explicitly configured equivalent). It is not the source repository and must not be treated as one. Durable truth, derived caches, reconstructable artifacts, and diagnostics have different owners and retention rules:
+
+| Current path | Owner | State class | Notes |
+|---|---|---|---|
+| `sessions/<sessionId>.jsonl` | `SessionStore` | Durable | Canonical session event history and replay source. |
+| `snapshots/<sessionId>/` | `SnapshotStore` | Artifact / reconstructable | Private Git object store; its internal contents are Git-owned and opaque. |
+| `tasks/<taskId>.json` + `*.events.jsonl` | `TaskManager` / `TaskEventLog` | Durable | Task state and task event history; current layout is flat. |
+| `tool-output/` | `ToolOutputStore` | Artifact / referenced | Large outputs are referenced by `tool-output://` identities and have a bounded default retention policy. |
+| `repomap-cache/` | repository index | Derived | Rebuildable workspace index/cache; never durable session truth. |
+| `provider-traces/` | provider trace capture | Diagnostic / sensitive | Explicit opt-in; exact prompt/response content may contain secrets or personal data. Keep private and retention-bounded. |
+| `plugins/` | plugin registry/install layer | Durable + cache | Installation state, trust state and downloaded materializations have different lifecycles. |
+| `config.json`, `migrations.json` | config/migration layer | Durable | Preserve legacy global/project configuration compatibility during future migrations. |
+
+The 2026-11-12 comparison of the supplied OpenClaude and TermAgent runtime trees identified a useful upstream pattern: OpenClaude groups much of its session/task/agent state under project- and session-specific namespaces, while TermAgent currently keeps session JSONL files and task state/event files in flat roots. TermAgent already separates snapshots, tool output, repo-map cache, plugins, and provider traces by domain; the next improvement is consistent project/session scoping, centralized path policy, and explicit lifecycle/retention boundaries—not a wholesale copy of OpenClaude's schema.
+
+Future storage-layout work is assigned to Phase 17A, after Phase 14 closure and the selected Phase 16 work. Start with a central path resolver and project/session indexes while retaining current canonical session paths. Any later move of sessions or task records must be versioned, atomic, idempotent, lock-safe, restart-recoverable, and backward-compatible with flat legacy paths. Never delete an old path until the migrated record is verified. Do not move or shard files inside `snapshots/<sessionId>/` Git repositories; manage those repositories only at their enclosing session boundary. Keep user-created trace archives/exports outside the active application trace directory.
+
+Research record: `docs/research/OPENCLAUDE-TERMAGENT-RUNTIME-STORE-REVIEW-2026-11-12.md`.
 ## Phase 3 execution intelligence
 
 the corresponding module is the execution controller used by autonomous runs. It persists planning, building, verification, iteration, and terminal blocked/complete states through `SessionStore`, filters tools by phase, and requires a successful `verify_project` result before completion. Recovery is bounded by autonomous step, verification-failure, repeated-tool, and no-progress limits.
@@ -28,7 +49,7 @@ the corresponding module keeps the durable JSONL transcript unchanged while prod
 Repository intelligence and compaction stay Node-only and native-dependency free for ARMv7 Termux.
 ## Phase 4 application and service architecture
 
-Phase 4 establishes the application/runtime boundary independently of any one presentation surface. The terminal is a client of the runtime, not the owner of agent/session semantics. The same principle is used for future Web View and VS Code clients.
+Phase 4 establishes the application/runtime boundary independently of any one presentation surface. The terminal is a client of the runtime, not the owner of agent/session semantics. The same principle applies to the Web View and to any future host adapter; VS Code is not an active implementation target.
 
 ```text
                          Canonical Runtime
@@ -44,7 +65,7 @@ Phase 4 establishes the application/runtime boundary independently of any one pr
                   HTTP/JSON    SSE      future WS
                    /            |            \
                   /             |             \
-        Terminal Client     Web View Client    VS Code Client
+        Terminal Client     Web View Client    Future host adapter
           (ANSI/VT)          (HTML/CSS/JS)       (Webview)
 
 All clients submit semantic commands to the same runtime and receive the same
@@ -281,6 +302,29 @@ Trust approvals are bound to `registryId + skillId + source + version + sha256 +
 
 The catalog merges registry skills alongside project/global/plugin skills but keeps source provenance. the corresponding module performs a live revocation check, registry-install-root containment check, content security scan, and digest recheck immediately before returning a registry skill body to the agent. This preserves the Phase 4 descriptor-first discovery model while adding a remote, auditable distribution source.
 
+## 1.18.1 Phase 14H — model-aware context and durable memory continuity
+
+Phase 14H extends the existing context budget, repository intelligence, compaction checkpoint, instruction loader, skill catalog, and file-read cache. It does not introduce a parallel memory service. The active route resolves input context and output limits independently: explicit configuration overrides provider-profile values, then provider/model metadata, then a conservative 128K fallback whose source is surfaced in `/context`. Unknown endpoints are never assumed to support the largest marketed context window. The sample configuration no longer inserts a fixed 12K cap; a pre-existing explicit `maxContextTokens` setting remains an intentional user override until removed.
+
+Provider usage is normalized at the adapter boundary. OpenAI-compatible routes accept the standard Chat usage shape and common Responses-style aliases, including nested cached/reasoning detail fields and usage attached to a choice. Gemini reports prompt plus tool-use-prompt tokens as input, candidate plus thinking tokens as output, and retains cached-token and modality breakdowns as subsets/details; its provider total is authoritative. Anthropic reports uncached input separately from cache read/write input; streamed `message_start` and `message_delta` usage snapshots are merged right-biased, per-iteration billing counts are summed, and the final iteration's request context is kept distinct from aggregate turn billing. Cache subsets are added exactly once when calculating effective input. The CLI's `/context` command exposes latest provider usage, final-request context occupancy, tool-use-prompt counts, modality breakdowns, local estimate and drift. Each completed provider request writes a compact `session.provider.usage` durable event containing only bounded numeric usage fields and sanitized provider/model identifiers; it excludes API keys, endpoints, raw request bodies, and provider metadata. The latest valid report is restored when a session is resumed; fork switches to the child's own event history and does not inherit a usage measurement from a different branch. Conversation message projection remains unchanged. This is per-request history, not yet an aggregate analytics view. Anthropic and Gemini now expose optional provider-native input-count preflight through their existing adapters; the Agent invokes it only near the usable context threshold, compares it conservatively with the local estimate, and recounts after compaction. OpenAI-compatible routes and unsupported gateways retain local estimation. This is a native count API, not a universal local tokenizer. Complete image/audio/video request-cost and provider-specific hidden framing reconciliation remain follow-up work because the current canonical ChatMessage contract does not carry live media attachment parts. Usage from a failed stream attempt is discarded before retry so it cannot be mistaken for the successful request's accounting.
+
+The durable JSONL replay harness uses the existing `SessionStore` projection to audit compaction/checkpoint epochs, tool-call/result pairing, repeated exploration signatures, and summary-section retention. Replay exposed a summary-fitting omission; the fitter now protects all structural headings, selects content by section priority while preserving original order, and deduplicates repeated facts. A four-cycle continuity regression verifies objective, requirements, decisions, exact file references, active Todo, verification evidence, and atomic tool-call/result groups. A synthetic 1,000-module repository fixture checks graph extraction, focus prioritization, map bounds, and warm index reuse. Historical traces still lack provider usage and complete request payloads, so they cannot prove estimator drift or a clean A/B compaction improvement. See `docs/research/PHASE14H-REPLAY-ANALYSIS.md` and `docs/phases/PHASE14H-CONTEXT-MEMORY-INSTRUCTION-LOADING.md`.
+
+The context budget remains token-driven. `maxContextMessages` is deprecated and ignored; repository map/retrieval limits scale with model capacity while retaining separate hard caps for path counts, file counts, bytes, and prompt payload size. These are device/resource safety limits, not an artificial model-window ceiling. Provider-reported cache input tokens are counted in request occupancy. `/context` displays the sanitized selected endpoint, model/window and output sources, request estimate, usable/remaining capacity, compaction target, recent retention, component breakdown, and repository allocations.
+
+The adaptive request estimator anchors each request to the latest durable provider-measured usage and adds the estimated delta since that measurement, with a bounded median correction scoped to provider/model/context-window. Successful micro-prune and full compaction start a new calibration epoch: the old measured baseline and rolling samples are cleared, and the first request receives a one-request prior shrunk 75% toward a neutral ratio of 1. The next valid same-route provider measurement replaces that prior. Route changes clear calibration entirely. This 75% transition is supported by two supplied single-route chronological replay datasets but remains a validation candidate pending additional provider/device evidence; replay and experiment details are recorded in `docs/research/PHASE14H-CALIBRATION-EPOCHS-2026-11-12.md`.
+
+Normal compaction targets 90% of usable capacity to leave room for request growth and estimation uncertainty. Explicit provider context-overflow recovery uses a 72% target and retries only once. These policies remain subject to physical Termux/provider validation; an application preflight guard is not evidence of a provider-side overflow rejection.
+
+
+Staged micro-pruning is selective and operates only on the active prompt projection. It requires an older completed successful result, a registry declaration of both `risk: 'read'` and `readOnly: true`, and a valid durable `tool-output://<sha256>` reference. Shell/write outputs, failure/deferred/interrupted results, recent turns, and results that are not archived are retained verbatim. The replacement marker preserves tool/call identity and the full-output reference; the persisted SessionStore event and ToolOutputStore content are not deleted. Reapplying micro-pruning is idempotent.
+
+Context checkpoint state now restores bounded file-read coverage into the new per-turn `FileReadStateCache`. The restore path validates workspace/scope containment (including realpaths), file size and metadata, SHA-256 content identity, total line count, and resource budgets while streaming large files rather than loading them wholesale. Only previously read complete ranges are rehydrated, and prompt evidence is separately capped. Read coverage remains an optimization hint, never an authorization or correctness substitute.
+
+Hierarchical instructions continue to use the existing loader: global and ancestor instructions load at startup, nested instructions load only for relevant touched paths, and saved paths are revalidated against allowed roots on restoration. Loaded skills remain progressive-disclosure content; the prompt budget now explicitly allocates for a restored skill body even when no new explicit skill invocation is present. Skill IDs and digests are checked before restoration so changed content does not silently inherit stale instructions.
+
+Upstream adaptation: OpenCode's session compaction implementation informed staged history reduction, preserving a recent verbatim tail, structured work-state summaries, and the distinction between compacted prose and machine-owned state. OpenClaude's context compaction/restore path informed retaining the actual loaded skill instructions across compaction. LaudaCode's bounded AGENTS.md and descriptor-first skill behavior reinforced small, progressive instruction loading. TermAgent keeps its own state schema, checkpoint log, daemon ownership and mobile safety budgets.
+
 ## 1.18.0 Phase 11 — release hardening and migration
 
 Phase 11 closes the extension rollout with a non-destructive adoption layer, structured diagnostics, authoring references, and a full lifecycle fixture. the corresponding module normalizes legacy project and global config aliases into canonical `plugins` and `skillPaths`, records observed legacy roots and executable plugin files, creates a pre-migration config backup before changing a file, and persists idempotent migration records atomically in `~/.termagent/migrations.json`. Existing `.termagent/skills`, `.claude/skills`, and `.termagent/plugins` content stays in place and remains supported by the compatibility loaders.
@@ -333,7 +377,42 @@ text/native normalization
 
 ## Future Web View / multi-client presentation architecture
 
-Web View is a planned first-class client surface. It is not a second UI implementation of the terminal and must not be built by mirroring rendered ANSI output. The source of truth is the semantic runtime/session state and event stream; TerminalUI, Web View, and a future VS Code extension are independent projections of that state.
+Web View is a planned first-class client surface. It is not a second UI implementation of the terminal and must not be built by mirroring rendered ANSI output. The source of truth is the semantic runtime/session state and event stream; TerminalUI and Web View are independent projections of that state. The protocol remains presentation-independent for possible future hosts, but VS Code integration is not an active milestone.
+
+### Accepted runtime ownership decision — single daemon (Option A, 2026-11-01)
+
+The project owner selected one long-lived TermAgent runtime daemon. This decision is recorded in accepted ADR-019. The daemon owns the Agent loop, providers, ToolRegistry, PermissionGate waiters, SessionStore writes, TaskManager workers, active turn controllers and runtime event publisher. The terminal UI and browser Web View are clients of that daemon; they do not each construct a competing Agent for the same session. Future Telegram adapters are also daemon-owned clients/transports and never create a second agent engine.
+
+```text
+                    TERMAGENT DAEMON (single owner)
+ +-------------------------------------------------------------------+
+ | Agent / ProviderRouter / ToolRegistry / PermissionGate             |
+ | SessionStore / CommandLedger / TaskManager / active controllers    |
+ | SessionEventBus / interaction services / runtime scheduler        |
+ | NotificationService + outbox (planned Phase 17)                    |
+ +------------------------------+------------------------------------+
+                                |
+                  canonical commands + event stream
+              +-----------------+------------------+
+              |                 |                  |
+        HTTP + SSE        local IPC adapter    Telegram adapter
+          Browser          Terminal client     (planned Phase 17)
+```
+
+The daemon enforces an exclusive owner lock/lease with process identity and stale-owner recovery. A second runtime startup must attach to the existing daemon or fail clearly; it must not open another live writer against the same sessions. Durable JSONL events and monotonic sequence cursors remain truth. The in-daemon EventBus is only a wakeup mechanism; a client reconnect reconciles from the last durable cursor/snapshot. Cross-process event brokers are not required for the selected one-daemon topology and remain deferred unless multi-daemon operation is explicitly approved.
+
+The legacy standalone terminal workflow must remain supported, but a session must have exactly one active runtime owner. The local CLI's shared-runtime mode should connect through the canonical client/command contract, not a second Agent/PermissionGate/TaskManager. A local transport such as a Unix domain socket is allowed if it reuses the same versioned command and event schemas; HTTP/SSE remains the browser and remote-client contract.
+
+
+#### Phase 14F.1 owner implementation state
+
+`src/server/daemon-owner.ts` now implements the first owner-boundary slice. A canonical workspace path maps to a private owner record; both `server/index.ts:serve()` and the standalone `cli/repl.ts:start()` acquire it before creating runtime state. The lock records a random owner/token identity, PID, Linux process-start identity when available, mode and start time. A separate atomic metadata record tracks starting/ready/stopping state, heartbeat and the server endpoint. POSIX modes are `0700` for the daemon state directory and `0600` for lock/metadata files. Stale reclaim uses a short recovery guard and revalidates the recorded token; release also compares the token before deleting the owner. `/health` returns only the safe public projection, and `readDaemonOwner()` filters out stale process records.
+
+After an owner lease is acquired, startup scans sessions for that workspace. Pending permissions and questions are durably cancelled as orphaned, and unmatched started turns become `interrupted`; no synthetic success or automatic workspace rollback is created. The new durable `session.turn.interrupted` kind lets event consumers refresh their projections. The owner guard currently makes a competing standalone terminal or server invocation fail clearly. The TUI is not yet attached as a daemon client, so simultaneous terminal/browser runtime sharing is not claimed until the next 14F implementation slice. See `docs/phases/PHASE14F1-DAEMON-OWNERSHIP.md` and `docs/research/PHASE14F-UPSTREAM-DAEMON-OWNER-ADAPTATION.md`.
+
+### Future owner notifications and Telegram companion (planned Phase 17)
+
+Notifications are a runtime service, not a free-form platform API exposed to every model call. Canonical run/task/permission/runtime events create bounded notification intents. A durable outbox owns destination, deduplication, retry state, redaction, quiet hours and rate limits. Telegram is the first planned adapter and initially targets one explicitly paired private owner chat. The Telegram adapter uses the Bot API and maps any future inbound control messages into canonical daemon commands; it never owns sessions or permissions. See `docs/decisions/ADR-021-runtime-notifications-telegram-companion.md` and the Hermes research report.
 
 ### Core principle
 
@@ -349,8 +428,8 @@ Web View is a planned first-class client surface. It is not a second UI implemen
                         Client event model
                     /           |           \\
                    /            |            \\
-              Terminal       Browser       VS Code
-              renderer        renderer       Webview
+              Terminal       Browser       Future hosts
+              renderer        renderer       (deferred)
                    |             |             |
                    +-------------+-------------+
                                  |
@@ -365,7 +444,7 @@ Web View is a planned first-class client surface. It is not a second UI implemen
           abort/resume      tool approval       response
 ```
 
-The runtime is authoritative. A client never becomes a competing agent runner merely because it can display or control a session. Terminal and browser actions therefore converge on the same command handlers and durable state transitions.
+The single daemon runtime is authoritative. A client never becomes a competing agent runner merely because it can display or control a session. Terminal and browser actions therefore converge on the same command handlers and durable state transitions.
 
 ### Canonical session/runtime events
 
@@ -455,7 +534,7 @@ session metadata / agent / model
 plugin/MCP/skill activity and provenance
 ```
 
-TerminalUI continues to own ANSI/VT layout, raw input, picker geometry, and terminal-specific focus. Web View may render the same semantics using richer cards, panels, syntax highlighting, diff views, file trees, progress indicators, and responsive layouts. VS Code can reuse that browser-grade presentation inside a Webview while using the same runtime protocol.
+TerminalUI continues to own ANSI/VT layout, raw input, picker geometry, and terminal-specific focus. Web View may render the same semantics using richer cards, panels, syntax highlighting, diff views, file trees, progress indicators, and responsive layouts. A future host may reuse that browser-grade presentation through the same runtime protocol; VS Code work is deferred indefinitely.
 
 ### Shell lifecycle semantics
 
@@ -480,12 +559,13 @@ Runtime domain logic
         |
         +-- Transport adapters
              +-- local HTTP + SSE
-             +-- future WebSocket
+             +-- local IPC adapter (optional terminal transport)
+             +-- future WebSocket (deferred)
         |
         +-- Client adapters
              +-- terminal
              +-- browser Web View
-             +-- VS Code Webview
+             +-- Telegram adapter / notifications (planned Phase 17)
 ```
 
 No business logic should depend on Express-like request objects, browser APIs, DOM state, ANSI escape sequences, or a particular client. This keeps the same runtime usable from Termux, a local browser tab, a remote browser client, and an IDE integration.
@@ -511,9 +591,9 @@ The protocol should support heartbeats, explicit connection state, server-side s
 
 Local Web View may bind to a local interface by default, while remote access must be an explicit configuration choice. Authentication/authorization, origin checks, CSRF protection for browser-mediated state-changing requests, session scoping, and command idempotency belong in the transport/control plane. Browser code must never receive credentials or internal permission secrets that are unnecessary for presentation.
 
-VS Code integration should use the same authenticated local/runtime contract rather than creating a privileged second execution path inside the extension.
+Any future editor integration should use the same authenticated local/runtime contract rather than creating a privileged second execution path in an extension.
 
-### Future VS Code integration
+### Future editor integration (deferred; no active Phase 15 work)
 
 The intended path is:
 
@@ -529,13 +609,13 @@ TermAgent runtime
      browser-style TermAgent UI
 ```
 
-A later VS Code extension may provide launch/attach, workspace/session discovery, authentication to the local TermAgent instance, notifications, and panel lifecycle. It should not reimplement agent execution, permissions, tasks, or tool semantics.
+A future editor host may provide launch/attach, workspace/session discovery, authentication to the local TermAgent instance, notifications, and panel lifecycle. It must not reimplement agent execution, permissions, tasks, or tool semantics.
 
 ### Web View implementation blueprint
 
 The Web View design plan for Web View is documented in `docs/research/WEB-VIEW-RESEARCH.md` and is treated as part of the architecture contract. The first production seam is HTTP command submission plus a durable SSE event stream; WebSocket remains an optional transport over the same protocol.
 
-The current TermAgent server is not yet sufficient for that contract. the corresponding module currently implements SSE by polling the JSONL session file every 250ms, and question completion is held in a request-local `pendingQuestions` map. Those are acceptable transitional mechanisms for the current local API, but they are not the long-term multi-client synchronization model. Web View implementation must replace them with a runtime-owned event publisher, durable event sequencing, durable/reconstructible request state, and race-free replay-then-tail subscriptions.
+The Phase 14B baseline used a 250ms JSONL polling loop and request-local question completion. Later Phase 14C/14E work moved interaction state into the durable SessionStore and canonical command ledger; Phase 14F.1 added exclusive daemon ownership. Phase 14F.2 now tails durable JSONL from the last sequence with local EventBus wakeups plus a bounded one-second fallback poll, handles SSE response backpressure, and emits explicit transient-gap frames that trigger snapshot reconciliation. The remaining multi-client gap is terminal attachment to the daemon, not a second browser event publisher.
 
 The `SessionStore` remains append-only JSONL durable truth, and Phase 14A now persists an authoritative monotonic durable sequence in every newly appended event. Legacy records may be assigned a compatibility sequence during migration/read projection, but new public replay semantics must not depend on array offsets. Phase 14B will build the runtime publisher/subscriber around this sequence.
 
@@ -554,7 +634,7 @@ src/client      dependency-free protocol client
        |
   +----+----------------+
   |                     |
-src/cli              web/ / VS Code
+src/cli              web/ / future hosts
 ANSI renderer        independent projections
 ```
 
@@ -562,7 +642,7 @@ A permission/question answer is a command that resolves authoritative request st
 
 For browser authentication, the protocol should support authenticated fetch-based SSE rather than depending on the browser `EventSource` API when custom authorization headers are required. Browser pairing/session credentials must remain scoped and revocable, and provider credentials must never enter browser presentation state.
 
-The Web View application itself belongs outside the Node runtime source tree. `web/` may use an independent frontend toolchain or framework without adding those dependencies to the TermAgent runtime package. The VS Code extension belongs under `extensions/vscode/` and communicates with its Webview through the VS Code extension-host message API rather than allowing the Webview to own privileged runtime access.
+The Web View application itself belongs outside the Node runtime source tree. `web/` may use an independent frontend toolchain or framework without adding those dependencies to the TermAgent runtime package. A future VS Code extension, if the roadmap is reopened, belongs under `extensions/vscode/` and communicates through the extension-host message API rather than allowing a Webview to own privileged runtime access.
 
 ### Phase 14A implementation state
 
@@ -587,13 +667,13 @@ The following invariants are mandatory before Web View is considered production-
 6. Duplicate commands are idempotent where retry is possible.
 7. Stale/concurrent decisions converge deterministically.
 8. Replay + live tail has no event-loss race.
-9. Terminal/Web/VS Code never execute agent tools independently.
+9. Terminal/Web/future hosts never execute agent tools independently.
 10. Reconnect reconstructs state from durable truth.
 ```
 
-### VS Code integration posture
+### Future editor-host posture (deferred indefinitely)
 
-The eventual VS Code integration should provide both a native Chat Participant and, where richer UI is justified, a custom Webview. The native Chat Participant is the natural integration for conversational coding, while the custom Webview can expose TermAgent's richer tool/task/diff/session surfaces. The extension host remains the privileged bridge to the TermAgent runtime.
+If an editor integration is reopened in the future, it should use the canonical client/protocol and daemon APIs. A host may offer native chat or a custom Webview, but must remain a client and privileged bridge rather than own a second Agent runtime. No VS Code extension implementation or maintenance is scheduled in the active roadmap.
 
 ### ExplorationState and read-coverage projection
 
@@ -731,3 +811,86 @@ TermAgent keeps execution bookkeeping separate from semantic progress. Shell/tas
 The server exposes durable session events through a runtime-owned `SessionEventBus` plus `SessionStore` durable sequence reads. The bus is a bounded wakeup mechanism, not an event store: subscribers register before historical replay, durable commits mark the session dirty, and the stream re-queries persisted rows after each wake by sequence. This gives replay-then-tail handoff without a replay/sleep race while keeping durable storage authoritative.
 
 The event stream emits renderer-neutral durable envelopes and a `ready` frame containing the current durable sequence. A cursor ahead of the authoritative sequence is rejected explicitly. The `/snapshot` endpoint provides a reconstructible session/meta/message/interaction/context view for clients that need authoritative reconciliation after live-only data is missed.
+
+## Phase 14C — HTTP contract and dependency-free client
+
+Phase 14C exposes the canonical runtime through a stable HTTP contract without moving session truth into the HTTP layer. `src/server/http.ts` handles transport-only concerns (auth, request decoding, status/headers, JSON limits, SSE framing, and path/query conversion). `src/server/api.ts` adapts validated requests to existing runtime services and the durable command ledger.
+
+`src/protocol/api.ts` is the public route/data inventory and `src/protocol/types.ts` remains the canonical EventEnvelope/CommandEnvelope model. `src/client/client.ts` is deliberately dependency-free: it consumes only protocol types plus standard Fetch/Streams/Abort APIs, so a browser, Node process, test harness, or future editor integration can share the same client without importing TermAgent runtime modules.
+
+The public synchronization contract is durable session history plus the replay-then-tail durable event stream established in Phase 14B. The client tracks the latest durable sequence and reconnects explicitly with that cursor. Live-only events such as connection state and heartbeat never advance durable sequence state. Fetch-based SSE is used instead of `EventSource` because header-based authentication must work consistently.
+
+Command mutations preserve the existing `CommandLedger` idempotency/stale-state contract. Permission and question resolution continue to use the durable first-writer-wins state stored by `SessionStore`. The browser therefore becomes a consumer/commander of canonical semantic state instead of a scraper of terminal output.
+
+## Phase 14D browser Web View implementation
+
+`web/prototype/` is the unmodified supplied v4 prototype. `web/app/` is the production browser client that preserves the prototype's component placement and stylesheet while projecting runtime state. It imports the compiled dependency-free `TermAgentClient` and shared protocol helpers through allowlisted HTTP asset paths; it does not import Node runtime modules or use a separate browser-side session/execution store.
+
+The UI bootstraps from a session snapshot, uses the durable session cursor for reconnect/replay, renders transient live frames as provisional activity, and reconciles completed runs from persisted state. Static presentation assets may load without a bearer token, but health, runtime, session, command, and event data are protected by the configured local, legacy-token, or paired-device mode. Paired device tokens exist only in page memory. Phase 14E adds one-time pairing, hash-only device-token persistence, expiry/revocation, workspace and command scopes, Host/Origin and Fetch Metadata checks, JSON-only state changes, rate limits, and safe API projections. Cross-client convergence and exclusive runtime ownership remain Phase 14F.
+
+
+## 2026-11-01 architecture review — multi-client runtime and cloud readiness
+
+The source-level audit in `docs/research/TERMAGENT-ARCHITECTURE-ASSESSMENT-2026-11-01.md` records the Phase 14D checkpoint diagnosis. Phase 14E.1 closes its server-owned permission-wait defect, and Phase 14E implements the browser-facing security/pairing boundary. Terminal/browser attachment to one authoritative runtime remains a separate Phase 14F deliverable; physical Android and production-network validation remain open.
+
+### Permission resolver integration — Phase 14E.1
+
+The CLI continues to use its local `PermissionGate.setRequester()` adapter in `src/cli/repl.ts`. The server composition in `src/server/runtime.ts` now installs a server-owned requester that awaits `SessionStore.waitForInteractionResolution(sessionId, requestId, signal)`. `src/server/api.ts` remains a command adapter: browser decisions are committed through the existing canonical `SessionStore.resolvePermission()` path, not through an HTTP-owned promise. The runtime-local `SessionEventBus` wakes the waiter; it then re-reads the durable interaction projection and returns the first-writer decision to the exact `PermissionGate.check()` invocation already awaited by `ToolRegistry.execute()`. Consequently, an accepted browser Allow/Once/Always lets the original execution continue, and Deny blocks it, without a second stdin prompt.
+
+The waiter subscribes before reading durable state, races wakeup with timeout and `AbortSignal`, and re-reads the durable state after a timeout/abort wakeup so a decision committed by the first writer is not lost to a simultaneous cancellation. Pending waits are cancelled durably when the request is interrupted, times out, or its requester fails. The permission projection retains a cancellation reason. Runtime shutdown aborts in-flight turns and awaits their completion before closing MCP clients. The request ID uses a fresh random component when no provider tool-call ID exists, so independent direct calls with identical arguments do not collide.
+
+This integration deliberately reuses the canonical store and runtime-local wakeup bus rather than adding a second in-memory promise registry. It does not make the bus cross-process: Option A requires one daemon owner, enforced in Phase 14F.1 by the workspace lease. A graceful shutdown is covered; an abrupt process crash destroys the in-memory Agent continuation. After the new owner lease is acquired, startup recovery now marks pending permission/question requests as cancelled and unmatched started turns as interrupted. Do not sweep pending records while multiple unfenced runtimes may still be alive. The terminal is not yet attached as a daemon client; terminal/browser parity remains a 14F deliverable. See `docs/phases/PHASE14E1-PERMISSION-RESOLVER.md`.
+
+### Security, pairing, and remote access — Phase 14E
+
+`src/server/security.ts` owns the one-time pairing code, per-device bearer credentials, expiry, revocation, workspace association, and bounded audit history. Codes are single-use and short-lived; device tokens are high-entropy random values returned once to the browser and stored only as SHA-256 hashes in an owner-only auth-state file. The browser retains the token in memory and sends it in the Authorization header. No cookie or query-string credential is used. Revocation is persisted and rechecked on request boundaries, including periodic checks for long-lived prompt and SSE connections.
+
+`src/server/http.ts` keeps loopback as the default bind and rejects a non-loopback bind unless remote mode is explicitly enabled with TLS certificate/key and an HTTPS public origin. A reverse proxy may terminate TLS while TermAgent stays bound to loopback; it must preserve the public Host header. Host and Origin are checked exactly, cross-site Fetch Metadata is rejected, state changes require JSON, CORS is not enabled, and per-source request/mutation/pairing rate limits are applied. Forwarded client-IP headers are not trusted. Device command identity is derived from the authenticated device record, not browser-supplied IDs. Workspace/session/task ownership is checked by `createApi()`, while interaction and task mutations require their dedicated scopes.
+
+The data projection in `src/server/api.ts` allowlists model routing and variant settings, omits provider credentials and custom-agent prompt bodies, and redacts internal 5xx details from HTTP/SSE output. Static Web View assets remain public, but API/runtime data is authenticated in pairing mode. The current UI supports self-revocation; owner-facing revoke-other-device management is not included. The auth store is process-owned and must not be shared by unsupervised server instances before Phase 14F owner fencing.
+
+The upstream patterns and adaptation rationale are recorded in `docs/research/PHASE14E-UPSTREAM-SECURITY-PAIRING.md`; implementation and verification are recorded in `docs/phases/PHASE14E-SECURITY-PAIRING-REMOTE-ACCESS.md`.
+
+### Runtime ownership and event authority
+
+`SessionEventBus` is intentionally an in-memory wakeup mechanism attached to the daemon-owned `SessionStore`. JSONL remains the durable source of truth. The two-store probe demonstrated that a competing process does not notify the daemon's bus; under accepted Option A, that competing runtime is unsupported and must be prevented by the daemon owner lock rather than supported with a distributed event broker. `activeControllers` is process-local by design because the daemon is the only runtime owner; terminal/browser interruption must route through the daemon command API. Reconnects use durable sequence replay and authoritative snapshot reconciliation. Preserve the existing session turn lease and command idempotency/fencing.
+
+Phase 14F.2 hardens the browser tail without weakening this single-owner rule. `src/server/http.ts` waits for response drain before writing further frames, serializes heartbeat/auth checks with replay/live delivery, polls durable sequence at a bounded one-second interval as a fallback to in-process wakeups, and sends an explicit `gap` frame if the 128-frame transient buffer overflowed. The Web View then reconciles from `/snapshot`; the gap never advances the durable cursor. This fallback supports daemon-managed child workers that append durable records without sharing the parent EventBus, not a second runtime writer. See `docs/phases/PHASE14F2-DURABLE-SSE-RECONCILIATION.md`.
+
+### Local/cloud execution seam
+
+The shared agent engine remains the canonical orchestration layer. Before cloud execution, built-in filesystem and process tools need an explicit workspace execution interface with a local adapter and a future sandbox-backed adapter. `shell-command.ts`, task worker spawn paths, and plugin hooks currently inherit broad `process.env`; this is not an acceptable cloud secret boundary. A tool-level path check does not sandbox arbitrary shell processes. Cloud execution requires child environment allowlisting, secret separation, workspace filesystem/process isolation, resource limits and egress policy. See proposed ADRs 018–020.
+
+### Browser performance contract
+
+Retain HTTP/SSE unless measurements prove it inadequate. Instrument the end-to-end path before changing transport. Phase 14F.2 adds serialized SSE writes through Node's `drain` signal and explicit gap/snapshot reconciliation for the bounded live buffer. Remaining likely amplification points include request fan-out, durable-event-triggered full refresh, and full-feed `innerHTML` reconstruction on live deltas. See the performance sub-gate in `TODO.md`; no latency numbers are claimed by this review.
+
+### Roadmap choices
+
+- Phase 14 is reopened for permission runtime integration, secure pairing/remote access, single-daemon ownership, terminal/browser client parity, durable replay and real Android validation.
+- Phase 14G WebSocket is deferred pending measurement.
+- Phase 15 VS Code implementation is discontinued as an active milestone and deferred indefinitely; preserve generic API/client/protocol seams. Its former specification is retained in `docs/research/PHASE15-DEFERRED-SPEC.md`.
+- Phase 16 selected subphases are 16A, 16B, 16D, 16E and 16F. Phase 16C notebooks are deferred.
+- Phase 18 Cloud Edition is a future direction only, not authorized implementation work.
+
+
+## Single runtime daemon and client ownership
+
+Accepted on 2026-11-01 (Option A). `src/server/runtime.ts` composition becomes the daemon-owned runtime authority. Its `PermissionGate`, `TaskManager`, `SessionStore`, active turn controllers, provider instances and event publisher live for the daemon lifetime. Terminal and browser clients submit canonical commands through `src/client`/`src/protocol`; no client owns a second controller for the same session. Exclusive owner locking, startup discovery, graceful shutdown and stale owner recovery are Phase 14F requirements.
+
+A second independent process writing the same JSONL session or creating a second `SessionEventBus` is unsupported in this topology. The previously observed two-store missed-wakeup remains a valid characterization test for accidental duplicate owners, but Phase 14F should prevent this state rather than add a distributed event broker pre-emptively. Reconnect correctness continues to use durable sequence replay and authoritative snapshots.
+
+The Telegram design is intentionally separate from generic tools. `NotificationService` converts canonical runtime events or constrained owner notification intents into durable outbox records. `TelegramAdapter` sends only to the paired owner destination. It does not accept arbitrary recipient IDs from the model, does not hold provider credentials, and does not bypass permission/question interactions.
+
+
+### Terminal daemon-client convergence — Phase 14F.3
+
+`src/cli/repl.ts` now probes the workspace owner before constructing the standalone Agent runtime. If a ready server owner exists, the terminal attaches through `src/cli/daemon-client.ts`; it verifies `/api/info` and `/health` against the owner ID/PID/mode/state and confirms the canonical workspace path. A start race rechecks for the server owner after exclusive owner acquisition fails. The original standalone path remains when no server owns the workspace. Automatic terminal attachment is loopback-only; remote endpoint attachment is intentionally not inferred from the Web View's remote-access configuration.
+
+The attached terminal is an HTTP/SSE client built on the existing dependency-free `TermAgentClient`. Prompts enter the daemon-owned durable `SessionPromptQueue`; the server queue worker executes them using the daemon's Agent, provider, ToolRegistry, PermissionGate, SessionStore and active controllers. Terminal session, queue, turn-control, history, permission and question operations call the server API/command ledger. Durable JSONL event sequence remains the recovery cursor; transient live deltas are provisional. SSE gap detection fetches a canonical snapshot, and final durable assistant history replaces a partial/missing terminal stream prefix. Terminal device credentials are stored per workspace under `~/.termagent/devices/` with atomic writes and POSIX owner-only permissions; self-revocation removes both the server-side device grant and the local credential. The browser continues to keep its paired token in memory.
+
+The first daemon-client increment deliberately supports a smaller slash-command surface than the standalone REPL. Advanced provider/model configuration, plugin/marketplace/skills management, theme/effect customization and other standalone-only utilities are not yet fully exposed in attached mode. The existing TerminalUI is reused, but rich interactive TTY permission/question behavior and complete cross-client state parity still require interactive verification.
+
+Integration found a durable append race: a per-session global mutation-depth counter could allow unrelated async queue-worker work to be treated as nested under another command mutation, bypassing the store lease. `SessionStore` now uses `AsyncLocalStorage` to make nested-mutation ownership specific to the actual async call chain. `session.queue` schedules the daemon worker only after the `CommandLedger` transaction settles, preventing a worker append from racing the receipt append. This is a reentrancy fix, not a second lock or broker.
+
+OpenCode's registration/probe/ensure and CLI server-connection patterns informed this adaptation. TermAgent retains its workspace owner lease, workspace-scoped pairing, `TermAgentClient`, command ledger, and durable JSONL/SSE protocol. See `docs/research/PHASE14F3-UPSTREAM-TERMINAL-DAEMON-CLIENT-ADAPTATION.md` and the verification/limitations in `docs/phases/PHASE14F3-TERMINAL-DAEMON-CLIENT.md`.

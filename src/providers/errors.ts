@@ -55,3 +55,13 @@ export function parseRetryAfter(headers: Headers | ProviderErrorHeaders, now = D
 export function responseHeaders(response: Response): ProviderErrorHeaders {
   return Object.fromEntries(response.headers.entries())
 }
+
+/** Detect provider responses that explicitly reject the prompt for exceeding its context limit. */
+export function isProviderContextOverflowError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const value = error as { status?: unknown; code?: unknown; message?: unknown; responseBody?: unknown }
+  const status = Number(value.status)
+  if (![400, 413, 422].includes(status)) return false
+  const text = `${String(value.code ?? '')} ${String(value.message ?? '')} ${String(value.responseBody ?? '')}`.toLowerCase()
+  return /context[_ -]length[_ -]exceeded|maximum context(?: length)?|context window (?:is )?(?:exceeded|too small)|prompt (?:is )?too long|input (?:is )?too long|too many tokens|token limit (?:exceeded|reached)|request (?:exceeds|exceeded) (?:the )?(?:model )?context|prompt_too_long/.test(text)
+}

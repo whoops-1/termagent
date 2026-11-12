@@ -123,10 +123,15 @@ test('13G interruption settles started tools and leaves no pending/running lifec
   const root=await tmp();
   try {
     const { sessions, session }=await makeSession(root); const { registry }=await makeRegistry()
-    registry.add({name:'slow',risk:'read',description:'slow',schema:{type:'object'},async execute(_args,ctx){await new Promise(resolve=>{if(ctx.abort.aborted) return resolve();ctx.abort.addEventListener('abort',resolve,{once:true})});return {output:'aborted'}}})
+    let markStarted
+    const started=new Promise(resolve=>{markStarted=resolve})
+    registry.add({name:'slow',risk:'read',description:'slow',schema:{type:'object'},async execute(_args,ctx){markStarted();await new Promise(resolve=>{if(ctx.abort.aborted) return resolve();ctx.abort.addEventListener('abort',resolve,{once:true})});return {output:'aborted'}}})
     const provider={id:'mock',model:'mock',async *stream(){yield {type:'tool_call',call:{id:'slow-1',type:'function',function:{name:'slow',arguments:'{}'}}};yield {type:'done',finishReason:'tool_calls'}}}
-    const ac=new AbortController();setTimeout(()=>ac.abort('test'),50)
-    await assert.rejects(runAgent({root,sessions,session,provider,tools:registry,signal:ac.signal}),/Provider turn interrupted|interrupted/i)
+    const ac=new AbortController()
+    const running=runAgent({root,sessions,session,provider,tools:registry,signal:ac.signal})
+    await started
+    ac.abort('test')
+    await assert.rejects(running,/Provider turn interrupted|interrupted/i)
     const loaded=await sessions.load(session.id);const life=loaded.events.filter(e=>e.type==='tool.call'&&e.data.callId==='slow-1');assert.equal(life.at(-1).data.state,'interrupted');assert.equal(life.at(-1).data.outcome,'interrupted')
     assert.equal(life.at(-1).data.state==='pending'||life.at(-1).data.state==='running',false)
   } finally { await fs.rm(root,{recursive:true,force:true}) }
@@ -137,7 +142,7 @@ test('13G parallel-safe tools execute concurrently but tool results are persiste
   try {
     const { sessions, session }=await makeSession(root); const { registry }=await makeRegistry()
     let active=0,maxActive=0
-    for (const [name,delay] of [['one',100],['two',10],['three',20],['four',5],['five',1]]) {
+    for (const [name,delay] of [['one',300],['two',180],['three',140],['four',100],['five',1]]) {
       registry.add({name,risk:'read',parallelSafe:true,description:name,schema:{type:'object'},async execute(){active++;maxActive=Math.max(maxActive,active);await new Promise(r=>setTimeout(r,delay));active--;return {output:name}}})
     }
     const calls=['one','two','three','four','five'].map((name,i)=>({id:`p${i}`,type:'function',function:{name,arguments:'{}'}}))

@@ -622,7 +622,7 @@ A complete review of the implementation `0.10.0`  surfaced several practical pat
 
 **13N-F status:** `[verified]` at the provider reliability contract level. Typed HTTP errors now preserve status/headers/body and `Retry-After`; retries honor cancellation; SSE streams have a bounded idle watchdog; partial streamed output is never replayed automatically; provider metadata remains opaque; and reasoning options stay adapter-specific. Detailed notes: `docs/research/PHASE13N-F-PROVIDER-RELIABILITY.md`.
 
-**Context-budget note:** TermAgent defaults to `maxContextTokens=12000`. With the default `compactionThreshold=0.82`, `contextReserveTokens=768`, and the budget helper's default 2048 output reserve, the normal usable request budget is `9840 - 2048 = 7792` estimated tokens before compaction. the implementation instead derives its usable threshold from each model's provider metadata (`model.limit.input` or `model.limit.context`) and reserves output capacity dynamically; there is no equivalent global 12K ceiling in the model-aware overflow calculation. A future model-aware budget layer can expose the same separation between provider hard cap and TermAgent working budget without weakening deterministic local budgeting.
+**Context-budget note (corrected during Phase 14H):** the 14F6 source does not default `maxContextTokens` to 12,000. `environmentDefaults()` leaves it unset unless `TERMAGENT_CONTEXT_WINDOW` is supplied; the previous `.termagent-example.json` explicitly carried a 12,000-token cap, and a project/global config can retain that explicit override. The active Agent route now resolves the context window from explicit config, provider profile, provider/model `extra` metadata, or a labelled conservative fallback. Check `/context` for the actual source before attributing a particular session's limit. The old fixed `7792` usable-token calculation is not a valid current default.
 
 ### 13N-G — Specialist sub-agent hardening
 
@@ -708,9 +708,11 @@ A complete review of the implementation `0.10.0`  surfaced several practical pat
 - [ ] Structured UI/performance changes preserve the frozen Phase 12 contracts.
 - [ ] ARMv7/Termux evidence is real when the platform is touched.
 
-# Phase 14 — Web View and Multi-Client Runtime
+# Phase 14 — Runtime Reliability, Context, Provider Platform and Web View
 
-Web View is a first-class client of TermAgent's canonical runtime. It is not an ANSI mirror. The browser, terminal, and future VS Code integration must observe and mutate the same session state through semantic events and commands.
+Web View is a first-class client of TermAgent's canonical runtime. It is not an ANSI mirror. The browser, terminal, and future clients must observe and mutate the same session state through semantic events and commands. Phase 14 also closes reliability gaps exposed while using the runtime on a real repository: context capacity and compaction, instruction/skill continuity, background-agent orchestration, provider configuration, session-state locking, and live event delivery. These are shared-runtime concerns, not separate terminal-only or browser-only features.
+
+**Phase 14 status: REOPENED / P0 reliability work added.** Phases 14A–14E have host-side implementation and focused regression evidence, and Phase 14F.1/.2/.3/.4 have verified partial sub-gates for owner fencing, SSE reconciliation, terminal daemon attachment, and cross-client state projection. The session UI showed `ctx 5k/12k`, and the supplied example configuration previously contained a 12K `maxContextTokens` cap; the 14F6 source default itself does not hardcode 12K. An existing project/global `maxContextTokens` or `TERMAGENT_CONTEXT_WINDOW` override can still intentionally cap a route, so `/context` provenance and the effective config must be checked before attributing a particular session’s cap. The uploaded 759-event session records 50 compaction events, while child-agent failures are not reliably fed into an already-running parent turn, child provider credentials can be omitted when only an in-memory key exists, the session-state lease can exhaust its acquisition window, and tool events can be persisted but not become visible in the live Web View until reconnect. These findings reopen the relevant 14B/14F live-delivery validation and require the new 14H–14J work below. Phase 14 remains incomplete until these issues, full terminal/browser parity, cross-client interaction/cancellation and recovery, performance measurements, the repository-wide regression gate, and physical mobile/deployment validation are closed.
 
 ### 14A — Canonical event log and interaction model
 
@@ -737,167 +739,246 @@ Web View is a first-class client of TermAgent's canonical runtime. It is not an 
 - [verified] Add an authoritative session snapshot endpoint for reconciliation after missed live-only events, alongside the existing context endpoint.
 - [verified] Add reconnect/race regression coverage at the replay→tail handoff, cursor validation, and subscriber cleanup boundaries.
 
-**14B status:** `[verified]` runtime publisher/subscriber, replay→tail handoff, heartbeat/connection frames, cursor validation, snapshot reconciliation, reconnect behavior, and subscriber cleanup are covered by the focused 14A/14B/server regression set. The overall Phase 14 gate remains open because 14C+ and the separate 13N rollout/platform gates are not complete.
+**14B status:** `[reopened for live end-to-end validation]` The runtime publisher/subscriber, replay→tail handoff, heartbeat/connection frames, cursor validation, snapshot reconciliation, reconnect behavior, and subscriber cleanup have focused regression coverage. However, the user-observed Web View session did not display tool calls while the agent was running; those calls appeared after the agent was stopped and the runtime reconnected. The transport/reducer path must be traced end-to-end and proven live before this sub-gate can be considered closed. Existing focused tests remain useful evidence but do not override this production symptom.
 
 ### 14C — HTTP API and dependency-free client SDK
 
-- [ ] Refactor the corresponding module so route functions only adapt HTTP to canonical commands/services.
-- [ ] Define stable session, history, event-stream, permission, question, task, diff, context, and runtime-status endpoints.
-- [ ] Prefer durable history + durable event stream as the public synchronization contract.
-- [ ] Add a typed dependency-free client API in the corresponding module for all Web View operations.
-- [ ] Implement a fetch-based SSE reader with explicit auth headers and reconnect support; do not require browser `EventSource` when header-based auth is needed.
-- [ ] Keep the protocol usable without the browser and without VS Code.
-- [ ] Add schema/route drift tests.
+- [verified] Refactor the corresponding module so route functions only adapt HTTP to canonical commands/services.
+- [verified] Define stable session, history, event-stream, permission, question, task, diff, context, and runtime-status endpoints.
+- [verified] Prefer durable history + durable event stream as the public synchronization contract.
+- [verified] Add a typed dependency-free client API in the corresponding module for all Web View operations.
+- [verified] Implement a fetch-based SSE reader with explicit auth headers and reconnect support; do not require browser `EventSource` when header-based auth is needed.
+- [verified] Keep the protocol usable without the browser and without VS Code.
+- [verified] Add schema/route drift tests.
+
+**14C status:** `[verified]` implementation and focused HTTP/client regression gate. The stable plural checkpoint-create route was corrected after route-drift testing exposed the legacy singular-only handler. Phase 14C does not close the overall Phase 14 gate; browser implementation, security/pairing, two-way mirror verification, and the separate 13N rollout/platform gate remain open.
 
 ### 14D — Browser Web View application
 
-- [ ] Add the browser application under `web/` without coupling it to Node runtime modules.
-- [ ] Implement initial bootstrap/session discovery.
-- [ ] Implement transcript projection from canonical events/state.
-- [ ] Implement streaming assistant output from live events with durable completion reconciliation.
-- [ ] Implement tool cards, expandable tool input/output, paths, task state, reasoning/activity, and diffs.
-- [ ] Implement shared permission/question surfaces.
-- [ ] Implement session switching, new sessions, abort, resume, compact, undo/redo, task inspection, and other exposed commands.
-- [ ] Implement browser-local presentation state such as collapsed cards, scroll, panels, and responsive layout.
-- [ ] Add accessible keyboard navigation and responsive layouts without changing runtime contracts.
+**Status:** `[IMPLEMENTED; integration blocker closed by 14E.1; device validation open]`. The host-side browser application and focused rendering/client tests exist. Phase 14E.1 now connects the server-owned `PermissionGate` to the canonical durable interaction state, so browser Allow/Deny settles the exact wait awaited by the original tool execution; the server runtime no longer falls back to stdin for these requests. Physical Android/Brave behavior and live-provider interaction remain unverified. See `docs/phases/PHASE14E1-PERMISSION-RESOLVER.md` and the original source assessment for the pre-fix diagnosis.
 
-### 14E — Security, pairing, and remote access
+- [verified] Add the browser application under `web/` without coupling it to Node runtime modules.
+- [verified] Implement initial bootstrap/session discovery.
+- [verified] Implement transcript projection from canonical events/state.
+- [verified] Implement streaming assistant output from live events with durable completion reconciliation.
+- [verified] Implement tool cards, expandable tool input/output, paths, task state, reasoning/activity, and diffs.
+- [verified] Render permission/question surfaces from durable interaction state; Phase 14E.1 proves the browser decision resumes the original server-owned permission wait and the original tool call.
+- [verified] Implement session switching, new sessions, abort, saved-session resume, compact, undo/redo, task inspection/continuation, and exposed session commands.
+- [verified] Implement browser-local presentation state such as collapsed cards, scroll-follow, focus/theme preferences, panels, and responsive layout.
+- [verified] Add accessible keyboard navigation and responsive layouts without changing runtime contracts.
 
-- [ ] Keep local browser access as the default deployment mode.
-- [ ] Require explicit configuration to expose TermAgent beyond localhost.
-- [ ] Add authenticated browser pairing/bootstrap rather than embedding long-lived provider/session secrets into page source.
-- [ ] Add origin validation and CSRF protection for state-changing browser requests.
-- [ ] Scope credentials/commands to authorized workspaces and sessions.
-- [ ] Never send provider API keys, permission internals, filesystem secrets, or unrelated environment values to the browser.
-- [ ] Add duplicate-command, stale-command, expired-auth, origin, and replay security tests.
+**14D implementation notes:** the uploaded v4 prototype remains unchanged under `web/prototype/`; `web/app/` uses its exact stylesheet as the foundation and binds the layout to the existing typed client and durable event protocol. Focused verification is documented in `PHASE-14D-REPORT.md` and `docs/research/PHASE14D-WEB-VIEW.md`.
 
-### 14F — Two-way mirror verification
+### 14E — Security, pairing, and remote access (IMPLEMENTED; deployment validation open)
 
-- [ ] Open terminal and Web View on one session simultaneously.
-- [ ] Verify user messages, assistant responses, reasoning/activity, tool calls/results, Todo, tasks, diffs, permissions, and questions converge.
-- [ ] Resolve a permission from Web View and verify terminal convergence.
-- [ ] Resolve a question from terminal and verify Web View convergence.
-- [ ] Submit simultaneous conflicting decisions and verify one authoritative durable result.
-- [ ] Disconnect Web View during streaming and reconnect from the durable cursor.
-- [ ] Restart the Web View client without restarting TermAgent and reconstruct exact authoritative state.
-- [ ] Restart TermAgent and verify durable session reconstruction plus explicit active-run recovery behavior.
+**14E.1 status: `[verified]` permission resolver integration.** The server-owned gate awaits the canonical durable interaction state. Browser commands do not own a second promise: they commit through `SessionStore`, notify the runtime-local event bus, and settle the same wait that is already inside `PermissionGate.check()` / `ToolRegistry.execute()`. See `docs/phases/PHASE14E1-PERMISSION-RESOLVER.md`.
+
+- [verified] Wire the server `PermissionGate` requester to the same durable `SessionStore` interaction resolution that HTTP/browser clients use; remove the server fallback to interactive stdin for server-owned permission requests. Browser allow/deny settles the original tool-call wait.
+- [verified] Cover once/always/deny, first-writer-wins races, duplicate commands, stale/wrong-session IDs, timeout, cancellation/abort, graceful server shutdown and restart reconstruction, browser disconnect/reconnect, and concurrent requests at the 14E.1 integration boundary. Abrupt-crash orphan reconciliation remains deferred until 14F provides exclusive owner fencing.
+- [verified] Keep local browser access as the default deployment mode; refuse non-loopback binds unless secure remote authentication is explicitly configured.
+- [verified] Add one-time device pairing, opaque hashed device tokens, expiry, revocation, authenticated client identity, and workspace/session/task scopes.
+- [verified] Validate Host/Origin and state-changing request provenance; bearer-only Authorization avoids ambient-cookie CSRF, with Fetch Metadata, JSON-only mutations, no CORS, and no URL credentials.
+- [verified] Add request/mutation/pairing rate limits, pairing brute-force protection, command-scope authorization, bounded audit events, and safe error/log redaction.
+- [verified] Keep provider credentials, raw process environment, custom-agent prompt bodies, token hashes, and unrelated configuration values out of browser projections.
+- [verified] Security-test unauthenticated remote access, expired/revoked tokens, replay, wrong scope, bad Origin/Host, cross-site/CSRF-style requests, duplicate commands, and stale interactions.
+
+**14E implementation status:** the code-level permission, pairing, TLS/origin, bearer-token, expiry/revocation, workspace-scope, and command-scope requirements have focused host-side evidence. The combined Phase 14A–14E.1 plus server regression set passes 43/43; the production build, release-artifact verification, and package dry-run pass. The repository-wide test command remains not green because of the known `/auto` CLI assertion and the aggregate runner timeout; no full-suite pass is claimed. Physical Android/Brave and production-network deployment checks remain open. The Web View currently supports self-revocation; revoke-other-device administration is a documented limitation. Physical Android/Brave validation remains open. Phase 14F.1 now adds workspace owner fencing and post-lock restart interaction reconciliation. See `docs/phases/PHASE14E-SECURITY-PAIRING-REMOTE-ACCESS.md` and `PROGRESS.md`.
+
+### 14F — Two-way terminal/browser synchronization (REOPENED / P0; Option A ACCEPTED)
+
+**Runtime topology decision (2026-11-01):** the project owner selected **Option A — one long-lived TermAgent runtime daemon**. It is the only owner of Agent instances, active turn controllers, PermissionGate waiters, SessionStore writes, TaskManager workers, providers and the runtime event bus. Terminal and browser are clients. See accepted `ADR-019`.
+
+- [verified] Introduce the daemon lifecycle and exclusive workspace owner lease with process identity, local owner discovery, authenticated health/heartbeat metadata and stale-owner recovery. A second launch fails clearly with owner mode/PID/endpoint instead of silently creating a competing runtime. After acquiring the lease, startup reconciles orphaned pending permissions/questions and marks unmatched turns interrupted. See `docs/phases/PHASE14F1-DAEMON-OWNERSHIP.md`.
+- [verified, partial] The interactive terminal now attaches to a ready workspace daemon before constructing local Agent state; standalone mode remains available when no server owns the workspace. The daemon-client command catalog and rich TTY parity are still incomplete. See `docs/phases/PHASE14F3-TERMINAL-DAEMON-CLIENT.md`.
+- [verified, partial] Attached terminal prompts, queue operations, session operations, interactions and turn controls use the existing typed `TermAgentClient` command/event protocol over HTTP/SSE. Advanced standalone-only commands and full UI parity remain open.
+- [verified] The daemon remains the only live runtime writer; `SessionEventBus` is a wakeup mechanism and JSONL + monotonic sequence is durable truth. Queue worker execution is daemon-owned; no cross-process event broker was added.
+- [verified] Make SSE replay/tail recover from reconnect, slow consumers, write backpressure and live-buffer overflow; emit an explicit gap/reconciliation condition instead of silently dropping transient frames. Durable JSONL is replayed from the last sequence; a 1-second poll supplements process-local wakeups; live overflow emits a gap that triggers snapshot reconciliation. the durable session-event `writeSse()` path serializes writes through Node's `drain` signal. See `docs/phases/PHASE14F2-DURABLE-SSE-RECONCILIATION.md`.
+- [verified, partial] Terminal interrupt/cancel and abort use daemon API commands that reach the daemon-owned active controller. Full cross-client cancellation/race coverage remains open.
+- [ ] Open terminal and Web View on the same session simultaneously and verify messages, reasoning/activity, tool calls/results, Todo, tasks, diffs, queue, checkpoints, permissions, questions, metadata and run status converge.
+- [ ] Resolve permission from browser and question from terminal; verify both surfaces converge to the same durable winner. Verify terminal permission controls route through the same daemon interaction resolution.
+- [ ] Test two browsers plus terminal, duplicate commands, conflicting responses, queue edits, session switch, cancellation, daemon crash/restart, stale lock recovery and client attach/detach.
+- [ ] Disconnect Web View during streaming and reconnect from the last durable sequence; reconstruct state after browser and daemon restarts with explicit active-run recovery semantics.
+- [ ] Run physical Android/Brave/Chrome tests for keyboard, viewport, orientation, dialogs, scrolling, background/foreground, offline/online, network handoff and long transcripts.
+
+**14F exit criteria:** one enforced runtime owner; terminal and browser are clients of that owner; every client observes the same durable state; permission/question decisions are deterministic; cancellation reaches the owning daemon; reconnect and daemon recovery are documented and tested.
+
+**14F.1 implementation status — `[verified]` owner foundation only (2026-11-01):** `src/server/daemon-owner.ts` creates a workspace-keyed exclusive lease with a random owner/token identity, PID and Linux process-start identity, safe metadata registration, heartbeat, stale-owner recovery guard, and compare-before-release. `serve()` and the standalone REPL acquire the same lease before runtime construction. `/health` publishes the safe owner projection and endpoint. On fenced startup, `SessionStore.recoverOrphanedRuntimeState()` durably cancels stranded permission/question requests and records unfinished turns as `interrupted`. Eleven focused tests (10 owner tests + 1 server-owner integration test) and the TypeScript build pass. The terminal currently fails clearly when a server already owns the workspace; it is not yet a shared-runtime client. Phase 14F's terminal attachment, true simultaneous browser/terminal convergence, and device tests remain unchecked. Full report: `docs/phases/PHASE14F1-DAEMON-OWNERSHIP.md`; upstream adaptation: `docs/research/PHASE14F-UPSTREAM-DAEMON-OWNER-ADAPTATION.md`.
+
+
+**14F.2 implementation status — `[verified]` durable SSE/reconciliation sub-gate (2026-11-01):** `SessionEventBus` now reports timed wakeups and transient overflow; the SSE tail combines local wakeups with a 1-second durable JSONL poll, writes serially through response drain, and emits a `gap` frame when bounded live delivery drops frames. The Web View fetches a canonical snapshot on a gap without advancing its durable cursor from that frame. Upstream OpenCode V2 event-stream architecture was studied and adapted without adding a second feed abstraction or cross-process event broker. Focused event-stream/Web View tests pass 13/13; the full Phase 14A–14F focused set is recorded in `PROGRESS.md`. Terminal daemon-client attachment, shared command handling, full cross-client convergence and physical Android/Brave tests remain open. Report: `docs/phases/PHASE14F2-DURABLE-SSE-RECONCILIATION.md`; research: `docs/research/PHASE14F2-UPSTREAM-EVENT-STREAM-ADAPTATION.md`.
+
+**14F.3 implementation status — `[verified, partial]` terminal daemon-client convergence (2026-11-03):** `src/cli/repl.ts` now attaches to an existing ready server owner before local runtime construction; `src/cli/daemon-client.ts` uses the existing `TermAgentClient` for prompt queueing, sessions, queue controls, interruption/abort, history operations and durable SSE/live events. Daemon-owned queue workers execute attached terminal prompts. Terminal pairing persists a workspace-bound device credential atomically with POSIX 0700/0600 permissions; `/device revoke` revokes and removes it. Auto-attach is loopback-only. `SessionStore` now uses `AsyncLocalStorage` for async-chain mutation reentrancy, and queue execution is kicked after the command ledger transaction completes. Durable assistant history repairs incomplete transient streaming. The daemon-client command catalog remains smaller than the standalone REPL, and rich TTY permission/question flows, full UI parity, remote attachment, detach/restart recovery with live clients, two-browser coverage and physical Android/Brave validation remain open. Focused Phase 14A–14F suite: **63/63 PASS**; F3 + owner integration: **7/7 PASS**. `npm test` remains not green: the `/auto` integration assertion fails alone; a Phase 13G failure seen in the aggregate run passed on isolated rerun; aggregate run timed out at test 203 after 600s. Reports: `docs/phases/PHASE14F3-TERMINAL-DAEMON-CLIENT.md`, `docs/research/PHASE14F3-UPSTREAM-TERMINAL-DAEMON-CLIENT-ADAPTATION.md`.
+
+
+**14F.4 implementation status — `[verified, partial]` cross-client state convergence (2026-11-03):** `TerminalUI` now hydrates tool-call/result history by stable provider `callId`, and live/durable lifecycle updates reconcile concurrent same-name calls independently. The call ID is propagated through runtime activity/SSE and permission interaction projections so the terminal can associate a permission with its exact requesting tool call. A non-TTY attached terminal is passive and no longer auto-denies/cancels browser-owned interactions; failed interaction resolution remains retryable until durable state confirms settlement. Attached-mode `/diff`, task inspection, task cancellation, checkpoint/list/restore/branch commands use existing daemon APIs. New regressions cover call-ID hydration, passive-client question ownership and daemon diff/task/checkpoint/branch commands. Focused Phase 14 suite: **66/66 PASS**; build, distribution verification, version, browser syntax and package dry-run pass. Full repository test suite, rich interactive TTY parity, two-browser + terminal concurrency, client detach/reconnect and daemon crash/restart with live clients, and physical Android/Termux/Brave/Chrome validation remain open. Report: `docs/phases/PHASE14F4-CROSS-CLIENT-STATE-CONVERGENCE.md`; upstream adaptation: `docs/research/PHASE14F4-UPSTREAM-CLIENT-STATE-PROJECTION-ADAPTATION.md`.
 
 ### 14G — Optional WebSocket transport
 
-- [ ] Evaluate WebSocket only after HTTP/SSE semantics are complete.
-- [ ] Reuse the same command/event schemas; WebSocket must be a transport adapter, not a second protocol.
-- [ ] Use it only where bidirectional live traffic materially benefits from lower latency or richer connection semantics.
-- [ ] Preserve durable SSE/HTTP recovery semantics even when WebSocket is used.
+**Status: DEFERRED.** Do not implement WebSocket in the current roadmap. Keep HTTP/SSE as the authoritative transport. Reopen only if measured end-to-end profiling shows an interaction/throughput problem that batching, incremental rendering, backpressure, and reconnect changes cannot solve.
+
+### Phase 14 performance and mobile sub-gate
+
+Before transport changes, collect reproducible p50/p95 and sample counts for: prompt submit→ack, agent start→first event, provider first token→browser, tool start→result, permission click→agent resume, SSE publish→browser receipt, event receipt→DOM render, session switch→ready, and cancel click→execution stopped. Correlate timestamps with request/command/event IDs; never infer numbers from user perception.
+
+Then profile and address: repeated snapshot/status/Todo/queue/context/diff/task/checkpoint request fan-out; 160 ms durable-event refresh bursts; full transcript `innerHTML` reconstruction and repeated Markdown parsing on each text/reasoning delta; SSE `res.write()` backpressure; silent 128-frame live-buffer eviction; tab visibility/background reconnection; and incremental mobile rendering. Do not adopt WebSockets without benchmark evidence.
+
+### 14H — Model-aware context, memory continuity, and instruction loading
+
+**Purpose:** Remove TermAgent's artificial context ceiling and stop large-repository work from repeatedly rediscovering the same files. Extend the existing `context/budget.ts`, `context/state.ts`, `context/exploration.ts`, `context/evidence-ledger.ts`, `agent/compaction.ts`, `agent/compaction` checkpoint projection, instruction loader, and skill catalog. Do not replace these systems with a new memory subsystem.
+
+- [implemented; focused tests pass] Resolve the effective input context window and output-token limit from the selected provider + model + endpoint/route metadata. Precedence is explicit user override → provider-profile metadata → provider/model `extra` metadata → clearly labelled 128K conservative fallback. `/context` reports source provenance; catalog/route-backed metadata expansion remains part of 14J.
+- [implemented; focused tests pass] Remove the fixed 12K cap from the shipped example configuration and use route-aware capacity. The screenshot displayed `ctx 5k/12k`, but source inspection shows there is no global 12K default in `environmentDefaults()`; the prior example file explicitly carried `maxContextTokens: 12000`, and existing local config can still carry that intentional override. `/context` now identifies `user-config` and explains how to remove it. Actual route/catalog metadata coverage remains open. Note: 14F6 defaults `maxContextMessages`, `maxContextBytes`, `contextRecentTokens`, and `repoMapTokens` to `0`; these are not defaults of 80/36KB/3000/2600.
+- [partially implemented; component breakdown is visible in `/context`] Complete one request-budget calculation for system prompt, project instructions, repository map/retrieval, skill descriptors and loaded skill bodies, tool schemas, tool calls/arguments, tool results, prior summaries, recent messages, images/multimodal payloads, reasoning, output reserve, and provider-specific framing/overhead. Multimodal and adapter-specific costs still need authoritative accounting.
+- [implemented; focused tests pass] Normalize provider-reported usage for Anthropic, OpenAI-compatible Chat/Responses-style aliases, and Gemini. Cache/reasoning breakdowns remain subsets when the provider's input/output totals are inclusive; Anthropic's separately reported cache counts are added to effective input exactly once. `/context` exposes the latest provider report and estimate drift for the current process. Anthropic and Gemini now have optional provider-native input-count preflight on near-budget requests; OpenAI-compatible routes and unsupported gateways retain local estimation. This is not a universal tokenizer, and exact media payload/framing overhead remains open. Sanitized per-request usage is persisted as a durable provider event and restored into `/context` when a session is resumed (forks use the child's own history and do not inherit a parent measurement); a session-scoped durable aggregate is now exposed through the existing context snapshot and terminal/Web View `/usage` surfaces. The aggregate separates provider-reported and estimated requests, preserves inclusive token totals, reports cache/reasoning/tool-use breakdowns and weighted estimator drift, bounds route cardinality, and deliberately does not guess pricing. Workspace-wide aggregation and clean-equivalent drift replay remain open. A failed provider retry discards usage from the failed attempt.
+- [partially implemented] Context and repository allocations use the resolved model window, output reserve is resolved separately, and physical payload/file/path caps remain independent safety limits. Audit every compaction threshold, recent-turn reserve, instruction/skill/schema share, and route-specific overhead at small, medium, 500K, and 1M windows before calling the scaling policy complete.
+- [implemented] `maxContextMessages` is deprecated and ignored; the source has no active history-trimming consumer. Retain whole turns and valid assistant-tool-call/result groups, and compact based on the effective request budget.
+- [partially implemented; focused tests pass; physical Termux validation open] Automatic compaction uses the complete `accountContext()` request estimate plus the latest durable provider-measured context anchor and an estimate of content added since that measurement. New provider usage events retain `estimateRequestTokens`; older records remain compatible through the message-estimate/schema fallback. A bounded median correction uses up to five recent samples for the exact provider/model/context-window route and never changes a global tokenizer multiplier. Successful micro-prune/full compaction now starts a new calibration epoch: clear the previous measured baseline and rolling samples, then warm-start the first request with a 75%-toward-prior ratio; the first new same-route usage measurement replaces that prior. Route changes still clear calibration completely. Two chronological Mercury-3 datasets (110 and 70 captures) show lower mean/P95 absolute replay error for this decayed prior than either full carry or full reset, but both are single-route and usable-budget misses remain; keep this policy under validation. Native Anthropic `messages/count_tokens` and Gemini `:countTokens` preflight remains available near 72% of usable capacity and the compacted request is recounted. Final/no-tool response branches now run the post-provider-response compaction hook before returning Ready. UI local/recomputed context figures carry `~`; provider-reported usage stays unmarked. OpenAI-compatible routes without native count rely on durable measured baselines after the first successful response. Exact wire framing, media attachment accounting, provider-specific hidden framing and physical provider verification remain open. Explicit provider overflow recovery remains one bounded compact-and-retry attempt for 400/413/422 context-limit responses.
+- [partially implemented; focused tests pass] Improve compaction quality and continuity. The fitted summary retains all 11 structural headings, preserves original bullet/section association, prioritizes current state, deduplicates repeated facts, and keeps tool-call/result groups atomic. A four-cycle test verifies objective, requirements, decisions, exact file references, active Todo, verification evidence, budget, and complete tool units. Broader machine-state and real-trace multi-cycle audits remain open.
+- [partially implemented; selective micro-prune implemented and tested] Summary fitting now uses section-aware prioritization, all structural headings, original line order, recent evidence, and duplicate suppression. Safe micro-pruning now removes only old successful archived read-only results while retaining a durable output reference; broader transcript-shortening levels and hierarchical summary merging still need validation against very long histories.
+- [implemented; focused tests pass] Restore bounded read coverage into the next `Agent.run` from durable context checkpoints, revalidate current content by streaming SHA-256 plus scope/realpath/stat/line-count checks, and rehydrate only previously inspected ranges within a small prompt-evidence budget. Existing exploration/evidence/workflow/task projections are restored from machine state. Broad repository index cache warm-recovery and daemon recovery stress tests remain open.
+- [implemented; focused tests pass] Repository map/retrieval allocations already scale with the resolved model window and retain independent resource ceilings (map ≤64K tokens/800 paths; retrieval ≤48K tokens/192KB/24 files, with per-file byte bounds). Explicit `repoMapTokens`/`maxContextBytes` overrides remain available. [ ] Add large-repository stress/quality coverage for prioritization, symbol/reference coverage, pagination, and index warm-recovery; do not remove mobile payload safety caps or dump the entire repository.
+- [partially implemented] The existing bounded `ExplorationStateSnapshot` is persisted in context machine state and restored at the next `Agent.run`; it tracks discovered paths, inspected ranges/file identity, search signatures/results, symbols, verification facts, and progress. The evidence ledger separately preserves verification, task, mutation, and file evidence. Still audit whether dependency edges and durable output references are adequately connected to the working set, and prove no broad scan repeats after daemon restart/compaction.
+- [implemented; focused tests pass] Existing hierarchical loader resolves global and root-to-workspace instruction files, then discovers nested instruction scopes for paths actually touched and persists their references. Restored paths are realpath-checked against workspace/global roots. Full ancestor precedence/conflict diagnostics, multi-agent scope tests, and large nested-tree stress remain open.
+- [implemented; focused tests pass] Keep existing descriptor-first/progressive-disclosure loading. Persist loaded skill IDs/digests/paths and restore unchanged skill bodies after a new Agent.run/compaction; restored skill content now receives its explicit-skill context allocation even without a fresh explicit invocation. Preserve security/provenance checks; large skill catalogs and near-budget restoration remain open.
+- [partially implemented] The four-cycle fixture exercises repeated compaction with oversized multi-turn inputs, and a separate 10,000-module fixture covers 10,002 repository paths, graph extraction, prioritization, bounded rendering, and warm-index reuse. Still add >80-message histories, multiple tool-schema sizes, nested `AGENTS.md` trees, explicit skills and near-budget combinations at several model windows, then verify memory bounds on Termux.
+- [implemented; focused tests pass] Add opt-in, local provider-request trace capture at the existing `Agent.run()` → provider adapter boundary and an offline estimator replay analyzer. Captures preserve exact request messages/tool schemas, normalized provider usage, optional native input count, route/window provenance, estimator breakdown, and response/tool-call data; request hashes are verified before replay. Capture is disabled by default, writes atomic `0600` files in a `0700` directory, rejects records over 32 MiB, and never serializes provider configuration credentials or endpoint config. Exact prompt/response content is intentionally retained for token comparison and may itself contain pasted secrets or personal data; operators must keep traces private and review before sharing. The analyzer reports usage presence but cannot independently attest live provider origin. Two user-supplied Mercury-3 datasets are paired with durable session logs: 110/110 and 70/70 exact request/event matches, three and two completed compactions respectively. The 70-capture run contains two 84K usable-budget crossings and is accompanied by a screenshot of the application preflight guard at 84,100 > 84,000 after tool/schema bounding. The shadow replay compares carry/reset/decayed epoch policies; 75%-toward-prior decay gives the best mean/P95 absolute error across these two datasets, but both remain single-route and still show budget-crossing misses. See `docs/research/PHASE14H-REPLAY-ANALYSIS.md`, `docs/research/PHASE14H-CALIBRATION-EPOCHS-2026-11-12.md`, and `tools/phase14h-provider-trace-replay.mjs`.
+- [implemented; regression tests pass] Reconcile dedicated durable `provider.usage` records in `tools/phase14h-session-replay.mjs` using the existing `aggregateProviderUsageEvents()` helper. Preserve compatibility with legacy usage embedded in `provider.turn`, avoid counting both representations for the same turn/round, and validate round identifiers without null/blank-to-zero coercion. The user-supplied 136-event session now reports 11/11 provider rounds with usage, 17/17 tool-result pairs and 3 baseline checkpoints; it has no compaction event and does not close the clean-equivalent compaction A/B gate. Single-route estimator drift is diagnostic only; do not apply a global multiplier. See `docs/research/PHASE14H-REPLAY-ANALYSIS.md`.
+- [implemented; regression tests pass] Fix the provider-measured compaction gap using OpenCode's measured-plus-estimated compaction anchor pattern and OpenClaude's explicit output/headroom and failure-guard principles. The current `Agent.run()` reuses durable `provider.usage` reports, estimates only the delta since the latest report, uses a bounded route/model/window-specific correction from up to five samples, and performs compaction after final/no-tool responses before returning Ready. Old usage records remain compatible; route switches invalidate the baseline. Add `estimateRequestTokens` to new durable reports and mark reconstructed UI usage with `~`. Regression tests cover resumed OpenAI-compatible sessions and oversized final responses. The second supplied 1,024-event log has 90/90 provider-usage records and 0 compactions; replaying it is diagnostic only and does not itself validate the patched runtime. Upstream: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/compaction.ts and https://github.com/Twigpine/openclaude/blob/main/src/services/compact/autoCompact.ts.
+- [implemented; focused regression tests pass; real provider rejection unverified] Add bounded first-request overflow recovery at the existing provider stream boundary. Classify only explicit context-limit failures on HTTP 400/413/422, force one compact to a 72% usable-budget target, persist `provider-context-overflow` compaction events, and retry the request once using the compacted history. A second overflow is surfaced instead of looping; unrelated 400s, auth/rate-limit errors and cancellation do not enter this path. Reuse the existing `ProviderHttpError`, `Agent.run()` retry flow, `maybeCompact()`, and `compactMessages()`; no second retry or compaction subsystem. Upstream review: OpenClaude `autoCompact.ts` forced overflow reason and failure-cooldown design plus `compact.ts` bounded prompt-too-long retry/truncation; TermAgent adapts the safe compact-and-retry subset to its summary compactor. Tests cover common error signatures, unrelated errors, and end-to-end one-time recovery. The supplied screenshot is an application-level post-bounding preflight guard, not a provider rejection; obtain provider-backed overflow evidence before accepting the recovery path.
+- [historical traces replayed; deterministic controlled policy harness implemented; provider-backed clean equivalent still open] The supplied 759-event/50-compaction trace and 415-event companion were replayed through the existing SessionStore projection. A new offline harness runs the same canonical route, schema, ordered messages/tool outcomes, additional request overhead, and workspace snapshot identifier against the legacy message/schema-only trigger and the current full request-footprint trigger. Its synthetic 14-request fixture produces 2 estimated-budget overflows under the legacy calculation and 0 under request-footprint-aware accounting (peak estimate 17,545 vs 13,668 tokens). This is a synthetic policy comparison, not proof of provider-tokenizer accuracy, latency/cost improvement, or production-session A/B improvement. Raw historical JSONL files with complete request payloads/provider usage are still required. See `docs/research/PHASE14H-REPLAY-ANALYSIS.md` and `docs/examples/phase14h-controlled-replay.example.json`.
+- [candidate implemented; local build/focused tests pass; device validation open] Normal compaction now targets 90% of usable capacity to leave request-growth/model-estimation headroom; explicit provider-overflow recovery retains the more aggressive 72% target. The 84,100 > 84,000 screenshot predates this headroom build and therefore does not validate the candidate. Verify ordinary compaction occurs before the preflight guard and preserves task context on physical Termux.
+- [offline calibration-policy comparison implemented] `phase14h-provider-trace-replay.mjs` now compares pre-fix ratio carry, full reset, and decayed priors (25/50/75%) without look-ahead. The 75% decay is the current runtime candidate because it improved mean and P95 absolute error in both supplied Mercury-3 sessions. Add further route/provider datasets and a clean-equivalent task-quality A/B before locking this policy.
+
+### 14I — Background-agent orchestration, session-state integrity, and live event delivery
+
+**Purpose:** Make background work observable and actionable to the running parent agent, remove avoidable session lock contention, and ensure live events reach every attached client without requiring a reconnect. Reuse the existing `TaskManager`, task event log, `SessionStore`, `SessionEventBus`, daemon owner, `TermAgentClient`, tool lifecycle, and command ledger.
+
+- [ ] Deliver task lifecycle events to the active parent-agent turn, not only to the durable parent-session mailbox. A child completion/failure that arrives while the parent is reasoning must become structured runtime input or an explicit orchestrator wakeup that the parent can consume before it launches more work. Keep durable notification persistence as the recovery source of truth.
+- [ ] Make parent orchestration await/observe every launched task: capture task IDs, inspect status/results, distinguish queued/running/completed/failed/cancelled/timed-out, and reconcile all child outcomes before declaring completion or deciding to launch more work. Progress events may update structured state; failures/completions must be actionable without flooding the conversation with every progress update.
+- [ ] Make notification delivery idempotent and race-safe across active turns, turn boundaries, reconnects, daemon restarts, and duplicate worker completion. A notification must never be lost between durable append, parent wakeup, acknowledgement/consumption, and model-context injection. Preserve child output references for deliberate retrieval.
+- [ ] Prevent orchestration loops and duplicate work. Track launched task IDs and scope assignments, detect duplicate/overlapping scopes before launch, detect repeated no-progress launches, bound fan-out/delegation depth/retries, and require a changed cause or configuration before retrying a deterministic failure.
+- [ ] Fix child-agent provider credential resolution. `src/tools/parallel.ts`, `src/tools/background.ts`, and `src/tasks/task-provider.ts` currently have duplicated provider-snapshot logic that deliberately removes the in-memory `apiKey` and retains `apiKeyEnv`. Consolidate this behind one daemon-owned credential-reference/resolution path: do not persist raw secrets in task JSON, but guarantee that a worker can securely resolve the exact selected provider/account credential even when the parent key existed only in memory.
+- [ ] Snapshot a validated provider/model/account/endpoint/adapter configuration for each child task. Before spawning, verify credential availability and route compatibility without exposing the secret. Return a precise preflight error when unavailable. A 401/403 or invalid credential is terminal for that attempt; do not retry the same credential or spawn replacement agents. Transient network/rate-limit/server errors may use only bounded, configured retries.
+- [ ] Unify provider-snapshot construction and credential handling for parallel agents, background agents, specialist agents, and future worker processes. Ensure model, base URL, headers, variant/reasoning settings, output limits, context metadata, and adapter choice are not lost or inferred from unrelated process-global environment variables.
+- [ ] Fix session-state lock contention behind `Session state is busy: unable to acquire state lock`. The current `acquireStateLease()` retries 60 times with roughly 10 ms waits (about 600 ms total), which can fail during concurrent session writes. Use bounded backoff with a measured/justified wait policy and diagnostics; distinguish a live owner, malformed/incomplete lock, stale owner, and genuinely stuck operation.
+- [ ] Strengthen lock ownership and stale-lock recovery. PID liveness alone is insufficient for robust process identity; use the daemon/worker process-start identity plus token/owner metadata where available. Never remove a live owner's lock merely because a short timeout elapsed. Ensure release is compare-before-delete and crash recovery is safe across Termux process restarts.
+- [ ] Reduce lock hold time and session-state write amplification. Audit `appendCore()`, trailing-record repair, durable sequence allocation, and repeated history reads. Avoid rescanning/parsing the entire JSONL history for every append where a durable sequence index/checkpoint can safely provide the next sequence. Keep a recovery scan for startup/repair and preserve atomic monotonic sequences across processes.
+- [ ] Add lock/session diagnostics: owner PID and process identity, operation kind, acquisition wait, hold duration, retry count, recovery decision, JSONL size, sequence/index state, and session ID. Redact prompts, credentials, and sensitive data. Report lock contention separately from corrupt JSONL and stale locks.
+- [ ] Trace the live event path using stable request/command/event/call IDs from runtime event publication through durable append, event bus, SSE write, client parser, state reducer, and transcript renderer. Identify why tool calls persisted to history but were not shown in the active Web View until stop/reconnect. Do not mark this fixed merely because reconnect replay works.
+- [ ] Ensure tool-call start/input, tool result/output, call IDs, task activity, reasoning/activity, Todo, diff, permission/question, and final message events render while the run is active. Keep the durable event log authoritative; live events are a latency path, not a separate source of truth.
+- [ ] On reconnect, replay every missed durable event from the last acknowledged sequence, deduplicate already-applied events, reconcile live-only state from an authoritative snapshot, and avoid duplicate/missing tool cards. Also recover when a client remains connected but its event subscription/reducer silently stops applying frames.
+- [ ] Add end-to-end tests that keep a long-running agent active while terminal and browser are both attached. Assert that each tool-call lifecycle transition becomes visible before the agent is stopped, then disconnect/reconnect midway and prove exact convergence without duplicate cards or missing results.
+- [ ] Add stress tests with concurrent task completion, several workers appending to one parent session, long JSONL histories, simultaneous browser/terminal subscribers, slow SSE consumers, lock owner crash, stale lock recovery, and daemon restart. Verify no duplicate sequences, lost notifications, orphaned tool calls, or unexplained `Session state is busy` warnings.
+
+### 14J — Universal provider platform, authentication, catalog, and `/provider` experience
+
+**Purpose:** Replace the current three-way provider selection (OpenAI-compatible, Anthropic, Gemini) and catch-all OpenAI-compatible fallback with an extensible provider platform. “Support every type of provider” means supporting the relevant protocol families and authentication patterns through explicit adapters/descriptors, plus custom integrations; do not claim a proprietary protocol is supported merely because its name appears in a catalog.
+
+- [ ] Define one provider descriptor/profile contract that separates provider identity, vendor/gateway, endpoint, transport/protocol, model ID, account, authentication method, custom headers/options, model capabilities, limits, and provenance. Make the daemon-owned provider registry/configuration the single source of truth for terminal, Web View, parent agents, subagents, and background workers.
+- [ ] Replace the three-provider hardcoded selection path with an extensible adapter registry. Preserve existing OpenAI-compatible, Anthropic Messages, and Gemini native implementations while making unsupported transport families fail explicitly instead of silently falling through to OpenAI-compatible.
+- [ ] Support the major provider protocol families through native or verified adapters: OpenAI Chat Completions and Responses; Anthropic Messages; Gemini native; Azure OpenAI; AWS Bedrock; Google Vertex AI; and OpenAI-compatible gateways/local servers. Keep provider-specific request/response formats, streaming parsers, tool-call semantics, reasoning fields, multimodal payloads, cache metadata, usage accounting, cancellation, and error normalization inside the correct adapter.
+- [ ] Build a broad, maintained provider catalog for hosted vendors and gateways (including OpenAI, Anthropic, Google, OpenRouter, DeepSeek, Moonshot/Kimi, Mistral, Groq, Together, Fireworks, Cerebras, xAI, NVIDIA, Novita, Chutes, and others) without equating catalog membership with verified protocol compatibility. Allow custom providers and custom model IDs when catalog data is absent or stale.
+- [ ] Support local/self-hosted inference targets including Ollama, LM Studio, llama.cpp servers, vLLM, and generic OpenAI-compatible endpoints, with local endpoint discovery where safe and appropriate. Keep local/no-key auth and cloud-hosted authentication distinct.
+- [ ] Implement provider-declared authentication methods: API key, environment variable, OAuth authorization-code/PKCE, OAuth device code, provider CLI/command login, cloud identity/default credentials (AWS/Azure/GCP), local/no-key, and custom header/form credentials where the adapter requires them. Expose only methods actually supported by each provider descriptor.
+- [ ] Implement secure credential storage and lifecycle: add, test, activate, rename/label, rotate, deactivate, remove, refresh, expiry handling, account switching, multiple accounts per provider, and secure daemon-side credential references for workers. Never serialize raw keys into task records, event payloads, Web View snapshots, status output, logs, or project files.
+- [ ] Add dynamic model discovery from provider-native catalog endpoints and a cached public catalog (models.dev/OpenCode-style pattern where appropriate). Record discovery source, timestamp, account/endpoint scope, and metadata freshness. Catalog failure/offline startup must not disable a previously working manually configured model.
+- [ ] Define per-model capability and limit metadata: context window, max output, tool/function calling, streaming, vision/image input, audio/video where supported, reasoning controls, structured output, prompt caching, and supported request formats. Use verified per-model data for context sizing and tool availability; allow explicit user overrides with provenance.
+- [ ] Rebuild provider/model interaction around clear responsibilities: `/provider` lists and manages provider profiles; `/connect` (or equivalent command flow) handles authentication/account connection; `/models` discovers, searches, previews, and selects models. `/provider` should support add/list/use/edit/remove/test/status and preserve a manual model-ID path at all times.
+- [ ] Adapt LaudaCode's useful `/provider add/list/use/edit/remove`, test-before-save, authenticated model catalog fetch, and manual model-ID fallback. Adapt OpenCode's provider integration catalog, separate connect/model flows, OAuth/command/key/environment methods, account lifecycle, and model metadata. Adapt OpenClaude's descriptor-driven provider/vendor/gateway catalog, API-format selection, route metadata, provider validation, custom headers, local discovery, and secret handling. Reuse these designs in TermAgent's current architecture rather than copying their UI or implementation wholesale.
+- [ ] Make API-format/adapter selection explicit for custom providers (for example Chat Completions, Responses, Responses-compatible, Anthropic Messages, Gemini native, and other verified protocols). Allow provider-specific options and headers with schema validation; never guess a protocol solely from a provider display name.
+- [ ] Preserve existing provider configuration and behavior during schema migration: current profiles, environment-variable mappings, variants, model overrides, smart routing, role routes, fallback lists, retry policy, reasoning effort, custom headers, and working credentials must survive without requiring users to re-enter secrets.
+- [ ] Resolve a complete immutable provider route for every request: provider descriptor + account/credential reference + endpoint + transport adapter + model + variant/capabilities. Parent agents, planning/building/verification roles, specialists, parallel tasks, and background tasks must use the same resolver and report the selected route safely.
+- [ ] Define error-class-based fallback. Only configured transient failures (network, timeout, rate limit, eligible server errors) may retry/fallback with bounded limits. Invalid credentials (401/403), missing model, unsupported protocol/capability, malformed request, or permission errors must fail fast with a precise cause. Never create a new child agent as an implicit provider retry.
+- [ ] Add provider diagnostics and `/status` projections for selected provider/account/model/adapter, credential source (never secret value), connectivity, context/output limits, capability flags, catalog freshness, retries/fallbacks, and provider error category. Keep the same safe state visible in terminal and Web View.
+- [ ] Add adapter conformance tests for request URL/headers/body, response parsing, streaming/chunk fragmentation, tool-call IDs and metadata/signatures, tool-result round trips, multimodal payloads, reasoning, structured outputs, usage/cache fields, cancellation, retries, and 401/403 fail-fast behavior. Test every supported provider family, not just generic happy-path JSON.
+- [ ] Add provider security tests for endpoint validation, HTTPS defaults for remote endpoints, explicitly approved insecure/local exceptions, bounded redirects/responses, timeouts, credential redaction, auth refresh races, secret-store failures, and daemon restart. Do not turn the daemon into an unrestricted network proxy through user-supplied URLs.
+- [ ] Add Termux/Android validation for provider setup, key entry, OAuth/device-code or command-based flows where supported, long provider/model lists, model search, manual IDs, disconnect/reconnect, and network loss. Ensure the `/provider` UX remains usable on narrow screens and does not require a desktop browser for API-key providers.
+
+**Upstream references and adaptation rules:**
+
+- **OpenCode V2:** use its provider catalog/integration model, `/connect` vs `/models` separation, declared key/OAuth/command/environment methods, provider-specific forms, multiple account lifecycle, custom provider configuration, and model metadata as architectural references. Keep HTTP/SSE and TermAgent's daemon-owned provider state; do not import OpenCode's dependency stack wholesale. References: [OpenCode provider CLI](https://dev.opencode.ai/v2/docs/cli/providers), [OpenCode provider configuration](https://dev.opencode.ai/v2/docs/providers/), [OpenCode provider catalog](https://opencode.ai/docs/providers/).
+- **OpenClaude 0.31.0 source archive supplied in this project:** adapt `src/commands/provider/provider.tsx`, `src/components/ProviderManager.tsx`, `src/integrations/descriptors.ts`, `src/integrations/registry.ts`, `src/integrations/providerUiMetadata.ts`, `src/integrations/routeMetadata.ts`, `src/utils/providerDiscovery.ts`, `src/utils/providerValidation.ts`, `src/utils/providerProfile.ts`, and `src/utils/providerSecrets.ts` for descriptors, vendor/gateway catalogs, API-format selection, route metadata, validation, custom headers, local model discovery, OAuth and credential handling.
+- **LaudaCode:** adapt the focused provider-management CLI workflow, authenticated catalog fetch, test-before-save behavior, manual model ID fallback, environment/config precedence, and provider status reporting. Its README primarily targets OpenAI-compatible endpoints, so use it as a compact Termux UX reference rather than as the native-protocol coverage target. References: [LaudaCode repository](https://github.com/Anon4You/Laudacode), [provider CLI](https://github.com/Anon4You/Laudacode/blob/main/src/cli.rs), [provider orchestration](https://github.com/Anon4You/Laudacode/blob/main/src/repl.rs).
+
+**14H status:** Active / partially implemented. The runtime now anchors request estimation on the latest route-matching provider-measured context, estimates post-measurement deltas, applies a bounded route-scoped median correction, and checks compaction after final/no-tool responses. A bounded first-request provider-overflow compact-and-retry path is implemented. The UI marks local/recomputed values with `~`. New 2026-11-11 analysis pairs 110 exact provider captures with a 1,161-event durable session log: 110/110 usage records match by timestamp/route/input/output/full-request estimate, 11/11 turns match, and 3 compaction boundaries are replayed. The raw estimate has 40.5% weighted undercount, but a shadow replay of the existing runtime adaptive formula has +0.1% aggregate signed error, 3.5% mean absolute error, 2.1% p50, 13.7% p95, and 29.3% maximum absolute error. One request crossed the 84,000 usable budget at 84,381 while the adaptive prediction was 82,463; native token-count data was unavailable. This single Mercury-3 route confirms the value of existing route-scoped calibration, not a case for a global multiplier. The replay tool now supports `--session-log`, validates matching session identity, replays only prior measurements and compaction resets, and reports budget-crossing misses. Focused provider-trace replay tests: **9/9 PASS**. The 110 captures include 3 completed compactions, but this remains observational evidence, not clean-equivalent legacy-vs-current compaction A/B. The current full repository rerun after this analyzer change passed **85/85 test files; 744/744 tests** at serial concurrency. Remaining: independent provider/model traces, native tokenizer comparison where supported, cold-start and post-compaction calibration evaluation, controlled provider-backed A/B, explicit overflow-path validation, physical Android/Termux validation, workspace-wide usage analytics, multimodal/wire-framing costs, 500K+/1M and device-memory benchmarks, and richer subagent scope/conflict coverage. The previous device smoke was Linux x64 (`termux:false`). Do not start Phase 14I until 14H acceptance is closed.
 
 ### Phase 14 gate
 
-- [ ] Browser and terminal are equivalent runtime clients.
-- [ ] Durable events replay correctly.
-- [ ] Live updates never become the only source of truth.
-- [ ] Permission/question state is deterministic across clients.
-- [ ] Reconnect/recovery is tested.
-- [ ] Security model is tested.
-- [ ] Package/build and browser distribution checks pass.
+- [ ] Phases 14H, 14I, and 14J are complete and their implementation/research reports are linked from `PROGRESS.md`.
+- [ ] The active provider/model/endpoint route supplies a verified context window and output limit, with explicit provenance and safe fallback for unknown models.
+- [ ] Context accounting includes system/instruction/repository/skill/tool/message/multimodal/output costs; no stale sample/local 12K override or deprecated message-count truncation silently overrides a larger verified route window.
+- [ ] Large repositories scale repository-map and retrieval allocations without dumping the entire codebase into the prompt or repeatedly rediscovering already-inspected files.
+- [ ] Compaction is driven by the effective request budget, preserves recent complete turns and valid tool-call/result groups, retains machine-readable exploration/read/evidence/task/skill state, and does not cause repeated repository-wide exploration.
+- [ ] Global, repository, and nested `AGENTS.md` / `TERMAGENT.md` / `CLAUDE.md` instruction scopes resolve deterministically for parent and child agents; relevant loaded skills survive compaction/restart without permanently loading every skill body.
+- [ ] Parent agents receive in-flight child task completion/failure events and handle every launched task. Notifications are durable, delivered, consumed, and deduplicated across turn boundaries/restarts.
+- [ ] Child agents resolve the exact daemon-owned provider/account credentials without persisting raw secrets. Provider 401/403 failures fail fast and cannot create retry/spawn loops.
+- [ ] Session-state mutation remains sequence-safe under concurrent workers. The lock wait/recovery policy handles live, stale, malformed, and crashed owners without false `Session state is busy` failures or unsafe lock deletion.
+- [ ] JSONL/event appends avoid unnecessary full-history rescans while preserving atomic durable sequence assignment and recovery after partial writes.
+- [ ] Tool-call/activity/task events appear in the active Web View and attached terminal before a run is stopped. Reconnect replays missed durable events and reconciles state exactly once; the original “tool calls appear only after reconnect” symptom is covered by an end-to-end regression.
+- [ ] Provider architecture distinguishes identity, account, credential, endpoint, protocol adapter, model, and capabilities. Unsupported formats fail explicitly rather than falling through to OpenAI-compatible.
+- [ ] `/provider`, `/connect`, and `/models` cover provider lifecycle, supported authentication methods, model discovery/search, manual IDs, custom endpoints, local models, and safe diagnostics on mobile and Web View.
+- [ ] Native provider adapters and OpenAI-compatible gateways pass adapter conformance tests for streaming, tools, metadata, multimodal requests, usage, cancellation, retries, and error classes.
+- [ ] Provider/model state is daemon-owned and identical for terminal, browser, parent agents, subagents, and background tasks; credentials never appear in session/event/browser/log projections.
+- [ ] Browser and terminal remain equivalent runtime clients; permissions/questions are deterministic; reconnect, daemon restart, task recovery, lock recovery, and cancellation are tested.
+- [ ] Run the full repository test suite, focused 14A–14J suites, TypeScript/build/package checks, browser distribution/syntax checks, daemon restart/reconnect tests, and physical Termux/Android/Brave/Chrome validation. Record known unrelated failures explicitly; do not call a timed-out aggregate test run a pass.
 
 ---
 
-# Phase 15 — VS Code integration
+# Phase 15 — VS Code integration (discontinued / deferred indefinitely)
 
-The long-term VS Code integration uses the same TermAgent runtime rather than embedding a second agent engine inside the extension.
+**Roadmap decision (2026-11-01):** Phase 15 is no longer an active milestone. Do not allocate implementation or maintenance work to a VS Code extension while the browser/cloud roadmap is the primary target. Preserve the generic protocol, typed client, presentation-independent runtime, and extension-friendly contracts. The original 15A–15D specification is preserved unchanged in `docs/research/PHASE15-DEFERRED-SPEC.md`; reopening requires an explicit roadmap decision.
 
-### 15A — Extension-host adapter
+# Phase 16 — Selected capability completion
 
-- [ ] Create `extensions/vscode/` using the official repository structure.
-- [ ] Implement a typed TermAgent client in the extension host.
-- [ ] Implement workspace-to-TermAgent session attachment and discovery.
-- [ ] Implement secure local/remote authentication and connection lifecycle.
-- [ ] Reuse canonical events/commands; do not duplicate task, permission, question, or agent logic.
+**Roadmap decision (2026-11-01):** actively complete 16A, 16B, 16D, 16E, and 16F. Defer 16C notebooks. Existing partial foundations are not considered completion; each capability requires the scoped deliverables and its own regression gate.
 
-### 15B — Native VS Code Chat Participant
+### 16A — LSP/code intelligence (SELECTED; diagnostic tracker exists, LSP manager missing)
 
-- [ ] Evaluate the VS Code Chat Participant API for native `@termagent` integration.
-- [ ] Stream TermAgent responses into the VS Code chat experience.
-- [ ] Map user messages and cancellation to canonical runtime commands.
-- [ ] Preserve TermAgent as the authoritative agent/tool runtime.
-- [ ] Map errors and progress into native VS Code chat affordances where practical.
-
-### 15C — Full custom VS Code Webview
-
-- [ ] Add a custom Webview panel/view only where richer TermAgent UI exceeds native Chat API capabilities.
-- [ ] Keep the Webview itself stateless or minimally stateful and restore through extension state/reconciliation.
-- [ ] Extension host receives runtime events and forwards sanitized semantic messages to the Webview.
-- [ ] Webview sends user actions back to the extension host with `postMessage()`; extension host submits canonical TermAgent commands.
-- [ ] Do not require the Webview to call localhost directly, especially where Remote Development/Codespaces portability matters.
-- [ ] Follow VS Code Webview CSP, `localResourceRoots`, serialization, accessibility, and lifecycle guidance.
-
-### 15D — IDE-native actions
-
-- [ ] Open referenced files at locations.
-- [ ] Open diffs in the VS Code diff editor.
-- [ ] Surface task status in the activity bar/status area where useful.
-- [ ] Support workspace/session selection.
-- [ ] Support attach/detach without changing session ownership.
-
-### Phase 15 gate
-
-- [ ] Native `@termagent` chat path works.
-- [ ] Custom Webview path works where needed.
-- [ ] Both use the same canonical runtime.
-- [ ] Session state remains consistent with terminal/Web View clients.
-- [ ] VS Code restart/restore behavior is tested.
-
----
-
-# Phase 16 — Capability recovery and full parity expansion
-
-This phase reopens capabilities previously deferred because TermAgent lacked the supporting architecture. Decisions must be based on engineering value and current TermAgents, not on resource pessimism.
-
-### 16A — LSP/code intelligence
-
-- [ ] Reassess the current session and language-server integration architecture when this phase is reopened.
-- [ ] Define a provider-neutral language-server manager and workspace document lifecycle.
+- [verified] Retain the existing 13N-E asynchronous diagnostic state tracker and EvidenceLedger integration as the diagnostics state contract.
+- [ ] Implement a provider-neutral JSON-RPC language-server process manager, capability negotiation, lifecycle, stderr/log handling, timeout and restart policy.
 - [ ] Implement diagnostics after edits.
 - [ ] Implement definitions/references/symbol search where supported.
 - [ ] Feed LSP evidence into repository retrieval and verification without making LSP mandatory for unsupported languages.
 - [ ] Make server process lifecycle durable/recoverable.
 
-### 16B — Web tools
+### 16B — Web tools (SELECTED; agent-facing tools not present)
 
-- [ ] Re-research current design webfetch/websearch implementations and network policies.
-- [ ] Define network permission and domain/resource classification.
+- [ ] Define and test network permission policy before exposing general web requests.
 - [ ] Add bounded fetch/search result storage and context projection.
 - [ ] Preserve complete results out-of-band where useful.
 - [ ] Add SSRF, redirect, size, timeout, content-type, and authentication safety controls.
 
-### 16C — Notebook/structured document editing
+### 16C — Notebook/structured document editing (DEFERRED)
 
-- [ ] Research the implementation NotebookEdit and related notebook state.
-- [ ] Define cell-aware document model and mutation protocol.
-- [ ] Preserve per-cell history, execution/output state, and diff/review semantics.
-- [ ] Add a real NotebookEdit implementation rather than text-file imitation.
+No implementation is scheduled. The deferred scope is preserved in `docs/research/PHASE16C-NOTEBOOKS-DEFERRED-SPEC.md`; do not add notebook dependencies as part of the selected Phase 16 roadmap.
 
-### 16D — Structural repository intelligence
+### 16D — Structural repository intelligence (SELECTED; useful foundation exists)
 
-- [ ] Reassess the current symbol/reference graph against the latest internal implementation approaches.
-- [ ] Improve language coverage and parser fallbacks.
+- [verified] Retain the existing file inventory, cached JS/TS/Python analyses, import edges, structural rank and token-bounded repository map.
+- [ ] Replace or supplement metadata-only cache identity with content hashes and precise incremental invalidation.
+- [ ] Improve language coverage and parser fallbacks while retaining lexical fallback.
 - [ ] Add dependency/reference graph persistence and incremental invalidation.
 - [ ] Fuse lexical, structural, symbol, and recent-session evidence.
 - [ ] Use exploration state to avoid redundant reads/searches.
 
-### 16E — Memory and project knowledge
+### 16E — Memory and project knowledge (SELECTED; no unified persistent project-knowledge store)
 
-- [ ] Research the implementation project memory and current design memory patterns.
+- [ ] Define a workspace-scoped, provenance-bearing, inspectable knowledge record and lifecycle.
 - [ ] Separate durable user/project knowledge from repository-derived facts.
 - [ ] Add explicit memory provenance and invalidation rules.
 - [ ] Add optional semantic/vector retrieval without coupling core session truth to one storage engine.
 - [ ] Make memory import/export inspectable and reversible.
 
-### 16F — Provider protocol maturity
+### 16F — Advanced provider protocol maturity (SELECTED; base provider platform moved into Phase 14)
 
-- [ ] Reassess streaming, retries, cancellation, structured outputs, tool-call IDs, and provider capability metadata against current design implementations.
-- [ ] Add transport-specific adapters only behind the provider-neutral contract.
-- [ ] Add deterministic recorder/replay fixtures for provider streams.
-- [ ] Revisit WebSocket provider transports where a real provider benefits from them.
+**Scope boundary:** Phase 14J now owns the provider registry, profile/auth lifecycle, model catalog, selected protocol adapters, provider manager, model capability metadata, and their conformance/security gate because the canonical Phase 14 daemon and Web View must manage the same provider state. Do not duplicate that work here.
+
+- [verified] Preserve typed provider stream events, AbortSignal cancellation, retry/backoff, Retry-After handling, cancellation during backoff, idle-stream distinction and partial-output replay safeguards from 13N-F.
+- [ ] Extend provider-specific structured-output, multimodal/audio, batch, caching, and advanced reasoning contracts beyond the Phase 14 minimum only where a supported provider/model requires them.
+- [ ] Add deterministic recorder/replay and differential conformance fixtures for newly adopted advanced protocol features, reusing the Phase 14 adapter test harness.
+- [ ] Add a provider-specific transport adapter only when a real provider requires a protocol not already covered by the Phase 14 registry; this is separate from deferred Phase 14G browser WebSocket transport.
+
+**Selected 16A/16B/16D/16E/16F scope is authoritative; 16C remains deferred.**
 
 ### Phase 16 gate
 
@@ -907,20 +988,76 @@ This phase reopens capabilities previously deferred because TermAgent lacked the
 
 ---
 
-# Phase 17 — Repository architecture migration and cleanup
+# Phase 17 — Persistent runtime operations, notifications and Telegram companion (PLANNED)
 
-This phase is allowed to be a real refactor when the current layout prevents correct evolution. Follow `REPO-STRUCTURE.md` and `AGENTS.md`.
+This phase follows Phase 14 closure and the selected Phase 16 capabilities. It prepares TermAgent for reliable 24/7 operation without beginning Phase 18 cloud workspace deployment. The single daemon selected in Phase 14F is the only agent/runtime owner.
 
-- [ ] Move newly developed protocol schemas into the corresponding module.
-- [ ] Move canonical client/server interaction semantics into the corresponding module.
-- [ ] Move the browser application into `web/` and VS Code integration into `extensions/vscode/`.
-- [ ] Mirror new tests into the domain-specific `tests/` structure.
+### 17A — Repository and runtime-state architecture migration and cleanup
+
+- [ ] Follow `REPO-STRUCTURE.md` and `AGENTS.md` when current layout blocks correct evolution.
+- [ ] Move newly developed protocol schemas and canonical interaction semantics into their domain modules.
+- [ ] Keep the browser app under `web/`; do not create an active VS Code extension track.
+- [ ] Mirror tests into domain-specific `tests/` structure.
 - [ ] Consolidate legacy duplicate helpers and eliminate parallel implementations.
-- [ ] Split oversized runtime/server modules where ownership is currently mixed.
-- [ ] Remove obsolete compatibility shims only after characterization tests prove they are no longer needed.
-- [ ] Update imports/docs and keep one authoritative implementation for every production capability.
+- [ ] Split oversized runtime/server modules where ownership is mixed; remove compatibility shims only after characterization tests.
+- [ ] Keep one authoritative implementation for every production capability.
+- [ ] Use `docs/research/OPENCLAUDE-TERMAGENT-RUNTIME-STORE-REVIEW-2026-11-12.md` as the storage-layout characterization; it compares runtime user-data roots, not source repository trees.
+- [ ] Introduce one central runtime path resolver and configurable state root, with explicit owners and state classes (durable truth, derived cache, referenced artifact, sensitive diagnostics). Preserve the current root by default.
+- [ ] Add a stable project/workspace identity index and project/session views without exposing raw absolute paths as directory names. Keep the canonical `SessionStore` JSONL contract and flat-path reader during the first index rollout.
+- [ ] Evaluate project/session grouping for session and task records only after characterization tests cover create, load, append, fork, restore, concurrent writer, daemon restart, cleanup and legacy flat-path access. Any move must be versioned, atomic, idempotent, lock-safe, restart-recoverable and rollback-compatible.
+- [ ] Group task records/events by session through an index/path resolver while preserving task IDs and parent/child relationships; do not change task identity or event-sequence semantics as a layout-only refactor.
+- [ ] Keep provider traces isolated by capture run/session and make export archives land outside the live trace directory. Preserve opt-in defaults, private permissions, secret sanitation and explicit content-retention policy.
+- [ ] Define lifecycle/retention for drafts, tasks, tool-output references, repo-map caches, provider traces, plugin downloads and snapshots. Never garbage-collect a referenced output, live task/session, or recoverable snapshot.
+- [ ] Treat `snapshots/<sessionId>/` as an opaque Git repository. Do not reorganize, shard or rewrite its internal Git object-store paths; lifecycle operations may act only at the enclosing snapshot boundary.
+- [ ] Provide migration dry-run, manifest, verification, resumability, rollback and post-migration audit before removing any legacy paths. Never delete a source path until the destination is verified and readers have switched safely.
+
+### 17B — Runtime notification service and durable outbox
+
+- [ ] Define renderer/platform-neutral notification intents sourced from canonical run/task/permission/runtime events.
+- [ ] Add a daemon-owned durable outbox with dedupe identity, claimed/delivered/failed/unknown states, retry metadata and restart recovery.
+- [ ] Separate agent execution outcome from notification delivery outcome; never rerun work merely because delivery failed.
+- [ ] Add notification preferences by category, project/session/task, importance, quiet hours, coalescing and rate limits.
+- [ ] Redact secrets and sensitive command/tool output before any external delivery; emit auditable records without storing unnecessary payload data.
+- [ ] If a model-facing `notify_owner` intent is added, it must have no recipient argument and may target only the paired owner under policy. Do not add generic arbitrary-target `send_message` to the default ToolRegistry.
+
+### 17C — Telegram owner companion (initially single-user/private)
+
+- [ ] Add an optional TypeScript Telegram Bot API adapter owned by the runtime daemon; do not add a Python agent or parallel orchestration runtime.
+- [ ] Implement explicit owner pairing, expiry, one-time use, rate limiting, revocation and one private chat scope. The owner must first start the bot.
+- [ ] Keep the bot token daemon-only; never expose it to browser assets, prompts, shell/task/plugin child environments or logs.
+- [ ] Deliver opted-in run completion/failure, permission-required deep-links, milestone, scheduled-report and daemon-health notifications.
+- [ ] Respect Telegram text length, per-chat pacing, 429 `retry_after`, message formatting and ambiguous-delivery handling; no token-per-message streaming.
+- [ ] Persist inbound update cursor/dedup if pairing or commands use long polling/webhooks. Configure one ingress mode only.
+- [ ] Keep Telegram approval/control commands deferred until they route through the same canonical command/PermissionGate contract and pass multi-client parity tests.
+
+### 17D — Scheduled and event-triggered automation
+
+- [ ] Add user-owned one-shot/recurring schedules with pause/resume/edit/trigger/remove and timezone-aware next-run calculation.
+- [ ] Run scheduled agent work in fresh, bounded sessions with selected skill/model policy and a durable execution ledger.
+- [ ] Separate scheduler trigger, agent execution and outbound delivery interfaces.
+- [ ] Support a restricted script-only/no-agent job mode only after workspace execution is isolated and resource-limited.
+- [ ] Add authenticated external event triggers (for example GitHub webhook) with signature validation, dedupe and the same job admission ledger.
+- [ ] Prevent recursive or runaway scheduling from scheduled-agent sessions.
+
+### 17E — Daemon health, watchdog and operational recovery
+
+- [ ] Expose runtime owner, heartbeat, provider connectivity, scheduler health, outbox backlog and degraded reasons.
+- [ ] Add bounded graceful shutdown, task settlement, interrupted-run recovery and supervisor-compatible exit semantics.
+- [ ] Add stale-heartbeat/watchdog behavior without treating an ordinary Telegram/network disconnect as a process failure.
+- [ ] Send deduplicated owner notifications on degraded/recovered state transitions.
+- [ ] Test abrupt kill, restart, network outage, Telegram 429/5xx, failed delivery, ambiguous send timeout and scheduler restart.
+
+**Phase 17 exit criteria:** one daemon owns the runtime; owner notification routing is secure and auditable; delivery is restart-safe and distinct from execution; scheduled work is bounded/recoverable; operational health is observable. Phase 17 does not implement cloud workspaces or public multi-tenant deployment.
 
 ---
+
+# Phase 18 — TermAgent Cloud Edition (future direction; NOT ACTIVE)
+
+This is a strategic architecture direction only. Do not start deployment or build the cloud product until Phase 14 and selected Phase 16 capabilities have been audited and closed. Preserve these design constraints while implementing earlier work: TermAgent remains the single agent engine; local and cloud use the same Agent/ToolRegistry/provider/session/protocol contracts; a local or remote `ExecutionEnvironment` adapter owns filesystem/process operations; provider credentials remain in the control plane; untrusted build/test/shell commands run in a workspace sandbox rather than as children of the public API process.
+
+Future workstreams are 18A cloud runtime foundation, 18B workspace manager/Git import, 18C sandboxed remote execution, 18D extension of the existing mobile-first Web View, 18E workflows built from existing specialist agents, and 18F persistence/recovery/observability/resource budgets. Phase 14F has selected a single-daemon topology: the same daemon/control-plane owner serves local terminal, browser and (after Phase 17) Telegram clients; cloud workspaces are execution adapters, not additional agent runtimes. Railway is the preferred control-plane candidate and its separate VM Sandbox API should be evaluated as the first workspace adapter; untrusted commands must never run as children of the control-plane service. Compare Railway Sandboxes with Daytona/E2B/Coder-style execution, including private-network reachability, persistent workspace lifecycle, resource caps and current cost, before selecting infrastructure.
+
+**Entry gate:** Phase 14 secure remote access and single-daemon multi-client parity are complete; selected Phase 16 work and Phase 17 persistent operations/notification gates are complete; secrets are separated from workspace execution; workspace isolation/resource limits and persistent storage/recovery have been tested; cost/hosting review is current.
 
 # TermAgent architecture owners
 
@@ -933,9 +1070,9 @@ The 1.7 execution-safety, semantic loop detection, completion gate, provider man
 
 # TODO maintenance rules
 
-- [ ] Every phase implementation starts only after its research/contract section is understood.
+- [verified] Every phase implementation starts only after its upstream research/contract section is understood; the 2026-11-01 architecture/research review is recorded before 14E/14F implementation.
 - [ ] Never mark a task complete from intention alone. Link completion to code/tests/report evidence.
-- [ ] When a plan changes, update this file and `ARCHITECTURE.md` in the same planning change.
+- [ ] When a plan changes, update this file and `ARCHITECTURE.md` in the same planning change. External feature imports must cite the inspected upstream revision and record adopt/adapt/defer decisions; see `docs/research/TERMAGENT-HERMES-AGENT-RESEARCH-2026-11-01.md`.
 - [ ] Keep historical reports immutable unless correcting a factual error; use current architecture/TODO documents for new decisions.
 - [ ] A newly discovered architectural flaw may introduce a hardening phase before a rollout gate. Do not force flawed work through a numbered gate merely to preserve numbering purity.
 
@@ -948,3 +1085,10 @@ A phase is not marked complete until its implementation, focused regression test
 
 - [x] Prevent task execution metadata (`taskId`) from activating semantic exploration no-progress detection.
 - [x] Regression-test three distinct `bash` verification calls followed by a fourth model response.
+
+
+## 2026-11-12 — Phase 14H epoch calibration and runtime-store architecture review
+
+Reviewed the user-supplied `~/.openclaude` and `~/.termagent` runtime trees and inspected OpenClaude `sessionStorage.ts`, `envUtils.ts`, `memdir/paths.ts`, and `autoCompact.ts`, plus OpenCode `session/compaction.ts` and `session/usage.ts`. This is a runtime-data comparison, not a source-repository comparison. TermAgent already has domain-owned session, snapshot, task, tool-output, repo-map, plugin and provider-trace stores; the inconsistency is mainly flat session/task/trace layouts and the lack of one central project/session path index. The 41k+ entries beneath TermAgent snapshots are Git object-store internals and remain opaque. Recorded future layout work under Phase 17A; no state migration is started in Phase 14H. See `docs/research/OPENCLAUDE-TERMAGENT-RUNTIME-STORE-REVIEW-2026-11-12.md` and the new runtime-state section in `ARCHITECTURE.md`.
+
+Audited compaction calibration lifecycle: pre-compaction rolling ratios had survived a changed context projection. Implemented a bounded 75%-toward-prior one-request warm start after micro-prune/full compaction, while clearing old baseline/samples. The replay can compare carry/reset/decay25/50/75 without look-ahead. Across two supplied Mercury-3 datasets (110 and 70 captures), decay75 achieved mean/P95 absolute errors of 3.1%/11.4% and 4.7%/14.0%; it outperformed carry and full reset on mean/P95 in both. Budget-crossing misses remained (one and two respectively), so this does not resolve trigger timing. New report: `docs/research/PHASE14H-CALIBRATION-EPOCHS-2026-11-12.md`. `npm run build` PASS; focused Phase14H provider-trace/context-continuity tests 30/30 PASS; complete parallel repository suite 744/744 PASS; `node scripts/verify-dist.mjs` PASS; `npm pack --dry-run` PASS (325 files; 501.7 kB). The serialized `npm test` runner timed out at the 180-second execution limit without a final TAP summary and remains unresolved. Physical Termux/headroom validation, cross-provider data and provider-rejected overflow evidence remain open. Phase 14H remains IN PROGRESS; Phase 14I has not started.

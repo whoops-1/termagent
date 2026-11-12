@@ -208,7 +208,7 @@ test('13B reproduces the 1372-line reread failure sequence and reaches the tail 
   } finally { await fs.rm(root,{recursive:true,force:true}) }
 })
 
-test('13B Agent.run supplies the read cache to tools and records preserved cache state on compaction', async () => {
+test('13B Agent.run persists read cache state in the durable context checkpoint after a large read', async () => {
   const { Agent } = await import('../dist/agent/agent.js')
   const { SessionStore } = await import('../dist/session/store.js')
   const { ToolRegistry } = await import('../dist/tools/registry.js')
@@ -222,8 +222,10 @@ test('13B Agent.run supplies the read cache to tools and records preserved cache
     builtinTools({timeout:5000,maxOutput:100000}).forEach(t => registry.add(t))
     class Provider {
       calls = 0
-      async *stream() {
+      seenMessages = []
+      async *stream(messages) {
         this.calls++
+        this.seenMessages.push(messages)
         if (this.calls === 1 || this.calls === 2) {
           yield {type:'tool_call',call:{id:`r${this.calls}`,type:'function',function:{name:'read_file',arguments:JSON.stringify({path:'read-me.txt'})}}}
           yield {type:'done',finishReason:'tool_calls'}
@@ -240,12 +242,12 @@ test('13B Agent.run supplies the read cache to tools and records preserved cache
     assert.equal(provider.calls,3)
     assert.equal(seen.length,2)
     assert.equal(seen[0].metadata.cache,'miss')
-    assert.equal(seen[1].metadata.cache,'rehydrated')
-    const loaded = await store.load(session.id)
-    const compaction = loaded.events.find(event => event.type === 'compaction')
-    assert.ok(compaction)
-    assert.ok(Array.isArray(compaction.data.readState))
-    assert.ok(compaction.data.readState.some(entry => entry.canonicalPath.endsWith('read-me.txt')))
+    // The second request in this fixture occurs while the original result is
+    // still part of the active transcript, so it must not be duplicated.
+    // Cross-turn restoration is covered independently by the Phase 14H test.
+    assert.equal(seen[1].metadata.cache,'unchanged')
+    const checkpoint = await store.latestContextCheckpoint(session.id)
+    assert.ok(checkpoint?.machineState?.readCoverage?.some(entry => entry.canonicalPath.endsWith('read-me.txt')))
   } finally { await fs.rm(root,{recursive:true,force:true}) }
 })
 

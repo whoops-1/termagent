@@ -7,7 +7,6 @@
     "verification": "backup",
     "subagent": "backup"
   },
-  "maxContextTokens": 12000,
   "retryMax": 4,
   "providers": {
     "backup": {
@@ -15,6 +14,10 @@
       "model": "backup-model",
       "baseUrl": "http://127.0.0.1:11434/v1",
       "apiKeyEnv": "OLLAMA_API_KEY"
+    }
+  }
+}
+"OLLAMA_API_KEY"
     }
   }
 }
