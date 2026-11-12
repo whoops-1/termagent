@@ -583,18 +583,19 @@ export class Agent {
 
     const turnNumberHint=messages.length+1
     const turn=await this.sessions.beginTurn(input.sessionId,input.cwd,messages,input.prompt)
-    const notifications=await this.sessions.consumeTaskNotifications(input.sessionId)
-    for(const notification of notifications){
-      const status=String(notification.status||'completed')
-      const summary=String(notification.summary||'No completion summary was recorded.').trim()
-      const taskId=String(notification.taskId||'unknown')
-      const childSessionId=notification.childSessionId?String(notification.childSessionId):''
-      const outputPath=notification.outputPath?String(notification.outputPath):''
+    const deliverTaskNotification=async(notification:any)=>{
+      const status=String(notification?.status||'completed')
+      const summary=String(notification?.summary||'No completion summary was recorded.').trim()
+      const taskId=String(notification?.taskId||'unknown')
+      const childSessionId=notification?.childSessionId?String(notification.childSessionId):''
+      const outputPath=notification?.outputPath?String(notification.outputPath):''
       const noteParts=[`<task-notification id="${taskId}" state="${status}">`,summary,childSessionId?`child_session=${childSessionId}`:'',outputPath?`output_path=${outputPath}`:'','</task-notification>'].filter(Boolean)
       const message:ChatMessage={role:'user',content:noteParts.join('\n')}
       messages.push(message)
       await this.sessions.appendMessage(input.sessionId,message,turn.id)
     }
+    const notifications=await this.sessions.consumeTaskNotifications(input.sessionId)
+    for(const notification of notifications){ await deliverTaskNotification(notification) }
     const toolLifecycle=new ToolCallLifecycle(this.sessions)
     await toolLifecycle.recoverUnsettled(input.sessionId)
     const appendProviderTurn=async(round:number,state:'started'|'tool_settling'|'completed'|'error'|'interrupted',extra:Record<string,unknown>={})=>{
@@ -661,6 +662,16 @@ export class Agent {
       let overflowRecoveryUsed=false
       let overflowRecoveryRounds=0
       for(let round=0;round<maxSteps+overflowRecoveryRounds;round++){
+        if(round>0){
+          // Parent-orchestration wakeup (TODO 14I items 1–4): child tasks that
+          // settle while this turn is active are delivered into the running
+          // turn at the next round boundary instead of waiting for the next
+          // user prompt. consumeTaskNotifications is idempotent (durable
+          // task.notification.consumed markers) and race-safe under the
+          // session lock, so active-turn delivery cannot double-report.
+          const wakeups=await this.sessions.consumeTaskNotifications(input.sessionId).catch(()=>[])
+          for(const notification of wakeups){ await deliverTaskNotification(notification) }
+        }
         await refreshActiveRouteContext()
         workflow?.assertProgressAllowed()
         await persistWorkflow()

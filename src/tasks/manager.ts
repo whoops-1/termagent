@@ -9,6 +9,51 @@ import { TaskEventLog } from './events.js'
 import type { ApprovalMode, PermissionRule } from '../config/config.js'
 import type { ProviderConfig } from '../providers/types.js'
 
+// Task lock lease policy. Mirrors the session state-lease discipline (bounded
+// exponential backoff + jitter, owner classification, redacted contention
+// diagnostics) while staying self-contained: the tasks domain must not import
+// src/session. envNonNegativeInt mirrors src/config/config.ts because a
+// config import would couple tasks to configuration loading.
+function envNonNegativeInt(name:string,fallback:number){
+  const raw=process.env[name]
+  if(raw===undefined||raw.trim()==='') return fallback
+  const value=Number(raw)
+  return Number.isSafeInteger(value)&&value>=0 ? value : fallback
+}
+const TASK_LEASE_INITIAL_WAIT_MS=10
+const TASK_LEASE_MAX_WAIT_MS=200
+// ~8x the previous fixed ~600 ms budget so concurrent task-record and
+// scheduler writes on slow mobile/Termux storage stop failing spuriously,
+// while staying well under a user-perceived hang.
+// TERMAGENT_TASK_LOCK_TIMEOUT_MS overrides it.
+const TASK_LEASE_DEFAULT_TIMEOUT_MS=5000
+// A lock whose contents cannot be classified (malformed/incomplete payload)
+// may still be mid-write by another process; only aged contents are recoverable.
+const TASK_LEASE_MALFORMED_FRESH_MS=5000
+// Attempt bound against pathological recreate/delete churn; the wall-clock
+// budget above is the primary bound for waiting on a live owner.
+const TASK_LEASE_MAX_ATTEMPTS=512
+// Bounded poll cadence for settle wakeups: cross-process task records change
+// by file write, so waiters re-read on a bounded cadence. Same-process settles
+// wake waiters immediately through the in-process notification set; fs.watch
+// is deliberately not used (platform/API fragmentation and fd pressure on
+// mobile; the 100 ms cadence is imperceptible for orchestration purposes).
+const TASK_WAIT_FALLBACK_POLL_MS=100
+export type TaskLeaseContention={
+  operation:string
+  lockId:string
+  attempts:number
+  waitedMs:number
+  outcome:'acquired'|'recovered-stale'|'recovered-malformed'|'timeout'
+  ownerPid?:number
+  decidedAt:number
+}
+type LeaseVerdict=
+  | {kind:'gone';pid?:undefined}
+  | {kind:'wait';reason:'live-owner'|'fresh-malformed';pid?:number}
+  | {kind:'recover-stale';pid:number;token:string}
+  | {kind:'recover-malformed';pid?:undefined}
+
 export type TaskKind = 'shell'|'agent'
 export type TaskStatus = 'queued'|'running'|'exited'|'failed'|'cancelled'
 export type TaskActivity = {kind:'tool'|'status'|'turn'|'output';label:string;detail?:string;at:number;callId?:string;outcome?:'success'|'error'|'running'}
@@ -28,6 +73,8 @@ export interface TaskRecord {
 export class TaskManager {
   private events:TaskEventLog
   private saveQueues=new Map<string,Promise<void>>()
+  private settleWaiters=new Set<()=>void>()
+  private lastTaskLeaseContentionRecord:TaskLeaseContention|undefined
   private readonly sessionRoot:string
   constructor(private root=process.env.TERMAGENT_TASK_ROOT||path.join(process.env.HOME||process.cwd(),'.termagent','tasks'), private workerDetached=true, sessionRoot=process.env.TERMAGENT_SESSION_ROOT||path.join(process.env.HOME||process.cwd(),'.termagent','sessions')){this.events=new TaskEventLog(root);this.sessionRoot=sessionRoot}
   private file(id:string){return path.join(this.root,`${id}.json`)}
@@ -37,27 +84,9 @@ export class TaskManager {
   private sessionLockFile(sessionId:string){return path.join(this.root,`.session-${crypto.createHash('sha256').update(String(sessionId)).digest('hex').slice(0,32)}.lock`)}
   private async withTaskLock<T>(id:string,fn:()=>Promise<T>):Promise<T>{
     await ensureDir(this.root)
-    const lockPath=this.lockFile(id),token=crypto.randomBytes(12).toString('hex'),payload=JSON.stringify({pid:process.pid,token,started:Date.now()})+'\n'
-    for(let attempt=0;attempt<60;attempt++){
-      try{
-        const handle=await fs.open(lockPath,'wx'); try{await handle.writeFile(payload,'utf8')}finally{await handle.close()}
-        try{return await fn()}finally{
-          try{const owner=JSON.parse(await fs.readFile(lockPath,'utf8'));if(owner?.pid===process.pid&&owner?.token===token)await fs.rm(lockPath,{force:true})}catch(error){if((error as {code?:string}).code!=='ENOENT')throw error}
-        }
-      }catch(error){
-        if((error as {code?:string}).code!=='EEXIST')throw error
-        let owner:any
-        try{owner=JSON.parse(await fs.readFile(lockPath,'utf8'))}catch(error){
-          if((error as {code?:string}).code==='ENOENT')continue
-          const info=await fs.stat(lockPath).catch(()=>undefined); if(info&&Date.now()-info.mtimeMs<5000){await new Promise(r=>setTimeout(r,10));continue}
-          await fs.rm(lockPath,{force:true}); continue
-        }
-        const pid=Number(owner?.pid)
-        if(Number.isInteger(pid)&&pid>0){try{process.kill(pid,0);await new Promise(r=>setTimeout(r,10));continue}catch(error){if((error as {code?:string}).code!=='ESRCH')throw error}}
-        await fs.rm(lockPath,{force:true})
-      }
-    }
-    throw new Error(`Task ${id} is busy: unable to acquire task lock`)
+    const lockPath=this.lockFile(id)
+    const lock=await this.acquireNamedLock(lockPath,`task-record:${id}`,`Task ${id}`)
+    try{return await fn()}finally{await this.releaseNamedLock(lock)}
   }
   private async saveUnlocked(t:TaskRecord){
     await ensureDir(this.root)
@@ -67,6 +96,10 @@ export class TaskManager {
     await fs.writeFile(tmp,JSON.stringify(t,null,2))
     await fs.rename(tmp,target)
     await this.events.append(t.id,'state',{kind:t.kind,status:t.status,pid:t.pid,exitCode:t.exitCode,outputTail:(t.output||'').slice(-2000),sessionId:t.sessionId,childSessionId:t.childSessionId,parentSessionId:t.parentSessionId,parentTaskId:t.parentTaskId,specialistRole:t.specialistRole,activity:t.activity})
+    // Settle wakeup (parent orchestration): same-process transitions resolve
+    // waiters immediately; cross-process writers are observed on the bounded
+    // poll cadence inside waitTaskSettled.
+    if(t.status!=='queued'&&t.status!=='running') this.wakeSettleWaiters()
   }
   async save(t:TaskRecord){
     const previous=this.saveQueues.get(t.id)||Promise.resolve()
@@ -253,32 +286,99 @@ ${text}`:text}finally{await h.close()}
       try{await fs.rm(path.join(credentialDir,entry),{force:true})}catch{}
     }
   }
-  private async acquireNamedLock(lockPath:string):Promise<{lockPath:string;token:string}> {
+  lastTaskLeaseContention(){ return this.lastTaskLeaseContentionRecord }
+  private rememberTaskLease(record:TaskLeaseContention){ this.lastTaskLeaseContentionRecord=record }
+  private async classifyTaskLease(lockPath:string):Promise<LeaseVerdict> {
+    let owner:any
+    try{ owner=JSON.parse(await fs.readFile(lockPath,'utf8')) }catch(error){
+      const code=(error as {code?:string}).code
+      if(code==='ENOENT') return {kind:'gone'}
+      const info=await fs.stat(lockPath).catch(()=>undefined)
+      if(!info) return {kind:'gone'}
+      return Date.now()-info.mtimeMs<TASK_LEASE_MALFORMED_FRESH_MS ? {kind:'wait',reason:'fresh-malformed'} : {kind:'recover-malformed'}
+    }
+    const pid=Number(owner?.pid)
+    const token=typeof owner?.token==='string'?owner.token:''
+    if(!Number.isInteger(pid)||pid<=0||!token){
+      const info=await fs.stat(lockPath).catch(()=>undefined)
+      if(!info) return {kind:'gone'}
+      return Date.now()-info.mtimeMs<TASK_LEASE_MALFORMED_FRESH_MS ? {kind:'wait',reason:'fresh-malformed'} : {kind:'recover-malformed'}
+    }
+    try{ process.kill(pid,0); return {kind:'wait',reason:'live-owner',pid} }
+    catch(error){
+      if((error as {code?:string}).code==='ESRCH') return {kind:'recover-stale',pid,token}
+      // EPERM/EACCES: liveness cannot be proven either way; treat the owner as
+      // live so an unprovable-dead owner's lock is never deleted.
+      return {kind:'wait',reason:'live-owner',pid}
+    }
+  }
+  private async acquireNamedLock(lockPath:string,operation:string,busySubject:string):Promise<{lockPath:string;token:string}> {
     await ensureDir(this.root)
     const token=crypto.randomBytes(12).toString('hex')
     const payload=JSON.stringify({pid:process.pid,token,started:Date.now()})+'\n'
-    for(let attempt=0;attempt<60;attempt++){
+    const lockId=path.basename(lockPath)
+    const budget=envNonNegativeInt('TERMAGENT_TASK_LOCK_TIMEOUT_MS',TASK_LEASE_DEFAULT_TIMEOUT_MS)
+    const startedAt=Date.now()
+    let attempt=0
+    let waitedMs=0
+    let waitMs=TASK_LEASE_INITIAL_WAIT_MS
+    let recovery:'stale'|'malformed'|undefined
+    let observedPid:number|undefined
+    for(;;){
+      attempt++
+      if(attempt>TASK_LEASE_MAX_ATTEMPTS){
+        const elapsed=Date.now()-startedAt
+        this.rememberTaskLease({operation,lockId,attempts:attempt,waitedMs,outcome:'timeout',decidedAt:Date.now()})
+        throw new Error(`${busySubject} is busy: unable to acquire ${lockId} after ${attempt} attempt(s) and ${elapsed} ms wait (attempt bound reached)`)
+      }
       try{
         const handle=await fs.open(lockPath,'wx')
         try{await handle.writeFile(payload,'utf8')}finally{await handle.close()}
+        if(attempt>1) this.rememberTaskLease({operation,lockId,attempts:attempt,waitedMs,outcome:recovery==='stale'?'recovered-stale':recovery==='malformed'?'recovered-malformed':'acquired',...(observedPid!==undefined?{ownerPid:observedPid}:{}),decidedAt:Date.now()})
         return {lockPath,token}
       }catch(error){
-        if((error as {code?:string}).code!=='EEXIST')throw error
-        let owner:any
-        try{owner=JSON.parse(await fs.readFile(lockPath,'utf8'))}catch(error){
-          if((error as {code?:string}).code==='ENOENT')continue
-          const info=await fs.stat(lockPath).catch(()=>undefined)
-          if(info&&Date.now()-info.mtimeMs<5000){await new Promise(r=>setTimeout(r,10));continue}
-          await fs.rm(lockPath,{force:true});continue
+        const code=(error as {code?:string}).code
+        // Windows surfaces EPERM for create-exclusive when the file already
+        // exists under concurrent acquisition; treat it as contention like
+        // EEXIST. A genuine permission problem degrades to the classified
+        // busy path below instead of an unclassified crash.
+        if(code!=='EEXIST'&&code!=='EPERM') throw error
+        const verdict=await this.classifyTaskLease(lockPath)
+        if(verdict.pid!==undefined) observedPid=verdict.pid
+        if(verdict.kind==='gone') continue
+        if(verdict.kind==='recover-stale'){
+          // Compare-before-recover: re-read and match the exact token that was
+          // classified stale, so a lock recreated by a new owner in between is
+          // never deleted.
+          try{
+            const current=JSON.parse(await fs.readFile(lockPath,'utf8'))
+            if(current?.token===verdict.token) await fs.rm(lockPath,{force:true})
+          }catch{}
+          recovery='stale'
+          continue
         }
-        const pid=Number(owner?.pid)
-        if(Number.isInteger(pid)&&pid>0){
-          try{process.kill(pid,0);await new Promise(r=>setTimeout(r,10));continue}catch(error){if((error as {code?:string}).code!=='ESRCH')throw error}
+        if(verdict.kind==='recover-malformed'){
+          try{await fs.rm(lockPath,{force:true})}catch{}
+          recovery='malformed'
+          continue
         }
-        await fs.rm(lockPath,{force:true})
+        // live-owner / fresh-malformed: wait within the budget; never delete.
+        const elapsed=Date.now()-startedAt
+        const remaining=budget-elapsed
+        if(remaining<=0){
+          const detail=verdict.reason==='live-owner'
+            ? `live owner pid ${verdict.pid} still holds the lock`
+            : 'malformed or incomplete lock payload aged beyond recovery'
+          this.rememberTaskLease({operation,lockId,attempts:attempt,waitedMs,outcome:'timeout',ownerPid:verdict.pid,decidedAt:Date.now()})
+          throw new Error(`${busySubject} is busy: unable to acquire ${lockId} after ${attempt} attempt(s) and ${elapsed} ms wait (${detail})`)
+        }
+        const jittered=Math.round(waitMs*(0.5+Math.random()*0.5))
+        const slice=Math.max(1,Math.min(jittered,remaining))
+        await new Promise<void>(resolve=>setTimeout(resolve,slice))
+        waitedMs+=slice
+        waitMs=Math.min(TASK_LEASE_MAX_WAIT_MS,waitMs*2)
       }
     }
-    throw new Error(`Task scheduler is busy: unable to acquire ${path.basename(lockPath)}`)
   }
   private async releaseNamedLock(lock:{lockPath:string;token:string}){
     try{
@@ -286,8 +386,49 @@ ${text}`:text}finally{await h.close()}
       if(owner?.pid===process.pid&&owner?.token===lock.token)await fs.rm(lock.lockPath,{force:true})
     }catch(error){if((error as {code?:string}).code!=='ENOENT')throw error}
   }
+  /**
+   * Resolves with the task record once it is no longer queued/running, or
+   * undefined when the deadline expires before settlement (or the task record
+   * disappears). Same-process settlements wake immediately; cross-process
+   * settlements are observed on the bounded poll cadence. Cancellation via
+   * abort resolves with the last-known record instead of throwing.
+   */
+  async waitTaskSettled(id:string,timeoutMs:number,abort?:AbortSignal):Promise<TaskRecord|undefined> {
+    const deadline=Date.now()+Math.max(0,timeoutMs)
+    for(;;){
+      const task=await this.get(id).catch(()=>undefined as TaskRecord|undefined)
+      if(!task) return undefined
+      if(task.status!=='queued'&&task.status!=='running') return task
+      const remaining=deadline-Date.now()
+      if(remaining<=0) return undefined
+      await this.waitForSettleSignal(Math.min(remaining,TASK_WAIT_FALLBACK_POLL_MS),abort)
+    }
+  }
+  private waitForSettleSignal(sliceMs:number,abort?:AbortSignal):Promise<void> {
+    return new Promise(resolve=>{
+      let done=false
+      const finish=()=>{
+        if(done)return
+        done=true
+        clearTimeout(timer)
+        this.settleWaiters.delete(wake)
+        if(abort) abort.removeEventListener('abort',onAbort)
+        resolve()
+      }
+      const wake=()=>finish()
+      const onAbort=()=>finish()
+      const timer=setTimeout(finish,sliceMs)
+      this.settleWaiters.add(wake)
+      if(abort){ if(abort.aborted) finish(); else abort.addEventListener('abort',onAbort,{once:true}) }
+    })
+  }
+  private wakeSettleWaiters(){
+    const waiters=[...this.settleWaiters]
+    this.settleWaiters.clear()
+    for(const waiter of waiters){ try{waiter()}catch{} }
+  }
   async withSessionLock<T>(sessionId:string,fn:()=>Promise<T>):Promise<T>{
-    const lock=await this.acquireNamedLock(this.sessionLockFile(sessionId))
+    const lock=await this.acquireNamedLock(this.sessionLockFile(sessionId),'session-state','Task scheduler')
     try{return await fn()}finally{await this.releaseNamedLock(lock)}
   }
   private async processIdentity(pid:number){
