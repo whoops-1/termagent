@@ -1092,3 +1092,58 @@ A phase is not marked complete until its implementation, focused regression test
 Reviewed the user-supplied `~/.openclaude` and `~/.termagent` runtime trees and inspected OpenClaude `sessionStorage.ts`, `envUtils.ts`, `memdir/paths.ts`, and `autoCompact.ts`, plus OpenCode `session/compaction.ts` and `session/usage.ts`. This is a runtime-data comparison, not a source-repository comparison. TermAgent already has domain-owned session, snapshot, task, tool-output, repo-map, plugin and provider-trace stores; the inconsistency is mainly flat session/task/trace layouts and the lack of one central project/session path index. The 41k+ entries beneath TermAgent snapshots are Git object-store internals and remain opaque. Recorded future layout work under Phase 17A; no state migration is started in Phase 14H. See `docs/research/OPENCLAUDE-TERMAGENT-RUNTIME-STORE-REVIEW-2026-11-12.md` and the new runtime-state section in `ARCHITECTURE.md`.
 
 Audited compaction calibration lifecycle: pre-compaction rolling ratios had survived a changed context projection. Implemented a bounded 75%-toward-prior one-request warm start after micro-prune/full compaction, while clearing old baseline/samples. The replay can compare carry/reset/decay25/50/75 without look-ahead. Across two supplied Mercury-3 datasets (110 and 70 captures), decay75 achieved mean/P95 absolute errors of 3.1%/11.4% and 4.7%/14.0%; it outperformed carry and full reset on mean/P95 in both. Budget-crossing misses remained (one and two respectively), so this does not resolve trigger timing. New report: `docs/research/PHASE14H-CALIBRATION-EPOCHS-2026-11-12.md`. `npm run build` PASS; focused Phase14H provider-trace/context-continuity tests 30/30 PASS; complete parallel repository suite 744/744 PASS; `node scripts/verify-dist.mjs` PASS; `npm pack --dry-run` PASS (325 files; 501.7 kB). The serialized `npm test` runner timed out at the 180-second execution limit without a final TAP summary and remains unresolved. Physical Termux/headroom validation, cross-provider data and provider-rejected overflow evidence remain open. Phase 14H remains IN PROGRESS; Phase 14I has not started.
+
+## 2026-11-12 — Phase 14I batch-1 work division and contribution workflow
+
+Phase 14I P0 work is divided into four non-overlapping work streams so parallel execution cannot collide at file level. Each stream owns its files exclusively; shared docs (`TODO.md`, `PROGRESS.md`, `ARCHITECTURE.md`) are updated only at integration, not by individual streams. Coordination contract for the second maintainer and downstream starter work: `docs/COLLABORATION-STARTERS.md`.
+
+### 14I-S1 — Child-agent provider credential resolution (TODO 14I items 5–7)
+
+- [ ] Consolidate the three duplicated provider-snapshot builders (`src/tools/parallel.ts`, `src/tools/background.ts`, `src/tasks/task-provider.ts`) behind one authoritative snapshot builder in `src/tasks/task-provider.ts` with identical behavior at every call site.
+- [ ] Add a daemon-owned task credential store (`src/tasks/task-credentials.ts`) for provider keys that exist only in memory, mirroring the established 0700/0600 atomic-write pattern in `src/cli/daemon-credentials.ts`. Task JSON must never contain raw keys.
+- [ ] Worker-side credential resolution with precise preflight errors: credential reference → resolvable env var → no-key local parity. A missing or corrupt reference fails with an explicit cause instead of a silent 401.
+- [ ] TaskManager lifecycle sweep removes orphaned and retention-expired credential files while keeping files for resumable tasks.
+- [ ] S3's one-line `fileURLToPath` fix in `src/tasks/manager.ts` spawnWorker is applied by this stream because it owns the file.
+
+**File ownership:** `src/tasks/**`, `src/tools/task.ts`, `src/tools/background.ts`, `src/tools/parallel.ts`, `tests/tasks/`, `tests/phase14f5-subagents.test.mjs`.
+
+### 14I-S2 — Session-state lock hardening (TODO 14I items 8–11)
+
+- [ ] Replace the fixed 60×10 ms lease loop in `src/session/store.ts` with bounded exponential backoff plus jitter under a configurable, justified wait policy.
+- [ ] Classify live owner / malformed lock / stale owner / stuck operation; never remove a live owner's lock merely because a short timeout elapsed; release remains compare-before-delete.
+- [ ] Add redacted lock diagnostics: owner PID, operation kind, acquisition wait, retries, recovery decision, session identity; report contention separately from corrupt JSONL and stale locks.
+- [ ] The durable-sequence append optimization (avoiding full-history rescans) is deliberately deferred to batch 2; this stream does not change the JSONL append contract.
+
+**File ownership:** `src/session/**`, `tests/session/`.
+
+### 14I-S3 — Windows port hardening (batch 1)
+
+- [ ] Add one shared home-directory resolver in `src/util/` and use it from owned callers; `process.env.HOME` is unset on Windows and `src/config/config.ts` currently falls back to cwd for user-level config.
+- [ ] Add a Windows process-group termination path (`taskkill /T /F` semantics) in `src/util/child-process.ts` alongside the POSIX group-kill path.
+- [ ] Fix Windows-broken worker entry resolution (`URL.pathname` → `fileURLToPath`) — applied by 14I-S1 because it owns `src/tasks/manager.ts`.
+- [ ] Audit and report (report-only, no edits outside ownership): Windows shell selection (`SHELL` absent), ANSI/VT enablement and raw-mode behavior, `src/server/daemon-owner.ts` Linux process-start identity fallback, long-path and mixed-separator handling in `src/tools/**` and `src/tasks/**`.
+
+**File ownership:** `src/util/**`, `src/config/**`, `src/cli/**`, `src/server/daemon-owner.ts`. Findings for other streams are reported, never edited directly.
+
+### 14I-S4 — Install website (batch 1)
+
+- [ ] Build a static, zero-dependency install/landing site under `web/site/` (separate from the `web/app/` Web View): hero with animated terminal mock, install tabs for cmd / PowerShell / npm with working copy buttons, feature cards, scroll-driven animations, reduced-motion support.
+- [ ] Use only real package facts: `npm install -g @whoops-1/termagent` requires Node ≥ 22 (`engines`), binary `termagent`, programmatic client and protocol subpath exports; include the source-clone and build path.
+- [ ] All visuals are self-contained inline SVG/CSS; no external network assets and no build step, so the site works from any static host and in restricted networks.
+- [ ] When it lands, add the `web/site/` ownership note to `REPO-STRUCTURE.md` in the same change.
+
+**File ownership:** `web/site/**` only.
+
+### Batch-2 queue (starts only after batch-1 integration)
+
+- [ ] Live event delivery trace: establish why tool calls persisted to history were not visible in the active Web View until stop/reconnect; the SSE durable poll is 1 s and child-process appends are only observed by that poll (TODO 14I items 12–14).
+- [ ] Parent orchestration wakeup: deliver task lifecycle events into the active parent-agent turn with idempotent, race-safe notification delivery (TODO 14I items 1–4).
+- [ ] Durable-sequence append optimization: avoid full-history JSONL rescans per append while preserving atomic monotonic sequences (TODO 14I item on write amplification).
+
+### Batch-1 integration gate
+
+- [ ] One owner per file held; no stream edits shared docs.
+- [ ] After all four streams land: one sequential `npm run build`, focused regression pass for `tests/tasks/`, `tests/session/`, and the touched Phase 14 suites, `npm pack --dry-run`, and source-hygiene scan.
+- [ ] `PROGRESS.md` receives one consolidated batch-1 entry written at integration; individual streams return summaries instead of editing shared docs.
+
+**Contribution workflow (2026-11-12):** the main dev repository is `whoops-1/termagent`; contributions flow through the `Tauseef666-ctrl/termagent` fork with branch-based pull requests so both maintainers can review before landing on `main`. No direct pushes to `main` for phase work.
