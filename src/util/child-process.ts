@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process'
+
 export type ProcessGroupTermination = {
   signalled: boolean
   forced: boolean
@@ -5,6 +7,56 @@ export type ProcessGroupTermination = {
 }
 
 type WaitOptions = { timeoutMs?: number; pollMs?: number }
+
+export type TerminationStage = 'graceful' | 'forced'
+
+/**
+ * The platform decision for terminating a detached child and its tree.
+ *
+ * POSIX targets the negative pid so the whole detached process group receives
+ * the signal. Windows has no POSIX process groups and `process.kill(-pid)` is
+ * invalid there, so the tree is terminated with `taskkill /PID <pid> /T /F`:
+ * `/T` walks the child tree, `/F` forces termination. Exit code 128 means the
+ * process was not found and is treated as a successful termination.
+ *
+ * The decision is pure so tests can assert argv without spawning processes.
+ */
+export type ProcessGroupTerminationPlan =
+  | { platform: 'win32'; command: string; args: string[]; notFoundExitCode: number }
+  | { platform: 'posix'; groupPid: number; signal: string }
+
+export function planProcessGroupTermination(
+  pid: number,
+  options: { stage?: TerminationStage; platform?: 'win32' },
+): { platform: 'win32'; command: string; args: string[]; notFoundExitCode: number }
+export function planProcessGroupTermination(
+  pid: number,
+  options: { stage?: TerminationStage; platform?: 'posix' },
+): { platform: 'posix'; groupPid: number; signal: string }
+export function planProcessGroupTermination(
+  pid: number,
+  options?: { stage?: TerminationStage; platform?: typeof process.platform },
+): ProcessGroupTerminationPlan
+export function planProcessGroupTermination(
+  pid: number,
+  options: { stage?: TerminationStage; platform?: typeof process.platform } = {},
+): ProcessGroupTerminationPlan {
+  const platform = options.platform ?? process.platform
+  if (platform === 'win32') {
+    return { platform: 'win32', command: 'taskkill', args: ['/PID', String(pid), '/T', '/F'], notFoundExitCode: 128 }
+  }
+  return { platform: 'posix', groupPid: -pid, signal: options.stage === 'forced' ? 'SIGKILL' : 'SIGTERM' }
+}
+
+export type TaskkillExitOutcome = 'terminated' | 'not-found' | 'unresolved'
+
+/** Classify a taskkill exit code: 0 terminated, 128 process not found, everything else (including a signaled run) unresolved. */
+export function taskkillExitOutcome(exitCode: number | null | undefined): TaskkillExitOutcome {
+  if (exitCode === null || exitCode === undefined) return 'unresolved'
+  if (exitCode === 0) return 'terminated'
+  if (exitCode === 128) return 'not-found'
+  return 'unresolved'
+}
 
 function errorCode(error: unknown): string | undefined {
   return typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : undefined
@@ -55,15 +107,21 @@ export async function waitForProcessGroupExit(pid: number | undefined, options: 
 }
 
 /**
- * Terminate a detached POSIX process group, escalating once after a bounded
- * grace period. This mirrors the useful part of the design pattern while
- * remaining dependency-free for Termux/ARMv7.
+ * Terminate a detached process group, escalating once after a bounded
+ * grace period. On POSIX this targets the process group created by the
+ * detached child. On Windows there are no process groups, so the child tree
+ * is force-terminated with `taskkill /T /F` and exit code 128 (process not
+ * found) counts as success. Dependency-free for Termux/ARMv7.
  */
 export async function terminateProcessGroup(
   pid: number | undefined,
   options: { graceMs?: number; pollMs?: number } = {},
 ): Promise<ProcessGroupTermination> {
   if (!pid || pid <= 0) return { signalled: false, forced: false, remaining: false }
+
+  if (process.platform === 'win32') {
+    return terminateWindowsProcessTree(pid)
+  }
 
   const existed = processGroupAlive(pid)
   if (!existed) return { signalled: false, forced: false, remaining: false }
@@ -77,6 +135,41 @@ export async function terminateProcessGroup(
   const forced = signalProcessGroup(pid, 'SIGKILL')
   const remaining = !(await waitForProcessGroupExit(pid, { timeoutMs: Math.max(200, options.graceMs ?? 1500) }))
   return { signalled, forced, remaining }
+}
+
+/**
+ * Windows has no POSIX process groups; taskkill walks the detached child tree
+ * itself. When taskkill is unavailable or refuses, fall back to the
+ * single-process termination Node supports on win32.
+ */
+async function terminateWindowsProcessTree(pid: number): Promise<ProcessGroupTermination> {
+  const plan = planProcessGroupTermination(pid, { stage: 'forced', platform: 'win32' })
+  const exitCode = await runTerminationCommand(plan.command, plan.args)
+  const outcome = taskkillExitOutcome(exitCode)
+  if (outcome === 'terminated') return { signalled: true, forced: true, remaining: false }
+  if (outcome === 'not-found') return { signalled: false, forced: false, remaining: false }
+  const killed = signalProcessGroup(pid, 'SIGKILL')
+  return { signalled: killed, forced: killed, remaining: !killed }
+}
+
+function runTerminationCommand(command: string, args: string[], timeoutMs = 5_000): Promise<number | null | undefined> {
+  return new Promise(resolve => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (code: number | null | undefined) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve(code)
+    }
+    const child = spawn(command, args, { stdio: 'ignore', windowsHide: true })
+    child.once('error', () => finish(undefined))
+    child.once('close', (code: number | null) => finish(code))
+    // A stalled taskkill must not hang termination forever; the caller falls
+    // back to the single-process kill on an undefined result.
+    timer = setTimeout(() => finish(undefined), Math.max(1, timeoutMs))
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+  })
 }
 
 /**

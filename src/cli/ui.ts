@@ -10,6 +10,7 @@ import { SelectModel } from './tui/select.js'
 import { renderTextDiff } from '../diff/render.js'
 import type { DiffResult } from '../diff/render.js'
 import { within } from '../util/fs.js'
+import { resolveHomeDirectory } from '../util/paths.js'
 import type { ProviderManagerProfile, ProviderManagerSnapshot, ProviderProfileDraft } from '../providers/manager.js'
 import type { TodoItem } from '../tools/todo.js'
 import { PluginManagerController, type PluginManagerCallbacks, type PluginManagerMode, type PluginManagerSnapshot } from './tui/plugin-manager.js'
@@ -285,7 +286,7 @@ async function previewToolDiff(cwd: string, toolName: string, args: any): Promis
 }
 
 function compactPath(cwd: string) {
-  const home = process.env.HOME || ''
+  const home = resolveHomeDirectory()
   if (home && cwd.startsWith(home)) return `~${cwd.slice(home.length)}`
   return cwd
 }

@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { resolveHomeDirectory } from '../util/paths.js'
 
 export interface TerminalDeviceCredential {
   version: 1
@@ -11,7 +11,7 @@ export interface TerminalDeviceCredential {
   expiresAt: number
 }
 
-function credentialPath(workspaceId: string, home = process.env.HOME || os.homedir()): string {
+function credentialPath(workspaceId: string, home = resolveHomeDirectory()): string {
   if (!/^[a-f0-9]{32}$/i.test(workspaceId)) throw new Error('Invalid daemon workspace identity')
   return path.join(home, '.termagent', 'devices', `${workspaceId}.json`)
 }
