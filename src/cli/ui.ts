@@ -589,6 +589,11 @@ export class TerminalUI {
       // stale status line saying the same thing, which wastes the tiny mobile
       // viewport and makes the UI look like two independent state machines.
       this.status = ''
+      // Defensive teardown guard: never arm the interval on an inactive UI.
+      // leave() clears activityTimer, but a late async continuation that calls
+      // setActivity() after leave() would otherwise re-arm a ref'd interval
+      // that nothing can clear again, keeping the process alive forever.
+      if (!this.active) return
       if (!this.activityTimer) this.activityTimer = setInterval(() => this.scheduleRender(), 1000)
       this.ensureMotionTimer()
     }
@@ -1482,6 +1487,12 @@ export class TerminalUI {
     if (this.permission) this.cancelPermission('deny')
     const extendedRequest = request as PermissionRequest & { skipPreview?: boolean }
     const preview = extendedRequest.skipPreview ? undefined : await previewToolDiff(this.options.cwd, request.tool.name, request.args)
+    // The preview above awaits a real git child process. If the UI left
+    // (request cancelled by teardown) while that await was in flight, stop
+    // here: writing this.permission after leave() would attach a dangling
+    // input listener and arm an activity interval that leave() can no longer
+    // clear, keeping the event loop alive forever.
+    if (!this.active) return 'deny'
     return await new Promise<PermissionChoice>((resolve, reject) => {
       const pending: PendingPermission = {
         request,
