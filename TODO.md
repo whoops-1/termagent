@@ -1142,8 +1142,8 @@ Phase 14I P0 work is divided into four non-overlapping work streams so parallel 
 
 ### Batch-1 integration gate
 
-- [ ] One owner per file held; no stream edits shared docs.
-- [ ] After all four streams land: one sequential `npm run build`, focused regression pass for `tests/tasks/`, `tests/session/`, and the touched Phase 14 suites, `npm pack --dry-run`, and source-hygiene scan.
-- [ ] `PROGRESS.md` receives one consolidated batch-1 entry written at integration; individual streams return summaries instead of editing shared docs.
+- [x] One owner per file held; no stream edits shared docs.
+- [x] After all four streams land: one sequential `npm run build`, focused regression pass for `tests/tasks/`, `tests/session/`, and the touched Phase 14 suites, `npm pack --dry-run`, and source-hygiene scan. Executed 2026-11-12 at the batch-2 integration gate: build PASS, focused regressions PASS, pack dry-run PASS (331 files), `verify-dist.mjs` PASS, full-tree bounded sweep 886 tests with every failure stash-verified as pre-existing Windows debt.
+- [x] `PROGRESS.md` receives one consolidated batch-1 entry written at integration; individual streams return summaries instead of editing shared docs. Landed as the consolidated 2026-11-12 Phase 14I entry covering batch-1 + batch-2.
 
 **Contribution workflow (2026-11-12):** the main dev repository is `whoops-1/termagent`; contributions flow through the `Tauseef666-ctrl/termagent` fork with branch-based pull requests so both maintainers can review before landing on `main`. No direct pushes to `main` for phase work.
