@@ -3,6 +3,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { TaskManager, type TaskRecord } from './manager.js'
 import { processGroupAlive, terminateProcessGroup, writeChildStdinWithTimeout } from '../util/child-process.js'
+import { resolveShell, spawnPlanFor } from '../util/platform-shell.js'
 
 export type ShellTermination = 'completed'|'nonzero'|'timeout'|'cancelled'|'signal'|'output-limit'|'stdin-timeout'|'spawn-error'
 
@@ -23,7 +24,13 @@ export interface ShellResult {
 }
 
 export interface ManagedShellOptions {
-  shell:string
+  /**
+   * Explicit caller-selected shell executable. Omit to resolve through
+   * `resolveShell()` (src/util/platform-shell.ts): POSIX keeps `$SHELL || sh`
+   * with `-lc`, win32 prefers TERMAGENT_SHELL / a PATH sh-compatible shell and
+   * otherwise falls back to COMSPEC with precise sh-syntax failure.
+   */
+  shell?:string
   command:string
   cwd:string
   timeout:number
@@ -131,17 +138,33 @@ export interface ManagedShellHandle {
 }
 
 export async function startManagedShell(manager:TaskManager,options:ManagedShellOptions,existingTask?:TaskRecord):Promise<ManagedShellHandle> {
+  // Resolve the platform shell before any task state is created so a failed
+  // resolution (win32 without a usable shell for this script) cannot leave a
+  // dangling task record behind.
+  const shellDecision=await resolveShell({script:options.command,shell:options.shell,env:process.env,platform:process.platform})
+  const spawnPlan=spawnPlanFor(shellDecision,options.command)
   const task=existingTask || await manager.createShell(options.command,options.cwd,options.parentSessionId,options.scopePaths,{background:options.background,coordinated:options.coordinated,timeoutMs:options.timeout})
   const shellMayLeaveBackgroundChildren = hasShellBackgroundOperator(options.command)
   if (task.timeoutMs !== options.timeout) { await manager.update(task.id,{timeoutMs:options.timeout}) }
   const outputPath=task.outputPath || manager.outputPath(task.id)
   await fs.mkdir(path.dirname(outputPath),{recursive:true})
   const handle=await fs.open(outputPath,'w')
-  const child=spawn(options.shell,['-lc',options.command],{
+  const child=spawn(spawnPlan.command,spawnPlan.args,{
     cwd:options.cwd,
-    detached:options.detached ?? process.platform!=='win32',
+    // win32: never detach. A detached cmd.exe drops the redirected output
+    // handle for grandchild processes, silently losing their output (e.g.
+    // verification commands report exit-only results with zero bytes).
+    // Windows children outlive the parent without detachment, and tree
+    // cleanup uses taskkill /T /F, which walks any pid tree; POSIX keeps the
+    // historical detachment semantics (options.detached ?? true).
+    detached:process.platform==='win32'?false:(options.detached ?? true),
     stdio:[options.stdin === undefined ? 'ignore' : 'pipe',handle.fd,handle.fd],
     env:process.env,
+    // cmd.exe has no backslash escape: Node's default quoting rewrites inner
+    // quotes as \" and the script degrades (e.g. `node -e "..."` loses its
+    // argument and exits 0 on EOF stdin — a false pass). Verbatim arguments
+    // keep the script exactly as resolved.
+    windowsVerbatimArguments:spawnPlan.windowsVerbatimArguments,
   })
   if(!child.pid){ await handle.close(); await manager.finish(task.id,{status:'failed',exitCode:1,termination:'spawn-error'}); throw new Error('Shell process did not provide a PID') }
 
@@ -204,7 +227,7 @@ export async function startManagedShell(manager:TaskManager,options:ManagedShell
   child.once('exit',(code:any,signal:any)=>{ void finish(code,signal) })
 
   if (!existingTask) await manager.claimWorker(task.id,child.pid).catch(()=>false)
-  await manager.recordProcessIdentity(task.id,child.pid,`${options.shell} -lc ${options.command}`,options.cwd).catch(()=>{})
+  await manager.recordProcessIdentity(task.id,child.pid,[shellDecision.command,...shellDecision.args,options.command].join(' '),options.cwd).catch(()=>{})
 
   if (options.stdin !== undefined) {
     try {
@@ -252,7 +275,7 @@ export async function startManagedShell(manager:TaskManager,options:ManagedShell
   }}
 }
 
-export async function runManagedShellTask(manager:TaskManager,task:TaskRecord,shell=process.env.SHELL||'sh',timeout=120_000,maxPreviewBytes=20_000,abort?:AbortSignal):Promise<ShellResult> {
+export async function runManagedShellTask(manager:TaskManager,task:TaskRecord,shell?:string,timeout=120_000,maxPreviewBytes=20_000,abort?:AbortSignal):Promise<ShellResult> {
   const handle=await startManagedShell(manager,{shell,command:task.command||'',cwd:task.cwd,timeout,maxPreviewBytes,outputLimitBytes:64*1024*1024,abort,detached:true},task)
   return handle.result
 }

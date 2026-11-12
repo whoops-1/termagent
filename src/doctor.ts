@@ -8,6 +8,8 @@ import { loadKnownMarketplacesSafe, loadInstalledPlugins, marketplaceStateRoot, 
 import { loadPluginSecurityPolicy } from './plugins/security.js'
 import { listSkillRegistries, listInstalledRegistrySkills, getSkillRegistryInstallRoot } from './skills/registry.js'
 import { loadSkillCatalog } from './skills/catalog.js'
+import { resolveHomeDirectory } from './util/paths.js'
+import { resolveShell } from './util/platform-shell.js'
 
 export type DoctorStatus = 'ok' | 'warn' | 'error'
 export type DoctorCheck = {
@@ -83,7 +85,6 @@ export async function doctor(cwd = process.cwd()): Promise<DoctorReport> {
     ['git', ['--version'], false],
     ['rg', ['--version'], false],
     ['npm', ['--version'], false],
-    ['sh', ['-c', 'printf ok'], true],
   ] as Array<[string, string[], boolean]>) {
     const result = await command(name, args)
     check(checks, {
@@ -94,6 +95,27 @@ export async function doctor(cwd = process.cwd()): Promise<DoctorReport> {
       remediation: result.ok ? undefined : `${name} is optional for basic operation but may be needed by related features.`,
     })
   }
+
+  // Probe the shell the runtime will actually use (src/util/platform-shell.ts)
+  // instead of hardcoding `sh`, so the doctor reflects the same decision the
+  // shell tools make. On win32 without a sh-compatible shell the probe cannot
+  // succeed; report a targeted remediation instead of a confusing spawn error.
+  const shellProbe = await resolveShell({ script: 'printf ok' })
+  const windowsFallback = shellProbe.kind === 'windows'
+  const shellResult = windowsFallback
+    ? { ok: false, out: 'no sh-compatible shell found on PATH and no TERMAGENT_SHELL override' }
+    : await command(shellProbe.command, [...shellProbe.args, 'printf ok'])
+  check(checks, {
+    group: 'environment',
+    label: windowsFallback ? 'sh-compatible shell' : path.basename(shellProbe.command),
+    status: shellResult.ok ? 'ok' : windowsFallback ? 'warn' : 'error',
+    value: shellResult.ok ? shellResult.out.split('\n')[0] || 'available' : (shellResult.out || 'unavailable'),
+    remediation: shellResult.ok
+      ? undefined
+      : windowsFallback
+        ? 'Set TERMAGENT_SHELL to a sh-compatible executable (for example the Git for Windows sh.exe) or add its directory to PATH. Shell tools and many agent commands assume sh.'
+        : 'The shell tool may fail until a working shell is available. Set TERMAGENT_SHELL on Windows or SHELL on POSIX to the shell TermAgent should use.',
+  })
 
   try {
     const cfg = await loadConfig(project)
@@ -175,7 +197,7 @@ export async function doctor(cwd = process.cwd()): Promise<DoctorReport> {
     check(checks, { group: 'skills', label: 'Skill catalog', status: 'error', value: 'unavailable', detail: error instanceof Error ? error.message : String(error), remediation: 'Inspect skill roots and rerun /skills.' })
   }
 
-  for (const candidate of [path.join(process.env.HOME || project, '.termagent'), path.join(project, '.termagent')]) {
+  for (const candidate of [path.join(resolveHomeDirectory(), '.termagent'), path.join(project, '.termagent')]) {
     try {
       const state = await pathState(candidate)
       if (!state.exists) continue

@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { resolvePluginComponentPath } from './manifest.js'
 import { assertRealpathWithin } from './security.js'
+import { resolveShell, spawnPlanFor } from '../util/platform-shell.js'
 import type { PermissionGate } from '../tools/permissions.js'
 import type { ToolDefinition } from '../tools/types.js'
 
@@ -48,8 +49,12 @@ async function executeOne(spec:PluginHookSpec,ctx:HookContext,gate:PermissionGat
   const tool:ToolDefinition={name:`plugin_hook_${spec.pluginName}_${ctx.event}`,risk:'shell',description:`Plugin hook ${spec.pluginName}:${ctx.event}`,schema:{type:'object'},execute:async()=>({output:''})}
   await gate.check(tool,{event:ctx.event,command},new AbortController().signal)
   if(spec.statusMessage) onStatus?.(spec.statusMessage)
+  // Hooks are plain sh `-c` scripts (not login shells); preserve that exact
+  // grammar while routing shell selection through the platform helper.
+  const shell=await resolveShell({script:command,login:false})
+  const plan=spawnPlanFor(shell,command)
   await new Promise<void>((resolve,reject)=>{
-    const child=spawn('sh',['-c',command],{cwd:spec.pluginRoot,env:{...process.env,CLAUDE_PLUGIN_ROOT:spec.pluginRoot,TERMAGENT_PLUGIN_ROOT:spec.pluginRoot,TERMAGENT_PLUGIN_ID:spec.pluginId,TERMAGENT_HOOK_EVENT:ctx.event},stdio:['pipe','pipe','pipe']})
+    const child=spawn(plan.command,plan.args,{cwd:spec.pluginRoot,env:{...process.env,CLAUDE_PLUGIN_ROOT:spec.pluginRoot,TERMAGENT_PLUGIN_ROOT:spec.pluginRoot,TERMAGENT_PLUGIN_ID:spec.pluginId,TERMAGENT_HOOK_EVENT:ctx.event},stdio:['pipe','pipe','pipe'],windowsVerbatimArguments:plan.windowsVerbatimArguments})
     let err=''; child.stderr.on('data',(b:any)=>{err+=b.toString().slice(0,8000)})
     child.stdin.end(JSON.stringify(ctx)+'\n')
     const timer=setTimeout(()=>{child.kill('SIGTERM');reject(new Error(`plugin hook timed out after ${spec.timeout}s`))},Math.round((spec.timeout||30)*1000))

@@ -212,5 +212,7 @@ export async function runTaskWorker(id:string, suppliedManager?:TaskManager){
 
 async function runShell(task:TaskRecord,manager:TaskManager){
   const { runManagedShellTask } = await import('./shell-command.js')
-  await runManagedShellTask(manager,task,process.env.SHELL||'sh',task.timeoutMs||DEFAULT_SHELL_TIMEOUT_MS,DEFAULT_OUTPUT_BYTES,undefined)
+  // Shell resolution is centralized in src/util/platform-shell.ts; passing no
+  // explicit shell keeps POSIX behavior identical and fixes win32 selection.
+  await runManagedShellTask(manager,task,undefined,task.timeoutMs||DEFAULT_SHELL_TIMEOUT_MS,DEFAULT_OUTPUT_BYTES,undefined)
 }

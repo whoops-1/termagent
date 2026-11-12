@@ -398,7 +398,7 @@ export function builtinTools(opts: { timeout: number; maxOutput: number; toolOut
       if(!command) throw new Error('bash command must not be empty')
       const explicitBackground=Boolean(a.run_in_background)
       const timeout=Number.isFinite(Number(a.timeout))&&Number(a.timeout)>=0 ? Math.floor(Number(a.timeout)) : opts.timeout
-      const handle=await startManagedShell(taskManager,{shell:process.env.SHELL||'sh',command,cwd:c.cwd,timeout:explicitBackground?0:timeout,maxPreviewBytes:opts.maxOutput,outputLimitBytes:64*1024*1024,autoBackgroundMs:explicitBackground?undefined:(Number.isFinite(Number(process.env.TERMAGENT_SHELL_AUTO_BACKGROUND_MS)) ? Math.max(1,Math.floor(Number(process.env.TERMAGENT_SHELL_AUTO_BACKGROUND_MS))) : 15_000),abort:c.abort,detached:true,parentSessionId:c.sessionID,scopePaths:c.scopePaths,background:explicitBackground})
+      const handle=await startManagedShell(taskManager,{command,cwd:c.cwd,timeout:explicitBackground?0:timeout,maxPreviewBytes:opts.maxOutput,outputLimitBytes:64*1024*1024,autoBackgroundMs:explicitBackground?undefined:(Number.isFinite(Number(process.env.TERMAGENT_SHELL_AUTO_BACKGROUND_MS)) ? Math.max(1,Math.floor(Number(process.env.TERMAGENT_SHELL_AUTO_BACKGROUND_MS))) : 15_000),abort:c.abort,detached:true,parentSessionId:c.sessionID,scopePaths:c.scopePaths,background:explicitBackground})
       if(explicitBackground){
         await handle.background()
         const current=await taskManager.get(handle.task.id)
@@ -428,7 +428,7 @@ export function builtinTools(opts: { timeout: number; maxOutput: number; toolOut
       const analysis=analyzeGitArgs(args)
       if(analysis.destructive) throw new Error(`Potentially destructive git command blocked: ${analysis.summary}. Arguments: ${args.join(' ')}`)
       const command=['git',...args].map(x=>shellQuote(String(x))).join(' ')
-      const handle=await startManagedShell(taskManager,{shell:process.env.SHELL||'sh',command,cwd:c.cwd,timeout:opts.timeout,maxPreviewBytes:opts.maxOutput,outputLimitBytes:64*1024*1024,autoBackgroundMs:(Number.isFinite(Number(process.env.TERMAGENT_SHELL_AUTO_BACKGROUND_MS)) ? Math.max(1,Math.floor(Number(process.env.TERMAGENT_SHELL_AUTO_BACKGROUND_MS))) : 15_000),abort:c.abort,detached:true,parentSessionId:c.sessionID,scopePaths:c.scopePaths})
+      const handle=await startManagedShell(taskManager,{command,cwd:c.cwd,timeout:opts.timeout,maxPreviewBytes:opts.maxOutput,outputLimitBytes:64*1024*1024,autoBackgroundMs:(Number.isFinite(Number(process.env.TERMAGENT_SHELL_AUTO_BACKGROUND_MS)) ? Math.max(1,Math.floor(Number(process.env.TERMAGENT_SHELL_AUTO_BACKGROUND_MS))) : 15_000),abort:c.abort,detached:true,parentSessionId:c.sessionID,scopePaths:c.scopePaths})
       const result=await handle.result
       return {title:`git ${analysis.operation}`,output:`${result.backgrounded?`Git command moved to background as task ${handle.task.id}.`:`git ${analysis.operation} ${result.termination}.`}${result.outputPreview?`\n${shellPreview(result.outputPreview)}`:''}`,metadata:{git:{...analysis,taskId:handle.task.id,status:result.termination,exitCode:result.code,signal:result.signal,outputPath:result.outputPath,outputBytes:result.outputBytes,outputTruncated:result.outputTruncated,background:result.backgrounded}}}
     }
