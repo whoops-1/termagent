@@ -1,18 +1,10 @@
 import type { Provider, ProviderConfig } from '../providers/types.js'
-import { ProviderRouter } from '../providers/router.js'
 import { TaskManager } from '../tasks/manager.js'
+import { subagentProviderSnapshot } from '../tasks/task-provider.js'
 import { summarizeTask } from '../tasks/format.js'
 import type { ToolDefinition } from './types.js'
 import { ToolRegistry } from './registry.js'
 import { specialistRole, specialistRoleNames, restrictSpecialistTools } from '../agent/specialists.js'
-
-function persistedSubagentConfig(provider: Provider, fallback?: ProviderConfig): ProviderConfig & { provider: string } {
-  const selected = provider instanceof ProviderRouter ? provider.select('subagent') : { provider, config: provider.config || fallback }
-  const cfg = selected.config
-  if(!cfg?.baseUrl) throw new Error(`Provider ${selected.provider.id} has no base URL for a background agent`)
-  const {apiKey: _apiKey, ...safe} = cfg
-  return { ...safe, apiKeyEnv: cfg.apiKeyEnv, provider: cfg.provider || selected.provider.id, model: selected.provider.model, baseUrl: cfg.baseUrl }
-}
 
 export function backgroundTool(manager: TaskManager): ToolDefinition {
   return {
@@ -85,7 +77,7 @@ export function backgroundAgentTool(manager: TaskManager, provider: Provider, pr
     description:'Start a persistent autonomous coding agent task. It runs independently and stores status/output for later inspection.',
     schema:{type:'object',properties:{prompt:{type:'string',minLength:1},scope_paths:{type:'array',items:{type:'string'}},role:{type:'string',enum:specialistRoleNames()}},required:['prompt']},
     async execute(a,c){
-      const cfg=persistedSubagentConfig(provider,providerConfig)
+      const cfg=await subagentProviderSnapshot(provider,providerConfig,{label:'a background agent',taskRoot:manager.taskRoot()})
       const policy=parentRegistry?parentRegistry.gate.deriveChildPolicy(parentRegistry.list()):{mode:'deny' as const,rules:[],allowedTools:[]}
       const role=specialistRole(typeof a.role==='string'?a.role:'general')
       const allowedTools=restrictSpecialistTools(role.name,policy.allowedTools)

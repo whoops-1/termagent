@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { TaskManager } from '../tasks/manager.js'
+import { subagentProviderSnapshot } from '../tasks/task-provider.js'
 import type { Provider, ProviderConfig } from '../providers/types.js'
-import { ProviderRouter } from '../providers/router.js'
 import type { ToolDefinition } from './types.js'
 import { ToolRegistry } from './registry.js'
 import { within } from '../util/fs.js'
@@ -10,12 +10,6 @@ import { specialistRole, specialistRoleNames, restrictSpecialistTools } from '..
 type ParallelTask={prompt:string;paths:string[];role:string}
 function normalizePaths(cwd:string,paths:string[]):string[]{return [...new Set(paths.map(x=>path.resolve(cwd,String(x))))].sort()}
 function overlaps(a:string,b:string){return a===b||a.startsWith(b+path.sep)||b.startsWith(a+path.sep)}
-function persistedSubagentConfig(provider:Provider, fallback:ProviderConfig):ProviderConfig {
-  const selected=provider instanceof ProviderRouter ? provider.select('subagent') : {provider,config:provider.config||fallback}
-  const cfg=selected.config
-  if(!cfg?.baseUrl) throw new Error(`Provider ${selected.provider.id} has no base URL for parallel agents`)
-  const {apiKey: _apiKey, ...safe}=cfg; return {...safe,apiKeyEnv:cfg.apiKeyEnv,provider:cfg.provider||selected.provider.id,model:selected.provider.model,baseUrl:cfg.baseUrl}
-}
 
 export function parallelAgentTool(manager:TaskManager,provider:Provider,providerConfig:ProviderConfig,parentRegistry?:ToolRegistry):ToolDefinition {
   return {
@@ -63,7 +57,7 @@ export function parallelAgentTool(manager:TaskManager,provider:Provider,provider
       }
       const ids:string[]=[]
       const created:string[]=[]
-      const persisted=persistedSubagentConfig(provider,providerConfig)
+      const persisted=await subagentProviderSnapshot(provider,providerConfig,{label:'parallel agents',taskRoot:manager.taskRoot()})
       const policy=parentRegistry?parentRegistry.gate.deriveChildPolicy(parentRegistry.list()):{mode:'deny' as const,rules:[],allowedTools:[]}
       try{
         for(const task of tasks){

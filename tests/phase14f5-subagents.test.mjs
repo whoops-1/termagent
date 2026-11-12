@@ -235,9 +235,16 @@ test('14F.5 real child worker persists turn lifecycle, output progress and usage
   try {
     await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve))
     const parent = await f.client.createSession(f.root, 'phase14f5-mock')
+    // The worker no longer trusts raw api keys in task JSON: the fixture must
+    // persist a task credential and hand createAgent a secret-free snapshot
+    // that references it, exactly like the parent-side builders do.
+    const { newTaskCredentialRef, saveTaskProviderCredential } = await import('../dist/tasks/task-credentials.js')
+    const credentialRef = newTaskCredentialRef()
+    const route = { provider: 'openai-compatible', model: 'phase14f5-worker', baseUrl: `http://127.0.0.1:${modelServer.address().port}/v1` }
+    await saveTaskProviderCredential(f.runtime.tasks.taskRoot(), credentialRef, route, 'worker-fixture-key')
     const task = await f.runtime.tasks.createAgent(
       'Summarize the repository structure', f.root,
-      { provider: 'openai-compatible', model: 'phase14f5-worker', baseUrl: `http://127.0.0.1:${modelServer.address().port}/v1`, apiKey: 'worker-fixture-key' },
+      { provider: route.provider, model: route.model, baseUrl: route.baseUrl, credentialRef },
       ['.'], parent.id, { specialistRole: 'general' },
     )
     const { runTaskWorker } = await import('../dist/tasks/worker.js')

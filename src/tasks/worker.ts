@@ -5,6 +5,7 @@ import { ToolRegistry } from '../tools/registry.js'
 import { builtinTools } from '../tools/builtin.js'
 import { createProvider } from '../providers/registry.js'
 import { Agent } from '../agent/agent.js'
+import { resolveTaskProviderConfig } from './task-provider.js'
 import { loadInstructions } from '../context/instructions.js'
 import { buildRepositoryMap, formatRepositoryMap } from '../context/repository.js'
 import { retrieveContext } from '../context/retrieval.js'
@@ -21,11 +22,6 @@ import type { TaskActivity } from './manager.js'
 
 const DEFAULT_SHELL_TIMEOUT_MS = 120_000
 const DEFAULT_OUTPUT_BYTES = 20_000
-
-function normalizeProvider(task:TaskRecord){
-  if(!task.provider) throw new Error('Agent task is missing provider configuration')
-  return task.provider
-}
 
 function renderSpecialistText(task:TaskRecord){
   const role=specialistRole(task.specialistRole)
@@ -78,7 +74,7 @@ export async function runTaskWorker(id:string, suppliedManager?:TaskManager){
   try{
     if(task.kind==='shell') return await runShell(task,manager)
     if(task.kind!=='agent') throw new Error(`Unsupported task kind: ${task.kind}`)
-    const providerConfig=normalizeProvider(task)
+    const providerConfig=await resolveTaskProviderConfig(task.provider,{taskRoot:manager.taskRoot()})
     const provider=createProvider(providerConfig)
     provider.setRole?.('subagent')
     provider.setTurnContext?.({userText:task.prompt||'',turnNumber:1})

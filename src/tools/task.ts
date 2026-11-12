@@ -2,7 +2,7 @@ import type { Provider } from '../providers/openai-compatible.js'
 import type { ProviderConfig } from '../providers/types.js'
 import { SessionStore } from '../session/store.js'
 import { TaskManager, type TaskRecord } from '../tasks/manager.js'
-import { persistedSubagentConfigForTask } from '../tasks/task-provider.js'
+import { subagentProviderSnapshot } from '../tasks/task-provider.js'
 import type { ToolDefinition } from './types.js'
 import { ToolRegistry } from './registry.js'
 import { sessionTodoTool } from './session-todo.js'
@@ -41,7 +41,7 @@ export function taskTool(provider:Provider, store:SessionStore, parentRegistry:T
       const role=specialistRole(typeof args.role==='string' ? args.role : 'general')
       const roleAllowedTools=restrictSpecialistTools(role.name,policy.allowedTools)
       if(role.name !== 'general' && roleAllowedTools.length===0) throw new Error(`Specialist role '${role.name}' has no tools permitted by the parent policy.`)
-      const persistedProvider=persistedSubagentConfigForTask(provider,providerConfig)
+      const persistedProvider=await subagentProviderSnapshot(provider,providerConfig,{label:'a child task',taskRoot:manager.taskRoot()})
       let task:TaskRecord
 
       if(args.task_id){

@@ -3,6 +3,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { ensureDir, within } from '../util/fs.js'
 import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { terminateProcessGroup } from '../util/child-process.js'
 import { TaskEventLog } from './events.js'
 import type { ApprovalMode, PermissionRule } from '../config/config.js'
@@ -16,7 +17,7 @@ export interface TaskRecord {
   status:TaskStatus; pid?:number; exitCode?:number; output:string; sessionId?:string; childSessionId?:string; parentSessionId?:string;
   result?:string; error?:string; pendingPrompts?:string[]; runCount?:number; background?:boolean; parentNotified?:boolean;
   permissionMode?:ApprovalMode; permissionRules?:PermissionRule[]; allowedTools?:string[]; coordinated?:boolean; specialistRole?:string; delegationDepth?:number; parentTaskId?:string;
-  provider?:ProviderConfig;
+  provider?:ProviderConfig & { credentialRef?:string };
   usage?:{inputTokens:number;outputTokens:number;totalTokens:number;estimated:boolean};
   activity?:TaskActivity;
   workerToken?:string;
@@ -144,6 +145,7 @@ export class TaskManager {
     const id=crypto.randomBytes(5).toString('hex');const outputPath=path.join(this.root,'outputs',`${id}.log`);const t:TaskRecord={id,kind:'shell',command,cwd,started:Date.now(),updated:Date.now(),status:'queued',output:'',outputPath,parentSessionId,scopePaths:normalized,background:Boolean(options.background),coordinated:Boolean(options.coordinated),timeoutMs:options.timeoutMs};await this.save(t);return t
   }
   outputPath(id:string){ return path.join(this.root,'outputs',`${id}.log`) }
+  taskRoot(): string { return this.root }
   async createAgent(prompt:string,cwd:string,provider:any,scopePaths?:string[],parentSessionId?:string,options:{permissionMode?:ApprovalMode;permissionRules?:PermissionRule[];allowedTools?:string[];background?:boolean;coordinated?:boolean;sessionId?:string;specialistRole?:string;delegationDepth?:number;parentTaskId?:string}={}){
     const normalized=scopePaths?.length?scopePaths.map(String):['.']
     this.assertValidScopes(cwd,normalized)
@@ -229,9 +231,26 @@ ${text}`:text}finally{await h.close()}
   }
   async cleanup(retentionDays=7){
     const cutoff=Date.now()-Math.max(1,retentionDays)*86400000
-    for(const task of await this.list()){
+    const tasks=await this.list()
+    const liveCredentialRefs=new Set<string>()
+    for(const task of tasks){
       if((task.status==='queued'||task.status==='running')||task.updated>cutoff)continue
       try{if(task.outputPath)await fs.rm(task.outputPath,{force:true})}catch{}
+    }
+    for(const task of tasks){
+      const ref=task.provider?.credentialRef
+      if(!ref)continue
+      const settled=task.status!=='queued'&&task.status!=='running'
+      if(settled&&task.updated<=cutoff)continue
+      liveCredentialRefs.add(ref)
+    }
+    const credentialDir=path.join(this.root,'credentials')
+    let credentialFiles:string[]
+    try{credentialFiles=await fs.readdir(credentialDir)}catch{credentialFiles=[]}
+    for(const entry of credentialFiles){
+      if(!entry.endsWith('.json'))continue
+      if(liveCredentialRefs.has(entry.slice(0,-'.json'.length)))continue
+      try{await fs.rm(path.join(credentialDir,entry),{force:true})}catch{}
     }
   }
   private async acquireNamedLock(lockPath:string):Promise<{lockPath:string;token:string}> {
@@ -314,7 +333,7 @@ ${text}`:text}finally{await h.close()}
     const task=await this.get(id)
     const workerToken=crypto.randomBytes(16).toString('hex')
     await this.update(id,{workerToken})
-    const workerEntry=new URL('./worker-entry.js',import.meta.url).pathname
+    const workerEntry=fileURLToPath(new URL('./worker-entry.js',import.meta.url))
     const env={...process.env,TERMAGENT_TASK_ROOT:this.root,TERMAGENT_WORKER_TOKEN:workerToken}; delete (env as any).NODE_TEST_CONTEXT; delete (env as any).NODE_TEST_WORKER_ID
     const child=spawn(process.execPath,[workerEntry,id],{cwd:task.cwd,detached,stdio:'ignore',env})
     const pid=await new Promise<number>((resolve,reject)=>{
