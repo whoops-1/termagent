@@ -1140,6 +1140,26 @@ Phase 14I P0 work is divided into four non-overlapping work streams so parallel 
 - [x] Parent orchestration wakeup: deliver task lifecycle events into the active parent-agent turn with idempotent, race-safe notification delivery (TODO 14I items 1–4). Batch 2 landed the `deliverTaskNotification` helper with durable `task.notification.consumed` markers and child-task settlement wakeup at every agent round boundary (round > 0), turn-start consumption retained; Windows EPERM is now classified as lock contention alongside EEXIST.
 - [x] Durable-sequence append optimization: avoid full-history JSONL rescans per append while preserving atomic monotonic sequences (TODO 14I item on write amplification). Batch 2 landed a stat-validated in-memory `sequenceCache` fast path for `nextDurableSequence`/`currentSequence` with authoritative full-scan fallback on external append/truncate, plus turn-lease token compare-before-recover and mtime/size confirm guards.
 
+### Batch-3 queue (starts only after batch-2 integration)
+
+Equal work division for the remaining 14I items; one owner per file, shared docs updated only at integration.
+
+**Stream O — orchestration observe/reconcile + loop prevention (items at TODO.md lines 857, 859, task side of 866).** Owns `src/agent/agent.ts`, `src/tasks/manager.ts`, `src/tools/task.ts`, `src/tools/parallel.ts`, `src/tools/background.ts`, plus new tests under `tests/tasks/` and `tests/agent/`. Captures launched task IDs, inspects durable task records at round boundaries, distinguishes queued/running/completed/failed/cancelled/timed-out, and injects structured reconciliation state (status-fingerprint deduped, no progress flooding) before completion or further launches. Refuses duplicate/overlapping scope launches, bounds fan-out/depth/retries, requires a changed cause or configuration before retrying deterministic failures, and surfaces task-lock contention diagnostics.
+
+**Stream D — session diagnostics + notification durability (item at line 858, session side of 866).** Owns `src/session/store.ts`, plus new tests under `tests/session/`. Adds redacted session-lock and JSONL diagnostics (owner PID + process identity, op kind, acquisition wait, hold duration, retry count, recovery decision, JSONL size, sequence state, session ID) with contention reported separately from corrupt-JSONL and stale-lock classes; hardens notification consumption so nothing is lost between durable append, parent wakeup, acknowledgement, and model-context injection, preserving child output references in consumed markers.
+
+**Stream W — Web View live render + reconnect recovery (items at lines 868, 869).** Owns `web/app/app.js`, `src/server/http.ts`, plus new tests under `tests/webapp-*.test.mjs`. Verifies every durable event kind renders while a run is active (tool call start/input/result/output, call IDs, task activity, reasoning, todo, diff, permission/question, final message), and rebuilds reconnect as replay-from-last-acknowledged-sequence with event dedupe, authoritative-snapshot reconciliation, duplicate-tool-card prevention, and a silent-subscription watchdog.
+
+**Stream C — provider preflight + snapshot completeness (items at lines 860–862 remainder).** Owns `src/tasks/task-provider.ts`, `src/tasks/task-credentials.ts`, `src/tasks/worker.ts`, plus new tests. Adds preflight validation of the child provider snapshot (credential availability, route compatibility, precise non-secret error classes), marks credential-terminal failures (401/403/invalid credential) as non-retryable and non-replaceable, keeps transient retries bounded and configured, and completes snapshot metadata (model, base URL, headers, variant/reasoning, output limits, adapter choice) so nothing is inferred from process-global environment variables.
+
+**Shared contracts (pinned across streams):**
+- C exports `preflightTaskProviderConfig(snapshot, opts)` returning `{ ok: true } | { ok: false; kind: 'missing-credential' | 'missing-model' | 'incompatible-route'; reason: string }`; O calls it in the launch tools before `createAgent`.
+- C sets a durable `terminalCredentialError: true` marker on the task record/event for credential-terminal failures; O's supervision never auto-retries or respawns such tasks.
+
+**Stream T — E2E + stress evidence (items at lines 870, 871).** Second wave, after O/D/W/C integration. Owns `tests/phase14i-e2e.test.mjs` and `tests/phase14i-stress.test.mjs`. Long-running agent with terminal and browser attached proving live visibility of every tool-call transition before stop, mid-run disconnect/reconnect convergence without duplicate cards or missing results, and stress coverage for concurrent task completion, several workers appending to one parent session, long JSONL histories, simultaneous browser/terminal subscribers, slow SSE consumers, lock owner crash, stale lock recovery, and daemon restart — asserting no duplicate sequences, lost notifications, orphaned tool calls, or unexplained `Session state is busy`.
+
+- [ ] Batch-3 gate: one sequential `npm run build`, focused regression for every stream's suite, `npm pack --dry-run`, `verify-dist.mjs`, full-tree bounded sweep with stash-verified failure classification, and a consolidated `PROGRESS.md` entry.
+
 ### Batch-1 integration gate
 
 - [x] One owner per file held; no stream edits shared docs.
