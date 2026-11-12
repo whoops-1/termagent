@@ -102,13 +102,19 @@ export class SessionStore {
         this.leases.set(id,lease)
         return lease
       }catch(error){
-        if((error as {code?:string}).code!=='EEXIST') throw error
+        // EPERM is Windows' create-exclusive "already exists" signal under
+        // concurrency; treat it as contention like EEXIST (see manager core).
+        const code=(error as {code?:string}).code
+        if(code!=='EEXIST'&&code!=='EPERM') throw error
         let owner:any
         try{owner=JSON.parse(await fs.readFile(lockPath,'utf8'))}catch(error){
           if((error as {code?:string}).code==='ENOENT'){continue}
           const info=await fs.stat(lockPath).catch(()=>undefined)
           if(info && Date.now()-info.mtimeMs<5000) throw new Error('Session is busy: another process is acquiring the turn lock')
-          await fs.rm(lockPath,{force:true})
+          // Same recreation guard as below: an aged unparseable lock is only
+          // recovered when it has not been recreated since we probed it.
+          const confirm=await fs.stat(lockPath).catch(()=>undefined)
+          if(!confirm || (info && confirm.mtimeMs===info.mtimeMs && confirm.size===info.size)) await fs.rm(lockPath,{force:true})
           continue
         }
         const pid=Number(owner?.pid)
@@ -116,9 +122,25 @@ export class SessionStore {
           try{process.kill(pid,0); throw new Error('Session is busy: another process is running a turn')}
           catch(error){
             if((error as {code?:string}).code!=='ESRCH') throw error
+            // Compare-before-recover (turn-lease hardening): the owner may
+            // have released and a new acquirer recreated the lock between our
+            // liveness probe and the recovery, so only remove the exact
+            // payload classified as stale.
+            try{
+              const current=JSON.parse(await fs.readFile(lockPath,'utf8'))
+              if(current?.token===owner?.token) await fs.rm(lockPath,{force:true})
+            }catch{}
+            continue
           }
         }
-        await fs.rm(lockPath,{force:true})
+        const info=await fs.stat(lockPath).catch(()=>undefined)
+        if(info && Date.now()-info.mtimeMs<5000) throw new Error('Session is busy: another process is acquiring the turn lock')
+        // Recover an aged malformed lock only if it has not been recreated
+        // since we probed it: a fresh mtime/size means another acquirer owns
+        // it now, and their lock must not be deleted.
+        const confirm=await fs.stat(lockPath).catch(()=>undefined)
+        if(!confirm || (info && confirm.mtimeMs===info.mtimeMs && confirm.size===info.size)) await fs.rm(lockPath,{force:true})
+        continue
       }
     }
     throw new Error('Session is busy: unable to acquire turn lock')
@@ -179,7 +201,10 @@ export class SessionStore {
         }
         return {lockPath,token}
       }catch(error){
-        if((error as {code?:string}).code!=='EEXIST')throw error
+        // EPERM is Windows' create-exclusive "already exists" signal under
+        // concurrency; treat it as contention like EEXIST (see manager core).
+        const code=(error as {code?:string}).code
+        if(code!=='EEXIST'&&code!=='EPERM')throw error
         const verdict=await this.classifyStateLock(lockPath)
         observedPid=verdict.pid
         if(verdict.kind==='gone')continue
@@ -313,12 +338,50 @@ export class SessionStore {
 
   private async appendCore(id:string,event:SessionEvent){
     await ensureDir(this.root)
-    await this.repairTrailingPartialEvent(id)
-    const sequence=await this.nextDurableSequence(id)
+    // Durable-sequence append optimization (Phase 14I batch 2): the fast path
+    // reuses the sequence cached after our own last append when the file size
+    // still matches, skipping the two full-history JSONL rescans (repair scan
+    // + max-sequence scan) that previously ran per append. The cache is
+    // DERIVED state validated against the file before every use: any external
+    // append, truncation, or cache loss (including after a crash) falls back
+    // to the authoritative full scan, so cross-process correctness, atomic
+    // monotonic sequences, and crash recovery are unchanged. The validation
+    // runs while the state lease is held, so no other writer can move the
+    // file between the size check and the append.
+    const cached=await this.fastNextSequence(id)
+    let sequence:number
+    if(cached===undefined){
+      await this.repairTrailingPartialEvent(id)
+      sequence=await this.nextDurableSequence(id)
+    }else{
+      sequence=cached
+    }
     const enriched=enrichStoredEvent(id,event,sequence)
     await fs.appendFile(this.file(id),JSON.stringify(enriched)+'\n')
+    const size=await this.fileSize(id)
+    if(size===undefined) this.sequenceCache.delete(id)
+    else this.sequenceCache.set(id,{sequence,size})
     this.events?.publishDurable(toDurableEventEnvelope(id,enriched,sequence))
     return enriched
+  }
+
+  private sequenceCache=new Map<string,{sequence:number;size:number}>()
+  private async fileSize(id:string):Promise<number|undefined>{
+    try{ const info=await fs.stat(this.file(id)); return info.size }catch{ return undefined }
+  }
+  private async fastNextSequence(id:string):Promise<number|undefined>{
+    const cached=this.sequenceCache.get(id)
+    if(!cached) return undefined
+    const size=await this.fileSize(id)
+    if(size===undefined||size!==cached.size){ this.sequenceCache.delete(id); return undefined }
+    return cached.sequence+1
+  }
+  private async fastCurrentSequence(id:string):Promise<number|undefined>{
+    const cached=this.sequenceCache.get(id)
+    if(!cached) return undefined
+    const size=await this.fileSize(id)
+    if(size===undefined||size!==cached.size){ this.sequenceCache.delete(id); return undefined }
+    return cached.sequence
   }
 
   private async appendUnlocked(id:string,event:SessionEvent){
@@ -332,6 +395,8 @@ export class SessionStore {
     return await this.withSessionLock(id,()=>this.appendUnlocked(id,event))
   }
   async currentSequence(id:string):Promise<import('../protocol/types.js').DurableSequence>{
+    const cached=await this.fastCurrentSequence(id)
+    if(cached!==undefined) return cached as import('../protocol/types.js').DurableSequence
     let events:SessionEvent[]=[]
     try{events=await this.readEventsRaw(id)}catch(error){
       if((error as {code?:string}).code==='ENOENT')return 0 as import('../protocol/types.js').DurableSequence
