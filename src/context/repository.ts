@@ -7,7 +7,7 @@ import { analyzeSource, type FileAnalysis, type SymbolInfo } from './symbols.js'
 import { estimateTokens } from './budget.js'
 import { IGNORED_DIRECTORIES } from '../tools/filesystem-search.js'
 
-const DEFAULT_IGNORES = new Set([...IGNORED_DIRECTORIES, 'coverage', '.turbo', '.termagent'])
+export const DEFAULT_IGNORES = new Set([...IGNORED_DIRECTORIES, 'coverage', '.turbo', '.termagent', 'AppData', 'Library'])
 const TEXT_EXTENSIONS = new Set(['.ts','.tsx','.js','.jsx','.mjs','.cjs','.json','.jsonc','.md','.mdx','.txt','.yml','.yaml','.toml','.ini','.env','.sh','.bash','.zsh','.py','.pyi','.go','.rs','.java','.kt','.kts','.c','.h','.cc','.cpp','.hpp','.cs','.php','.rb','.swift','.sql','.html','.css','.scss','.sass','.vue','.svelte','.xml','.gradle','.properties'])
 const IMPORTANT_FILES = new Set(['package.json','tsconfig.json','vite.config.ts','vite.config.js','next.config.js','next.config.mjs','README.md','AGENTS.md','CLAUDE.md','TERMAGENT.md','Cargo.toml','pyproject.toml','go.mod','pom.xml','build.gradle','Makefile','.env.example'])
 const CACHE_VERSION=3
@@ -49,17 +49,36 @@ async function command(cmd:string,args:string[],cwd:string,timeoutMs=4000):Promi
   })
 }
 
-async function fallbackFiles(root:string):Promise<string[]> {
+/** Injectable directory reader so tests can reproduce unreadable directories portably. */
+export type DirectoryReader=(dir:string,opts:{withFileTypes:true})=>Promise<Array<{ name:string; isDirectory():boolean; isFile():boolean; isSymbolicLink():boolean }>>
+
+export interface FallbackFilesOptions {
+  /** Directory reader; defaults to fs.readdir with withFileTypes. */
+  readdir?:DirectoryReader
+  /** Maximum directory recursion depth; defaults to 24. */
+  maxDepth?:number
+}
+
+// The fallback walker runs outside git (e.g. when TermAgent is launched from a
+// home directory). It must never crash the CLI: unreadable directories
+// (Windows EPERM on locked temp/junction trees, permission walls) are skipped.
+export async function fallbackFiles(root:string,options:FallbackFilesOptions={}):Promise<string[]> {
+  const readdir:DirectoryReader=options.readdir??((dir,opts)=>fs.readdir(dir,opts))
+  const maxDepth=options.maxDepth??24
   const out:string[]=[]
-  async function walk(dir:string){
-    for(const ent of await fs.readdir(dir,{withFileTypes:true})){
+  async function walk(dir:string,depth:number){
+    if(depth>maxDepth)return
+    let entries
+    try{ entries=await readdir(dir,{withFileTypes:true}) }
+    catch{ return }
+    for(const ent of entries){
       if(DEFAULT_IGNORES.has(ent.name)) continue
       const full=path.join(dir,ent.name); const rel=path.relative(root,full)
-      if(ent.isDirectory() && !ent.isSymbolicLink()) await walk(full)
+      if(ent.isDirectory() && !ent.isSymbolicLink()) await walk(full,depth+1)
       else if(ent.isFile() && out.length<20000) out.push(rel)
     }
   }
-  await walk(root); return out
+  await walk(root,0); return out
 }
 
 function isIgnoredPath(rel:string):boolean { const parts=rel.split(/[\\/]+/).filter(Boolean); return parts.some(p=>DEFAULT_IGNORES.has(p)) }
