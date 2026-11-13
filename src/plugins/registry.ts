@@ -1,6 +1,7 @@
 import path from 'node:path'
 import { promises as fs } from 'node:fs'
 import { exists } from '../util/fs.js'
+import { resolveHomeDirectory } from '../util/paths.js'
 import { readPluginManifest } from './manifest.js'
 import type { PluginPackage } from './types.js'
 
@@ -50,7 +51,7 @@ async function inspectCandidate(root: string, source: PluginPackage['source'], e
 
 export async function discoverPluginPackages(cwd: string, configured: string[] = []): Promise<{ packages: PluginPackage[]; errors: Array<{ path: string; error: string }> }> {
   const projectRoot = path.join(cwd, '.termagent', 'plugins')
-  const userRoot = path.join(process.env.HOME || cwd, '.termagent', 'plugins')
+  const userRoot = path.join(resolveHomeDirectory(), '.termagent', 'plugins')
   const candidates: Array<{ path: string; source: PluginPackage['source'] }> = [
     { path: projectRoot, source: 'project' },
     { path: userRoot, source: 'user' },

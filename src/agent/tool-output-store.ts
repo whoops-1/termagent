@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { resolveHomeDirectory } from '../util/paths.js'
 
 export const DEFAULT_MAX_LINES = 2_000
 export const DEFAULT_MAX_BYTES = 50 * 1024
@@ -161,7 +162,7 @@ export function parseToolOutputReference(value: string): string | null {
 }
 
 export function toolOutputStoreRoot(): string {
-  return process.env.TERMAGENT_TOOL_OUTPUT_ROOT || path.join(process.env.HOME || process.cwd(), '.termagent', 'tool-output')
+  return process.env.TERMAGENT_TOOL_OUTPUT_ROOT || path.join(resolveHomeDirectory(), '.termagent', 'tool-output')
 }
 
 function fileNames(key: string, root: string) {

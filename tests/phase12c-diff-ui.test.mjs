@@ -308,11 +308,22 @@ test('Phase 12C permission diff preview uses the same shared renderer geometry',
     input,
   })
   const tool = { name: 'edit_file', description: 'edit', risk: 'write', schema: { type: 'object' } }
+  // requestPermission awaits a real `git diff` child before rendering the
+  // prompt; on Windows a cold git spawn can exceed the old fixed 50 ms wait.
+  // Poll for the prompt instead of racing a constant.
+  const waitFor = async (pattern, timeoutMs = 4000) => {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const screen = stripAnsi(writes.join(''))
+      if (pattern.test(screen)) return screen
+      if (Date.now() > deadline) return screen
+      await wait(25)
+    }
+  }
   try {
     ui.enter()
     const pending = ui.requestPermission({ tool, args: { path: 'src/demo.ts', oldText: 'before = 1', newText: 'before = 2' } })
-    await wait(50)
-    const screen = stripAnsi(writes.join(''))
+    const screen = await waitFor(/Permission required/)
     assert.match(screen, /Permission required/)
     assert.match(screen, /changes/)
     assert.match(screen, /src\/demo\.ts/)

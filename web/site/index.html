@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="TermAgent is a terminal-first coding agent with a zero-dependency runtime core. Install it with npm and run it in any terminal — including Termux on Android." />
+  <meta name="theme-color" content="#000000" />
+  <meta name="color-scheme" content="dark" />
+  <meta property="og:title" content="TermAgent — a coding agent for every terminal" />
+  <meta property="og:description" content="Terminal-first coding agent. Zero runtime dependencies. Runs on Node 22+, including Termux on Android." />
+  <title>TermAgent — a coding agent for every terminal</title>
+  <!-- Self-contained site: no external fonts, no CDN assets, no binary images. -->
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<!-- Icon sprite (24x24 grid, 1.75 stroke). Inline only — works over file:// and offline. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6M12 19h8"/></symbol>
+    <symbol id="i-phone" viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6"/><path d="M6 8h12v2a6 6 0 0 1-12 0V8z"/><path d="M12 16v6"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 2 21 7l-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></symbol>
+    <symbol id="i-package" viewBox="0 0 24 24"><path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4z"/><path d="M12 22V12"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M7.5 4.27l9 5.15"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-7-7 7 7-7 7"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  </defs>
+</svg>
+
+<header class="site-head">
+  <div class="wrap head-row">
+    <a class="brand" href="#top" aria-label="TermAgent — back to top">
+      <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span>TermAgent</span>
+    </a>
+    <nav class="head-nav" aria-label="Site sections">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="#how">How it works</a>
+    </nav>
+    <a class="head-github" href="https://github.com/whoops-1/termagent" target="_blank" rel="noopener noreferrer">
+      <svg class="i" aria-hidden="true"><use href="#i-code"/></svg><span>GitHub</span>
+    </a>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- Hero -->
+  <section class="hero" id="top">
+    <div class="orb orb-a" aria-hidden="true"></div>
+    <div class="orb orb-b" aria-hidden="true"></div>
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <p class="chip-row rise" style="--rd:.04s">
+          <span class="chip"><span class="chip-dot" aria-hidden="true"></span>v1.18.0</span>
+          <span class="chip">MIT</span>
+          <span class="chip">Node ≥ 22</span>
+          <span class="chip">0 runtime deps</span>
+        </p>
+        <h1 class="rise" style="--rd:.13s">A coding agent that lives <span class="grad">in your terminal</span></h1>
+        <p class="sub rise" style="--rd:.21s">TermAgent plans, edits, runs tools and verifies changes from a single prompt. Its runtime core has zero npm dependencies, so it installs and runs anywhere Node 22 runs — including Termux on an Android phone.</p>
+        <div class="cta rise" style="--rd:.29s">
+          <a class="btn btn-primary" href="#install">Install TermAgent<svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+          <a class="btn btn-ghost" href="https://github.com/whoops-1/termagent" target="_blank" rel="noopener noreferrer">View source<svg class="i" aria-hidden="true"><use href="#i-code"/></svg></a>
+        </div>
+        <p class="micro rise" style="--rd:.37s">npm install -g @whoops-1/termagent — no native modules, no postinstall scripts.</p>
+      </div>
+      <div class="hero-term rise" style="--rd:.24s">
+        <span class="sr-only">Terminal demo: npm install -g @whoops-1/termagent, then run termagent to start the agent.</span>
+        <div class="term" aria-hidden="true">
+          <div class="term-head">
+            <span class="term-dots"><i></i><i></i><i></i></span>
+            <span class="term-title">termagent — install demo</span>
+          </div>
+          <div class="term-body" id="demoBody"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Install: tabbed, real commands -->
+  <section class="section" id="install">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <p class="kicker">Install</p>
+        <h2>Real commands, every shell</h2>
+        <p class="section-sub">One package, one command. Pick your shell below — every snippet is copy-paste ready and nothing here is a placeholder.</p>
+      </div>
+      <noscript><p class="noscript-note">JavaScript is off, so the tabs are static: the universal command is <code>npm install -g @whoops-1/termagent</code>, then run <code>termagent</code>. Requires Node.js 22 or newer.</p></noscript>
+      <div class="reveal" style="--d:1">
+        <div class="tabs" role="tablist" aria-label="Install commands">
+          <button type="button" role="tab" id="tab-cmd" data-tab="cmd" aria-controls="panel-cmd" aria-selected="true">cmd.exe</button>
+          <button type="button" role="tab" id="tab-powershell" data-tab="powershell" aria-controls="panel-powershell" aria-selected="false" tabindex="-1">PowerShell</button>
+          <button type="button" role="tab" id="tab-npm" data-tab="npm" aria-controls="panel-npm" aria-selected="false" tabindex="-1">npm · Unix · Termux</button>
+          <button type="button" role="tab" id="tab-source" data-tab="source" aria-controls="panel-source" aria-selected="false" tabindex="-1">Source build</button>
+        </div>
+
+        <div class="tabpanel" id="panel-cmd" role="tabpanel" aria-labelledby="tab-cmd">
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">C:\&gt;</span>
+            <code>node --version</code>
+            <button class="copy" type="button" data-copy="node --version" aria-label="Copy: node --version"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <p class="row-note">Must print v22.x or newer — TermAgent requires Node.js ≥ 22.</p>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">C:\&gt;</span>
+            <code>npm install -g @whoops-1/termagent</code>
+            <button class="copy" type="button" data-copy="npm install -g @whoops-1/termagent" aria-label="Copy: npm install -g @whoops-1/termagent"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">C:\&gt;</span>
+            <code>termagent</code>
+            <button class="copy" type="button" data-copy="termagent" aria-label="Copy: termagent"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <p class="panel-note">The commands are identical in cmd.exe and PowerShell — only the prompt differs.</p>
+        </div>
+
+        <div class="tabpanel" id="panel-powershell" role="tabpanel" aria-labelledby="tab-powershell" hidden>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">PS C:\&gt;</span>
+            <code>npm install -g @whoops-1/termagent</code>
+            <button class="copy" type="button" data-copy="npm install -g @whoops-1/termagent" aria-label="Copy: npm install -g @whoops-1/termagent"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">PS C:\&gt;</span>
+            <code>termagent</code>
+            <button class="copy" type="button" data-copy="termagent" aria-label="Copy: termagent"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <p class="panel-note">Same in Windows PowerShell 5.1 and PowerShell 7+. Node.js ≥ 22 is required — <code>winget install OpenJS.NodeJS.LTS</code> installs it.</p>
+        </div>
+
+        <div class="tabpanel" id="panel-npm" role="tabpanel" aria-labelledby="tab-npm" hidden>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code>npm install -g @whoops-1/termagent</code>
+            <button class="copy" type="button" data-copy="npm install -g @whoops-1/termagent" aria-label="Copy: npm install -g @whoops-1/termagent"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code>termagent</code>
+            <button class="copy" type="button" data-copy="termagent" aria-label="Copy: termagent"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <p class="panel-note">Works on macOS, Linux and Termux. On Termux, start with <code>pkg install nodejs</code>, then the same two commands. Requires Node.js ≥ 22.</p>
+        </div>
+
+        <div class="tabpanel" id="panel-source" role="tabpanel" aria-labelledby="tab-source" hidden>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code>git clone https://github.com/whoops-1/termagent</code>
+            <button class="copy" type="button" data-copy="git clone https://github.com/whoops-1/termagent" aria-label="Copy: git clone https://github.com/whoops-1/termagent"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code>cd termagent</code>
+            <button class="copy" type="button" data-copy="cd termagent" aria-label="Copy: cd termagent"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code>npm install</code>
+            <button class="copy" type="button" data-copy="npm install" aria-label="Copy: npm install"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code>npm run build</code>
+            <button class="copy" type="button" data-copy="npm run build" aria-label="Copy: npm run build"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code>npm link</code>
+            <button class="copy" type="button" data-copy="npm link" aria-label="Copy: npm link"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code>termagent</code>
+            <button class="copy" type="button" data-copy="termagent" aria-label="Copy: termagent"><svg class="i i-copy" aria-hidden="true"><use href="#i-copy"/></svg><svg class="i i-check" aria-hidden="true"><use href="#i-check"/></svg><span class="copy-label">Copy</span></button>
+          </div>
+          <p class="panel-note">Builds the TypeScript runtime into dist/ and links the termagent bin globally. This is how you run main-branch code or contribute.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section class="section" id="features">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <p class="kicker">Why TermAgent</p>
+        <h2>Built for real terminals</h2>
+        <p class="section-sub">A zero-dependency runtime core with mature capabilities — not a toy that happens to print ANSI.</p>
+      </div>
+      <ul class="cards">
+        <li class="card reveal" style="--d:0">
+          <span class="card-icon" aria-hidden="true"><svg class="i"><use href="#i-terminal"/></svg></span>
+          <h3>Terminal-first coding agent</h3>
+          <p>Describe a change; TermAgent plans, edits files, runs tools and verifies the result — all from your prompt line.</p>
+        </li>
+        <li class="card reveal" style="--d:1">
+          <span class="card-icon" aria-hidden="true"><svg class="i"><use href="#i-phone"/></svg></span>
+          <h3>Termux &amp; ARMv7 ready</h3>
+          <p>A pure-JavaScript core with no native modules, designed to install and run on Android phones through Termux.</p>
+        </li>
+        <li class="card reveal" style="--d:2">
+          <span class="card-icon" aria-hidden="true"><svg class="i"><use href="#i-monitor"/></svg></span>
+          <h3>Web View client</h3>
+          <p>Pair a browser as a peer client: sessions, transcripts, permissions and diffs in a dark, phone-friendly UI.</p>
+        </li>
+        <li class="card reveal" style="--d:3">
+          <span class="card-icon" aria-hidden="true"><svg class="i"><use href="#i-plug"/></svg></span>
+          <h3>Skills &amp; plugins</h3>
+          <p>Extend the agent with skill packages and marketplace plugins, loaded through an explicit trust model.</p>
+        </li>
+        <li class="card reveal" style="--d:4">
+          <span class="card-icon" aria-hidden="true"><svg class="i"><use href="#i-layers"/></svg></span>
+          <h3>Daemon &amp; durable tasks</h3>
+          <p>Long work runs in background workers with durable task state that survives restarts and client reconnects.</p>
+        </li>
+        <li class="card reveal" style="--d:5">
+          <span class="card-icon" aria-hidden="true"><svg class="i"><use href="#i-package"/></svg></span>
+          <h3>Zero runtime dependencies</h3>
+          <p>The core runtime ships with no npm dependencies — nothing extra to audit, update or break on a constrained device.</p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- How it works -->
+  <section class="section" id="how">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <p class="kicker">How it works</p>
+        <h2>Three steps to a working agent</h2>
+        <p class="section-sub">No accounts, no daemons to babysit, no dashboard. Install, connect a provider, describe a change.</p>
+      </div>
+      <ol class="steps">
+        <li class="step reveal" style="--d:0">
+          <span class="step-num" aria-hidden="true">1</span>
+          <div class="step-body">
+            <h3>Install</h3>
+            <p>Grab the CLI with <code>npm install -g @whoops-1/termagent</code>, or build from source. Node.js 22+ is the only requirement.</p>
+          </div>
+        </li>
+        <li class="step reveal" style="--d:1">
+          <span class="step-num" aria-hidden="true">2</span>
+          <div class="step-body">
+            <h3>Connect</h3>
+            <p>Add your model provider key to a TermAgent config file — start from <code>.termagent-example.json</code> in the repository — then launch <code>termagent</code>.</p>
+          </div>
+        </li>
+        <li class="step reveal" style="--d:2">
+          <span class="step-num" aria-hidden="true">3</span>
+          <div class="step-body">
+            <h3>Run</h3>
+            <p>Open a project, describe a change and approve edits as they arrive. Sessions are durable: checkpoints, undo and replay included.</p>
+          </div>
+        </li>
+      </ol>
+    </div>
+  </section>
+</main>
+
+<footer class="site-foot">
+  <div class="wrap foot-grid">
+    <div class="foot-brand">
+      <a class="brand" href="#top" aria-label="TermAgent — back to top">
+        <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <span>TermAgent</span>
+      </a>
+      <p>A terminal-first coding agent with a zero-dependency runtime core. Built for Termux, ARMv7 and every other terminal.</p>
+    </div>
+    <nav class="foot-links" aria-label="Project links">
+      <a href="https://github.com/whoops-1/termagent" target="_blank" rel="noopener noreferrer">GitHub repository</a>
+      <a href="https://github.com/whoops-1/termagent#readme" target="_blank" rel="noopener noreferrer">Documentation</a>
+      <a href="https://www.npmjs.com/package/@whoops-1/termagent" target="_blank" rel="noopener noreferrer">npm package</a>
+      <a href="https://github.com/whoops-1/termagent/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a>
+    </nav>
+  </div>
+  <div class="wrap foot-legal">
+    <p>© 2026 TermAgent contributors · Released under the MIT License · v1.18.0 · Requires Node.js ≥ 22</p>
+  </div>
+</footer>
+
+<div class="sr-only" id="copyStatus" role="status" aria-live="polite"></div>
+<script src="./app.js" defer></script>
+</body>
+</html>

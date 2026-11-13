@@ -21,7 +21,7 @@ export function verifyTool(timeout=120000,maxOutput=20000,manager=new TaskManage
       const cmd=a.command||await detect(c.cwd)
       if(!cmd) return {output:'No safe verification command detected. Inspect project files and choose an explicit command.',metadata:{status:'no_command',ok:false,verification:{status:'no_command',ok:false,settled:true,facts:[]}}}
       const timeoutMs=Math.min(Math.max(1,Number(a.timeoutMs||timeout)),300000)
-      const handle=await startManagedShell(manager,{shell:process.env.SHELL||'sh',command:cmd,cwd:c.cwd,timeout:timeoutMs,maxPreviewBytes:Math.max(1,maxOutput),outputLimitBytes:64*1024*1024,abort:c.abort,detached:true,parentSessionId:c.sessionID,scopePaths:c.scopePaths})
+      const handle=await startManagedShell(manager,{command:cmd,cwd:c.cwd,timeout:timeoutMs,maxPreviewBytes:Math.max(1,maxOutput),outputLimitBytes:64*1024*1024,abort:c.abort,detached:true,parentSessionId:c.sessionID,scopePaths:c.scopePaths})
       const result=await handle.result
       const task=await manager.get(handle.task.id)
       const exitCode=result.termination==='timeout' ? 124 : result.code

@@ -22,6 +22,9 @@ import {
 } from './security.js'
 
 const JSON_BODY_LIMIT = 2 * 1024 * 1024
+// Keep-alive/liveness floor for every open SSE subscription. Clients use these
+// frames (and their currentSequence field) to distinguish a quiet run from a
+// silently stalled reader, and proxies keep the connection open.
 const SSE_HEARTBEAT_MS = 15_000
 const SSE_REPLAY_PAGE = 100
 const SSE_DURABLE_POLL_MS = 1_000
@@ -182,10 +185,30 @@ function sse(res: ServerResponse, event: string, data: unknown) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
 }
 
+/**
+ * Durable replay cursor for SSE subscriptions.
+ *
+ * `after` is the canonical query parameter used by TermAgent clients, `since`
+ * is an accepted synonym for explicit replay-from requests, and `Last-Event-ID`
+ * lets a resuming EventSource client continue without rewriting its URL. An
+ * explicit query parameter wins over the header because the client's own
+ * acknowledged durable sequence is authoritative.
+ */
+function replayCursor(url: URL, req: IncomingMessage): number {
+  const header = req.headers['last-event-id']
+  const raw = url.searchParams.get('after')
+    ?? url.searchParams.get('since')
+    ?? (Array.isArray(header) ? header[0] : header)
+    ?? ''
+  if (String(raw).trim() === '') return 0
+  const value = Number(raw)
+  return Number.isFinite(value) ? Math.floor(value) : Number.NaN
+}
+
 /** @internal Write one SSE frame and respect Node's writable backpressure signal. */
-export function writeSse(res: ServerResponse, event: string, data: unknown): Promise<boolean> {
+export function writeSse(res: ServerResponse, event: string, data: unknown, id?: number | string): Promise<boolean> {
   if (res.writableEnded || res.destroyed) return Promise.resolve(false)
-  const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+  const frame = `${id === undefined ? '' : `id: ${id}\n`}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
   if (res.write(frame)) return Promise.resolve(true)
   return new Promise(resolve => {
     const cleanup = () => {
@@ -300,7 +323,7 @@ async function streamTaskEvents(runtime: Runtime, api: ReturnType<typeof createA
       while (!closed) {
         const page = await api.taskEvents(id, 100, cursor)
         for (const event of page) {
-          if (closed || !(await writeSse(res, 'event', event))) return
+          if (closed || !(await writeSse(res, 'event', event, event.seq))) return
           cursor = event.seq
         }
         if (page.length < 100) return
@@ -376,7 +399,9 @@ async function streamSessionEvents(runtime: Runtime, api: ReturnType<typeof crea
       while (!closed) {
         const page = await api.events(id, cursor)
         for (const event of page.events) {
-          if (closed || !(await writeSse(res, 'event', event))) return
+          // `id:` carries the durable sequence so a native EventSource client
+          // can resume with Last-Event-ID after a transport drop.
+          if (closed || !(await writeSse(res, 'event', event, event.sequence))) return
           cursor = event.sequence
         }
         if (!page.hasMore) return
@@ -417,7 +442,16 @@ async function streamSessionEvents(runtime: Runtime, api: ReturnType<typeof crea
         if (!(await writeSse(res, 'live', live))) break
       }
       if (closed) break
-      await replay()
+      // Live durable delivery (Phase 14I batch-2 trace): the durable poll only
+      // needs to fetch pages when the durable sequence has actually moved.
+      // currentSequence is a stat-validated fast path in the session store
+      // (append optimization), so this gate keeps the per-client poll from
+      // rescanning the whole session log every tick while preserving the
+      // ≤1 s delivery floor for appends written by detached task workers that
+      // do not share this in-process event bus. Same-process durable appends
+      // still wake the bus and replay immediately.
+      const durableSequenceNow = await api.currentSequence(id)
+      if (durableSequenceNow > cursor) await replay()
     }
   } catch (error) {
     if (!closed) {
@@ -560,8 +594,7 @@ export async function startServer(runtime: Runtime, opts: StartServerOptions): P
         const taskId = decodeURIComponent(parts[3])
         if (method === 'GET' && parts.length === 4) return json(res, 200, await api.task(taskId))
         if (method === 'GET' && parts[4] === 'events' && parts[5] === 'stream') {
-          const after = Number(url.searchParams.get('after') || 0)
-          return await streamTaskEvents(runtime, api, taskId, res, after, requireDeviceCurrent)
+          return await streamTaskEvents(runtime, api, taskId, res, replayCursor(url, req), requireDeviceCurrent)
         }
         if (method === 'GET' && parts[4] === 'events') {
           const rawLimit = url.searchParams.get('limit')
@@ -607,7 +640,7 @@ export async function startServer(runtime: Runtime, opts: StartServerOptions): P
           const limit = parsedLimit === undefined ? undefined : Number.isFinite(parsedLimit) ? Math.floor(parsedLimit) : 100
           return json(res, 200, await api.messages(id, Number(url.searchParams.get('after') || 0), limit, url.searchParams.get('tail') === '1'))
         }
-        if (method === 'GET' && tail[0] === 'events' && tail[1] === 'stream') return streamSessionEvents(runtime, api, id, res, Number(url.searchParams.get('after') || 0), requireDeviceCurrent)
+        if (method === 'GET' && tail[0] === 'events' && tail[1] === 'stream') return streamSessionEvents(runtime, api, id, res, replayCursor(url, req), requireDeviceCurrent)
         if (method === 'GET' && tail[0] === 'events') return json(res, 200, await api.events(id, Number(url.searchParams.get('after') || 0)))
         if (method === 'GET' && tail[0] === 'status') return json(res, 200, await api.statusForSession(id))
         if (method === 'GET' && tail[0] === 'diff') return json(res, 200, await api.diff(id, url.searchParams.get('staged') === '1'))

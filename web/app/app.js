@@ -12,6 +12,23 @@ const localStore = {
   get(key, fallback) { try { return localStorage.getItem(key) || fallback; } catch { return fallback; } },
   set(key, value) { try { localStorage.setItem(key, value); } catch {} },
 };
+// Phase 14I batch-3 (Stream W): reconnect recovery. The durable log is the
+// authoritative replay source; live frames are only a latency path between
+// acknowledgements. The last acknowledged durable sequence is persisted per
+// session (localStorage, presentation-only) so a reload, a new tab, or a
+// dropped SSE transport resumes replay where the previous subscriber stopped.
+const STREAM_WATCHDOG_RUN_MS = 20_000;
+const STREAM_WATCHDOG_IDLE_MS = 40_000;
+const ackKey = (sessionId) => `termagent:webview:seq:${sessionId}`;
+function readAckSequence(sessionId) {
+  const value = Number(localStore.get(ackKey(sessionId), ''));
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+function writeAckSequence(sessionId, sequence) {
+  const value = Number(sequence);
+  if (!sessionId || !Number.isSafeInteger(value) || value < 0) return;
+  localStore.set(ackKey(sessionId), String(value));
+}
 const mobilePointer = matchMedia('(pointer: coarse)');
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
@@ -23,8 +40,8 @@ const state = {
   tasks: [], checkpoints: [], context: null, diff: null,
   subagentPollTimer: null, subagentStreamAbort: null, subagentView: null, subagentRootId: '', subagentTaskId: '', subagentRequestKey: 0,
   cursor: 0, historyEvents: [], activity: [], activityIds: new Set(),
-  toolLifecycle: new Map(), readFiles: new Map(), expandedTools: new Set(),
-  streamAbort: null, wasConnected: false, connectionLost: false, lastHeartbeat: 0,
+  toolLifecycle: new Map(), toolCards: new Map(), toolCardSeq: 0, readFiles: new Map(), expandedTools: new Set(),
+  streamAbort: null, wasConnected: false, connectionLost: false, lastHeartbeat: 0, restartStream: false,
   streamState: 'connecting', streamProbeAt: 0, streamProbeBusy: false,
   promptStreamActive: false, promptStreamSuppressUntil: 0,
   status: null, pendingPrompt: '', liveText: '', liveReasoning: '', liveStreamId: '',
@@ -299,7 +316,7 @@ async function selectSession(id, { persist = false } = {}) {
     state.streamAbort?.abort();
     state.streamAbort = null;
     state.activeId = id;
-    state.cursor = 0;
+    state.cursor = readAckSequence(id);
     state.lastHeartbeat = 0;
     state.wasConnected = false;
     state.connectionLost = false;
@@ -329,6 +346,9 @@ async function selectSession(id, { persist = false } = {}) {
     state.stopRequested = false;
     state.activityIds = new Set();
     state.toolLifecycle = new Map();
+    state.toolCards = new Map();
+    state.toolCardSeq = 0;
+    state.restartStream = false;
     state.readFiles = new Map();
   }
   if (persist) localStore.set('termagent:webview:session', id);
@@ -358,9 +378,21 @@ async function refreshCurrent({ initial = false } = {}) {
     const snapshotSequence = Number(snapshot.sequence || 0);
     state.meta = snapshot.state?.meta || state.sessions.find((session) => session.id === id) || null;
     state.messages = Array.isArray(snapshot.state?.messages) ? snapshot.state.messages : [];
+    // A committed assistant message supersedes the live tail that produced it.
+    // Clearing it on the snapshot (instead of on the durable frame) avoids a
+    // flash between the durable frame and the next refresh, while an unmatched
+    // partial tail is kept until the run status says otherwise.
+    if (state.liveText && state.messages.some((message) => message.role === 'assistant' && String(message.content || '') === state.liveText)) {
+      state.liveText = '';
+      state.liveStreamId = '';
+    }
+    if (state.liveReasoning && state.messages.some((message) => message.role === 'assistant' && String(message.reasoning || '') === state.liveReasoning)) {
+      state.liveReasoning = '';
+    }
     state.pendingInteractions = Array.isArray(snapshot.state?.pendingInteractions) ? snapshot.state.pendingInteractions : [];
     state.context = snapshot.state?.context || null;
     state.cursor = Math.max(state.cursor, snapshotSequence);
+    writeAckSequence(id, state.cursor);
     state.status = await state.client.getSessionStatus(id).catch(() => ({ running: false, sequence: snapshotSequence }));
     if (state.status.running) {
       state.localRunning = false;
@@ -371,6 +403,13 @@ async function refreshCurrent({ initial = false } = {}) {
     } else if (state.runState === 'running' && !state.localRunning) {
       state.runState = 'done';
       state.runEndedAt = Date.now();
+    }
+    if (!state.status.running && !state.localRunning && state.runState !== 'running') {
+      // No run is active: committed messages are the only transcript truth.
+      // A reconnect must not keep a partial live tail that lost a gap.
+      state.liveText = '';
+      state.liveReasoning = '';
+      state.liveStreamId = '';
     }
     const parts = await Promise.allSettled([
       state.client.getTodo(id),
@@ -402,6 +441,18 @@ async function refreshCurrent({ initial = false } = {}) {
   }
 }
 function unwrap(result, fallback) { return result?.status === 'fulfilled' ? result.value : fallback; }
+
+async function reconcileAfterReconnect(id) {
+  if (!id || id !== state.activeId) return;
+  // Live-only frames are never replayed. Rebuild committed messages, tool
+  // cards, pending interactions and run status from the authoritative snapshot;
+  // the streaming tail restarts from the next thin delta instead of keeping
+  // text that may have lost a gap while the transport was down.
+  state.liveText = '';
+  state.liveReasoning = '';
+  state.liveStreamId = '';
+  await refreshCurrent().catch(() => {});
+}
 
 function startEventStream(id) {
   state.streamAbort?.abort();
@@ -436,7 +487,9 @@ function startEventStream(id) {
         if (frame.event === 'ready') {
           const data = frame.data || {};
           if (typeof data.replayAfter === 'number') state.cursor = Math.max(state.cursor, data.replayAfter);
-          if (state.connectionLost) {
+          writeAckSequence(id, state.cursor);
+          const reconnected = state.connectionLost;
+          if (reconnected) {
             setBanner(`Connection restored · replaying after seq ${state.cursor}`, 'done');
             setTimeout(() => { if (state.wasConnected && !state.connectionLost) setBanner(''); }, 3000);
             state.connectionLost = false;
@@ -445,6 +498,9 @@ function startEventStream(id) {
           state.wasConnected = true;
           $('#runtimeStatus').textContent = 'Live updates connected';
           $('#runtimeDot').dataset.s = 'done';
+          // Replay covers every missed durable frame; the snapshot promises that
+          // live-only state (active run, streaming tail) converges as well.
+          if (reconnected) void reconcileAfterReconnect(id);
         } else if (frame.event === 'connection') {
           const payload = frame.data?.payload || frame.data || {};
           if (payload.state === 'connected') {
@@ -466,8 +522,21 @@ function startEventStream(id) {
         } else if (frame.event === 'error') {
           const data = frame.data || {};
           if (data.code === 'session-not-found') setBanner('This session is no longer available. Refresh the session list.', 'error');
-          else if (data.message) setBanner(data.message, 'error');
+          else if (data.code === 'invalid-cursor') {
+            // The persisted acknowledgement can be ahead of a truncated or
+            // restored session log. Drop it and resync from the snapshot.
+            state.cursor = 0;
+            writeAckSequence(id, 0);
+            state.restartStream = true;
+            setBanner('The durable replay cursor was reset. Session state is being reconciled.', 'warn');
+            void refreshCurrent().catch(() => {});
+          } else if (data.message) setBanner(data.message, 'error');
         }
+      }
+      if (state.restartStream && !controller.signal.aborted && id === state.activeId) {
+        state.restartStream = false;
+        state.lastHeartbeat = Date.now();
+        startEventStream(id);
       }
     } catch (error) {
       if (controller.signal.aborted) return;
@@ -481,13 +550,103 @@ function startEventStream(id) {
   })();
 }
 
+// Live/durable activity is presentation state keyed by a stable id so replay,
+// snapshot reconciliation and live frames update one row instead of appending
+// duplicates for the same tool call or task transition.
+function pushActivity(entry) {
+  if (!entry || !entry.title) return;
+  const key = entry.key || entry.eventId;
+  const existing = key ? state.activity.findIndex((item) => (item.key || item.eventId) === key) : -1;
+  if (existing >= 0) {
+    state.activity[existing] = { ...state.activity[existing], ...entry, at: state.activity[existing].at };
+    return;
+  }
+  state.activity.unshift(entry);
+  state.activity = state.activity.slice(0, 40);
+}
+
+function lifecycleToolStatus(record) {
+  const value = String(record?.state || record?.outcome || '');
+  if (record?.error || /error|failed|denied|interrupted|rejected/.test(value)) return 'error';
+  if (/completed|success|done|exited/.test(value)) return 'done';
+  if (/running|pending|progress|started|called/.test(String(record?.state || record?.kind || ''))) return 'running';
+  return undefined;
+}
+
+function upsertToolCard(callId, patch = {}) {
+  const key = String(callId || '');
+  if (!key) return null;
+  const current = state.toolCards.get(key) || {
+    callId: key, name: 'Tool', argsRaw: '{}', output: '', status: 'running',
+    at: Date.now(), order: ++state.toolCardSeq,
+  };
+  const next = { ...current };
+  for (const [field, value] of Object.entries(patch)) if (value !== undefined) next[field] = value;
+  state.toolCards.set(key, next);
+  return next;
+}
+
+function toolCardStatus(card) {
+  const value = String(card?.status || '');
+  if (value === 'error' || value === 'interrupted') return 'error';
+  if (value === 'done' || value === 'completed') return 'done';
+  return state.localRunning || state.status?.running || state.runState === 'running' ? 'running' : 'done';
+}
+
+// Tool cards are an idempotent projection keyed by provider call ID. Snapshot
+// messages and tool results are upserted first; durable/live lifecycle records
+// then merge into the same card. Replay can therefore never duplicate a card,
+// and a card with no persisted message yet is backfilled from the lifecycle.
+function syncToolCards() {
+  for (const message of state.messages) {
+    if (!message) continue;
+    if (Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        const callId = String(call?.id || call?.callId || '');
+        if (!callId) continue;
+        upsertToolCard(callId, {
+          name: String(call?.function?.name || call?.name || 'Tool'),
+          argsRaw: call?.function?.arguments ?? call?.argumentsRaw ?? call?.arguments ?? '{}',
+        });
+      }
+    }
+    if (message.role === 'tool' && message.tool_call_id) {
+      const output = String(message.content ?? '');
+      upsertToolCard(String(message.tool_call_id), {
+        output,
+        ...(message.name ? { name: String(message.name) } : {}),
+        status: /^ERROR\b/.test(output.trim()) ? 'error' : 'done',
+      });
+    }
+  }
+  for (const [callId, record] of state.toolLifecycle) {
+    const status = typeof record.state === 'string' ? lifecycleToolStatus(record) : undefined;
+    upsertToolCard(callId, {
+      name: String(record.name || record.tool || 'Tool'),
+      argsRaw: typeof record.argumentsRaw === 'string' ? record.argumentsRaw : record.arguments ? JSON.stringify(record.arguments) : undefined,
+      status,
+      description: typeof record.description === 'string' ? record.description : undefined,
+      durationMs: typeof record.durationMs === 'number'
+        ? record.durationMs
+        : record.startedAt && record.endedAt ? Number(record.endedAt) - Number(record.startedAt) : undefined,
+    });
+  }
+}
+
 function handleLiveEvent(event) {
   if (!event || event.sessionId !== state.activeId) return;
-  // The foreground POST stream is the authoritative live projection for a
-  // prompt initiated in this tab. Ignore its parallel EventBus copy to avoid
-  // rendering duplicate tokens and tool cards; durable events still reconcile
-  // through the session event stream.
-  if (state.promptStreamActive || Date.now() < state.promptStreamSuppressUntil) return;
+  // The foreground POST stream is the authoritative live projection for the
+  // prompt it owns: token deltas and the tool activity it renders. Suppress
+  // ONLY those duplicate sources while it is active. Everything else —
+  // run-state changes, task lifecycle, notifications — must stay live during
+  // a running prompt; the previous blanket suppression made tool calls and
+  // task progress visible only after stop/reconnect (Phase 14I batch-2
+  // live-delivery trace).
+  if (state.promptStreamActive || Date.now() < state.promptStreamSuppressUntil) {
+    const kind = String(event.kind || '');
+    if (kind === 'session.text.delta' || kind === 'session.reasoning.delta'
+      || kind === 'runtime.activity.changed' || kind === 'session.tool.output.delta') return;
+  }
   const payload = event.payload && typeof event.payload === 'object' ? event.payload : {};
   const streamId = String(payload.streamId || '');
   if (event.kind === 'runtime.status.changed') {
@@ -533,28 +692,66 @@ function handleLiveEvent(event) {
   } else if (event.kind === 'runtime.activity.changed') {
     state.runLabel = String(payload.activityLabel || payload.message || payload.name || 'Working');
     if (payload.name) {
-      state.activity.unshift({ title: String(payload.activityLabel || payload.name), sub: payload.args ? truncate(JSON.stringify(payload.args), 140) : '', at: Number(event.timestamp || Date.now()), s: 'running', eventId: event.eventId });
-      state.activity = state.activity.slice(0, 40);
+      pushActivity({
+        key: payload.callId ? `tool:${payload.callId}` : undefined,
+        title: String(payload.activityLabel || payload.name),
+        sub: payload.args ? truncate(JSON.stringify(payload.args), 140) : '',
+        at: Number(event.timestamp || Date.now()),
+        s: 'running',
+        eventId: event.eventId,
+      });
+      // A live tool start renders the card immediately (with its call ID).
+      // The durable session.tool.called frame later replaces the same card.
+      if (payload.callId && (payload.state === 'tool' || payload.phase === 'started')) {
+        upsertToolCard(payload.callId, {
+          name: String(payload.name),
+          status: 'running',
+          description: String(payload.activityLabel || payload.name),
+          argsRaw: payload.args === undefined ? undefined : typeof payload.args === 'string' ? payload.args : JSON.stringify(payload.args),
+          at: Number(event.timestamp || Date.now()),
+        });
+        renderFeed();
+      }
     }
     renderRunbar();
     renderActivity();
   } else if (event.kind === 'session.tool.output.delta') {
     const name = String(payload.name || 'Tool');
-    state.activity.unshift({ title: `${name} · result`, sub: truncate(String(payload.output || ''), 140), at: Number(event.timestamp || Date.now()), s: payload.metadata?.toolLifecycle?.state === 'error' ? 'error' : 'done', eventId: event.eventId });
-    state.activity = state.activity.slice(0, 40);
+    const callId = String(payload.callId || '');
+    const failed = payload.metadata?.toolLifecycle?.state === 'error' || Boolean(payload.metadata?.toolLifecycle?.error);
+    const output = String(payload.output || '');
+    if (callId) {
+      upsertToolCard(callId, { name, output, status: failed ? 'error' : 'done', at: Number(event.timestamp || Date.now()) });
+      renderFeed();
+    }
+    pushActivity({
+      key: callId ? `tool:${callId}` : undefined,
+      title: `${name} · result`,
+      sub: truncate(output, 140),
+      at: Number(event.timestamp || Date.now()),
+      s: failed ? 'error' : 'done',
+      eventId: event.eventId,
+    });
     renderActivity();
   }
 }
 
 function handleDurableEvent(event) {
   if (!event || event.sessionId !== state.activeId || event.durable !== true) return;
-  if (Number.isSafeInteger(Number(event.sequence))) state.cursor = Math.max(state.cursor, Number(event.sequence));
-  if (!state.activityIds.has(event.eventId)) {
-    state.activityIds.add(event.eventId);
-    state.historyEvents.push(event);
-    if (state.historyEvents.length > 300) state.historyEvents.shift();
-    observeDurableEvent(event, true);
+  const sequence = Number(event.sequence);
+  // Reconnect replay may re-deliver frames the client already applied. A frame
+  // older than the last acknowledged sequence must never overwrite newer state,
+  // and a replayed eventId must never duplicate a card, row or file entry.
+  if (Number.isSafeInteger(sequence) && sequence > 0 && sequence < state.cursor) return;
+  if (state.activityIds.has(event.eventId)) return;
+  state.activityIds.add(event.eventId);
+  if (Number.isSafeInteger(sequence) && sequence > 0) {
+    state.cursor = Math.max(state.cursor, sequence);
+    writeAckSequence(state.activeId, state.cursor);
   }
+  state.historyEvents.push(event);
+  if (state.historyEvents.length > 300) state.historyEvents.shift();
+  observeDurableEvent(event, true);
   if (state.runState === 'running' || state.localRunning) {
     if (event.kind === 'session.permission.asked') state.runLabel = 'Waiting for permission';
     else if (event.kind === 'session.question.asked') state.runLabel = 'Waiting for your answer';
@@ -564,6 +761,8 @@ function handleDurableEvent(event) {
   const relevant = new Set([
     'session.message.user', 'session.message.assistant', 'session.message.tool', 'session.message.updated',
     'session.turn.started', 'session.turn.completed', 'session.turn.failed', 'session.turn.interrupted', 'session.tool.called',
+    'session.tool.started', 'session.tool.progress', 'session.tool.completed', 'session.tool.failed',
+    'session.reasoning.started', 'session.reasoning.completed',
     'session.permission.asked', 'session.permission.resolved', 'session.question.asked', 'session.question.resolved',
     'session.todo.updated', 'session.workflow.updated', 'session.queue.updated', 'session.verification.completed',
     'session.diff.updated', 'session.mutation.applied', 'session.compaction.completed', 'session.history.undo',
@@ -571,6 +770,9 @@ function handleDurableEvent(event) {
     'session.task.created', 'session.task.updated', 'session.task.notification',
   ]);
   if (relevant.has(event.kind)) scheduleRefresh();
+  // Tool lifecycle frames update the keyed card immediately; the snapshot
+  // refresh above supplies the persisted tool result output afterwards.
+  if (String(event.kind || '').startsWith('session.tool.')) renderFeed();
   $('#kvSeq').textContent = `seq ${state.cursor}`;
   renderActivity();
   renderFiles();
@@ -578,24 +780,59 @@ function handleDurableEvent(event) {
 
 function observeDurableEvent(event, shouldRender) {
   const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
-  if (event.kind === 'session.tool.called' || event.kind === 'session.tool.started' || event.kind === 'session.tool.completed' || event.kind === 'session.tool.failed') {
-    const id = String(payload.callId || payload.id || event.eventId);
-    state.toolLifecycle.set(id, { ...state.toolLifecycle.get(id), ...payload, kind: event.kind, timestamp: event.timestamp });
+  if (String(event.kind || '').startsWith('session.tool.')) {
+    // Key lifecycle records by the provider call ID only. Falling back to the
+    // event ID fragments one tool call into several records and defeats
+    // replay-safe card upserts.
+    const callId = String(payload.callId || payload.toolCallId || '');
     const name = String(payload.name || payload.tool || 'Tool');
-    const args = payload.parsedArguments || payload.arguments || payload.argumentsRaw || {};
+    const args = payload.parsedArguments ?? payload.arguments ?? payload.argumentsRaw ?? {};
+    if (callId) {
+      state.toolLifecycle.set(callId, { ...state.toolLifecycle.get(callId), ...payload, kind: event.kind, timestamp: event.timestamp });
+      const lifecycleState = typeof payload.state === 'string' ? lifecycleToolStatus(payload) : undefined;
+      upsertToolCard(callId, {
+        name,
+        argsRaw: typeof payload.argumentsRaw === 'string' ? payload.argumentsRaw : typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+        status: lifecycleState,
+        description: typeof payload.description === 'string' ? payload.description : undefined,
+        durationMs: typeof payload.durationMs === 'number'
+          ? payload.durationMs
+          : payload.startedAt && payload.endedAt ? Number(payload.endedAt) - Number(payload.startedAt) : undefined,
+        output: typeof payload.output === 'string' ? payload.output : typeof payload.result === 'string' ? payload.result : undefined,
+      });
+    }
     const pathValue = typeof args === 'object' && args ? (args.path || args.file_path || args.filePath) : null;
     if (pathValue) {
       const file = String(pathValue);
       state.readFiles.set(file, { path: file, status: /write|edit|patch|apply/i.test(name) ? 'Changed' : 'Read', time: event.timestamp });
     }
     if (shouldRender) {
-      state.activity.unshift({ title: name, sub: truncate(typeof args === 'string' ? args : JSON.stringify(args), 140), at: Number(event.timestamp || Date.now()), s: /failed|error/.test(event.kind) ? 'error' : /completed/.test(event.kind) ? 'done' : 'running', eventId: event.eventId });
-      state.activity = state.activity.slice(0, 40);
+      const status = typeof payload.state === 'string' ? lifecycleToolStatus(payload) : 'running';
+      pushActivity({
+        key: callId ? `tool:${callId}` : undefined,
+        title: name,
+        sub: truncate(typeof args === 'string' ? args : JSON.stringify(args), 140),
+        at: Number(event.timestamp || Date.now()),
+        s: status,
+        eventId: event.eventId,
+      });
     }
+  } else if (event.kind === 'session.task.created' || event.kind === 'session.task.updated' || event.kind === 'session.task.notification') {
+    const task = payload.task && typeof payload.task === 'object' ? payload.task : payload;
+    const taskId = String(task.id || payload.taskId || '');
+    const status = String(payload.status || task.status || '');
+    const label = String(payload.message || payload.reason || task.prompt || task.command || taskId || 'Task update');
+    pushActivity({
+      key: `task:${taskId}:${status || event.kind}`,
+      title: status ? `Task ${status}` : event.kind === 'session.task.notification' ? 'Task update' : 'Task activity',
+      sub: truncate(label, 140),
+      at: Number(event.timestamp || Date.now()),
+      s: /fail/.test(status) ? 'error' : /cancel|timeout/.test(status) ? 'warn' : /complete|exit|done/.test(status) ? 'done' : 'running',
+      eventId: event.eventId,
+    });
   } else if (event.kind === 'session.verification.completed') {
     const description = String(payload.command || payload.name || payload.message || 'Workspace verification');
-    state.activity.unshift({ title: 'Verification', sub: description, at: Number(event.timestamp || Date.now()), s: payload.ok === false || payload.status === 'failed' ? 'error' : 'done', eventId: event.eventId });
-    state.activity = state.activity.slice(0, 40);
+    pushActivity({ key: undefined, title: 'Verification', sub: description, at: Number(event.timestamp || Date.now()), s: payload.ok === false || payload.status === 'failed' ? 'error' : 'done', eventId: event.eventId });
   } else if (event.kind === 'session.mutation.applied') {
     const files = Array.isArray(payload.files) ? payload.files : payload.path ? [payload.path] : [];
     for (const file of files) if (typeof file === 'string') state.readFiles.set(file, { path: file, status: 'Changed', time: event.timestamp });
@@ -747,29 +984,26 @@ function toolSummary(name, args) {
   const command = value.command || value.cmd || value.path || value.file_path || value.url || value.query || value.prompt;
   return `${name}${command ? ` · ${String(command)}` : ''}`;
 }
-function latestLifecycle(callId, name) {
-  const exact = state.toolLifecycle.get(String(callId));
-  if (exact) return exact;
-  const matches = [...state.toolLifecycle.values()].filter((record) => String(record.name || record.tool || '') === String(name));
-  return matches.at(-1);
-}
-function renderToolCard(call, messageIndex, output) {
-  const toolName = String(call?.function?.name || call?.name || 'Tool');
-  const argsRaw = call?.function?.arguments ?? call?.argumentsRaw ?? call?.arguments ?? '{}';
+function renderToolCard(card) {
+  const callId = String(card?.callId || '');
+  const toolName = String(card?.name || 'Tool');
+  const argsRaw = card?.argsRaw ?? '{}';
   const args = parseArgs(argsRaw);
-  const callId = String(call?.id || call?.callId || `${messageIndex}:${toolName}`);
-  const lifecycle = latestLifecycle(callId, toolName);
-  const status = output ? 'done' : /failed|error/.test(String(lifecycle?.kind || lifecycle?.state || '')) ? 'error' : lifecycle?.state === 'running' ? 'running' : state.localRunning ? 'running' : 'done';
+  const status = toolCardStatus(card);
   const expanded = state.expandedTools.has(callId);
-  const outputText = output?.content ?? lifecycle?.output ?? lifecycle?.result ?? (status === 'running' ? 'Waiting for tool output…' : 'No output was stored for this tool call.');
+  const outputText = card?.output || (status === 'running' ? 'Waiting for tool output…' : 'No output was stored for this tool call.');
+  const durationMs = Number(card?.durationMs || 0);
+  // The provider call ID stays visible so live activity, durable replay and the
+  // copied output can be traced to one tool call.
+  const callLabel = callId ? ` · call ${callId.length > 20 ? `${callId.slice(0, 18)}…` : callId}` : '';
   return `<article class="tool${expanded ? ' is-open' : ''}" data-state="${status}" data-tool-id="${esc(callId)}">
     <button class="tool-head" type="button" aria-expanded="${expanded}" data-tool-toggle="${esc(callId)}">
       ${icon('terminal', 'tool-ico')}<span class="tool-cmd">${esc(toolSummary(toolName, args))}</span>
       <span class="tool-state">${status === 'running' ? icon('spinner', 'spin') : status === 'error' ? '!' : icon('check')}</span>
-      <time class="tool-time">${lifecycle?.durationMs ? esc(`${(Number(lifecycle.durationMs) / 1000).toFixed(1)}s`) : ''}</time>${icon('chevron-down', 'chev')}
+      <time class="tool-time">${durationMs ? esc(`${(durationMs / 1000).toFixed(1)}s`) : ''}</time>${icon('chevron-down', 'chev')}
     </button>
     <div class="tool-body"><div>
-      <p class="tool-desc">${esc(lifecycle?.description || `${toolName} · input and captured output`)}</p>
+      <p class="tool-desc">${esc(card?.description || `${toolName} · input and captured output`)}${callLabel}</p>
       <pre class="tool-args">${esc(typeof args === 'string' ? args : JSON.stringify(args, null, 2))}</pre>
       <pre class="term"><code>${esc(String(outputText ?? ''))}</code></pre>
       <div class="tool-foot"><button class="link-btn" type="button" data-copy="${esc(callId)}">Copy output</button></div>
@@ -793,10 +1027,9 @@ function renderFeed() {
   if (!feedInner) return;
   const wasAtBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 90;
   const oldTop = feed.scrollTop;
-  const outputByCall = new Map();
-  for (const message of state.messages) if (message.role === 'tool' && message.tool_call_id) outputByCall.set(message.tool_call_id, message);
+  syncToolCards();
   const items = [];
-  let toolIndex = 0;
+  const renderedCards = new Set();
   for (let i = 0; i < state.messages.length; i++) {
     const message = state.messages[i];
     if (!message || message.role === 'system') continue;
@@ -807,13 +1040,35 @@ function renderFeed() {
       if (message.reasoning) items.push(`<details class="reasoning"><summary>Reasoning / activity details</summary><div class="reasoning-body">${esc(message.reasoning)}</div></details>`);
       if (Array.isArray(message.tool_calls)) {
         for (const call of message.tool_calls) {
-          toolIndex++;
-          items.push(renderToolCard(call, i, outputByCall.get(call.id)));
+          const callId = String(call?.id || call?.callId || '');
+          if (callId && renderedCards.has(callId)) continue;
+          const card = callId ? state.toolCards.get(callId) : null;
+          if (card) {
+            renderedCards.add(callId);
+            items.push(renderToolCard(card));
+          } else {
+            // Legacy calls without a provider ID still render once, keyed by
+            // their message position rather than inventing a shared card.
+            items.push(renderToolCard({
+              callId: `tool-${i}-${renderedCards.size}`,
+              name: String(call?.function?.name || call?.name || 'Tool'),
+              argsRaw: call?.function?.arguments ?? call?.argumentsRaw ?? call?.arguments ?? '{}',
+            }));
+          }
         }
       }
     } else if (message.role === 'tool' && !message.tool_call_id) {
-      items.push(renderToolCard({ id: `tool-${i}`, function: { name: message.name || 'Tool', arguments: '{}' } }, i, message));
+      items.push(renderToolCard({ callId: `tool-${i}`, name: message.name || 'Tool', argsRaw: '{}', output: message.content ?? '', status: 'done' }));
     }
+  }
+  // Backfill: a tool card observed from live/durable lifecycle before its
+  // persisted message exists renders after the transcript. Once the snapshot
+  // contains the call, the same call ID renders in place instead — replay and
+  // reconnect never produce a second card for one call.
+  for (const card of [...state.toolCards.values()].sort((a, b) => a.order - b.order)) {
+    if (renderedCards.has(card.callId)) continue;
+    renderedCards.add(card.callId);
+    items.push(renderToolCard(card));
   }
   if (state.pendingPrompt && !state.messages.some((message) => message.role === 'user' && String(message.content || '').trim() === state.pendingPrompt.trim())) {
     items.push(`<div class="msg msg-user" data-pending-prompt="true">${renderMarkdown(state.pendingPrompt)}</div>`);
@@ -1102,9 +1357,27 @@ function handlePromptStreamFrame(frame, sessionId) {
   if (frame.event === 'tool_start') {
     const name = String(payload.name || 'Tool');
     const label = promptToolActivity(name);
+    const callId = String(payload.callId || '');
     state.runLabel = label;
-    state.activity.unshift({ title: label, sub: truncate(toolSummary(name, payload.args), 140), at: Date.now(), s: 'running', eventId: String(payload.callId || `live-${Date.now()}`) });
-    state.activity = state.activity.slice(0, 40);
+    pushActivity({
+      key: callId ? `tool:${callId}` : undefined,
+      title: label,
+      sub: truncate(toolSummary(name, payload.args), 140),
+      at: Date.now(),
+      s: 'running',
+      eventId: callId || `live-${Date.now()}`,
+    });
+    // Render the tool card from the foreground stream before the durable
+    // session.tool.called frame and snapshot refresh arrive.
+    if (callId) {
+      upsertToolCard(callId, {
+        name,
+        status: 'running',
+        description: label,
+        argsRaw: payload.args === undefined ? undefined : typeof payload.args === 'string' ? payload.args : JSON.stringify(payload.args),
+        at: Date.now(),
+      });
+    }
     renderActivity();
     renderRunbar();
     renderFeed();
@@ -1115,14 +1388,20 @@ function handlePromptStreamFrame(frame, sessionId) {
     const metadata = payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {};
     const lifecycle = metadata.toolLifecycle && typeof metadata.toolLifecycle === 'object' ? metadata.toolLifecycle : {};
     const output = String(payload.output || '');
+    const callId = String(payload.callId || lifecycle.callId || '');
     const denied = /permission denied|denied by permission/i.test(output);
     const failed = denied || lifecycle.state === 'error' || Boolean(lifecycle.error);
-    state.activity.unshift({
+    if (callId) {
+      upsertToolCard(callId, { name, output, status: failed ? 'error' : 'done', durationMs: typeof lifecycle.durationMs === 'number' ? lifecycle.durationMs : undefined, at: Date.now() });
+    }
+    pushActivity({
+      key: callId ? `tool:${callId}` : undefined,
       title: `${name} · ${denied ? 'permission denied' : failed ? 'failed' : 'completed'}`,
-      sub: truncate(output, 140), at: Date.now(), s: failed ? 'error' : 'done',
-      eventId: String(payload.callId || `result-${Date.now()}`),
+      sub: truncate(output, 140),
+      at: Date.now(),
+      s: failed ? 'error' : 'done',
+      eventId: callId || `result-${Date.now()}`,
     });
-    state.activity = state.activity.slice(0, 40);
     if (denied) state.runLabel = `Permission denied for ${name}`;
     else state.runLabel = 'Thinking';
     renderActivity();
@@ -1690,35 +1969,37 @@ document.addEventListener('keydown', (event) => {
 const heartbeatTicker = () => {
   if (!state.activeId) return;
   renderRunbar();
-  const staleFor = Date.now() - state.lastHeartbeat;
-  if (!state.wasConnected || !state.lastHeartbeat || staleFor < 40_000 || state.streamProbeBusy || Date.now() - state.streamProbeAt < 30_000) return;
   const sessionId = state.activeId;
+  const running = Boolean(state.localRunning || state.status?.running || state.runState === 'running');
+  // A silent subscription can stay "connected" while no frame is applied: a
+  // half-open mobile socket, a proxy buffering the stream, or a stalled reader.
+  // While a run is active the budget is tight; idle sessions tolerate a longer
+  // quiet period because the server heartbeat is 15 s either way.
+  const threshold = running ? STREAM_WATCHDOG_RUN_MS : STREAM_WATCHDOG_IDLE_MS;
+  const staleFor = Date.now() - state.lastHeartbeat;
+  if (!state.wasConnected || !state.lastHeartbeat || staleFor < threshold || state.streamProbeBusy || Date.now() - state.streamProbeAt < Math.min(threshold, 30_000)) return;
   state.streamProbeBusy = true;
   state.streamProbeAt = Date.now();
-  $('#runtimeStatus').textContent = 'Checking server health…';
+  state.lastHeartbeat = Date.now();
+  $('#runtimeStatus').textContent = 'Reconnecting live updates…';
+  $('#runtimeDot').dataset.s = 'warn';
+  setBanner(`No live frames for ${Math.round(staleFor / 1000)}s. Resynchronizing from the durable log at seq ${state.cursor}.`, 'warn');
+  state.connectionLost = true;
+  state.streamState = 'reconnecting';
+  // Durable state first, then a fresh SSE reader from the last acknowledged
+  // sequence. Both sides are event-driven: no busy loop, one probe per window.
   void (async () => {
     try {
-      // A quiet stream is not proof of a dead server. Confirm server health,
-      // then deliberately replace the stale SSE reader from the last durable
-      // cursor so a half-open mobile connection cannot remain stuck forever.
-      await Promise.race([
-        state.client.health(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Runtime health probe timed out')), 5_000)),
-      ]);
-      if (sessionId !== state.activeId) return;
-      state.lastHeartbeat = Date.now();
-      state.streamAbort?.abort();
-      startEventStream(sessionId);
+      await refreshCurrent();
     } catch {
-      if (sessionId !== state.activeId) return;
-      state.connectionLost = true;
-      state.streamState = 'reconnecting';
-      $('#runtimeStatus').textContent = 'Live updates reconnecting…';
-      $('#runtimeDot').dataset.s = 'warn';
-      setBanner(`Server health check failed. Reconnecting live updates from seq ${state.cursor}; durable history remains available.`, 'warn');
-      state.streamAbort?.abort();
-      startEventStream(sessionId);
+      // The durable fetch failing is itself a signal; the stream reopen below
+      // still reports the transport error through its own reconnect path.
+      setBanner(`Live updates are not responding. Retrying from seq ${state.cursor}; saved history remains available.`, 'warn');
     } finally {
+      if (sessionId === state.activeId) {
+        state.streamAbort?.abort();
+        startEventStream(sessionId);
+      }
       state.streamProbeBusy = false;
     }
   })();

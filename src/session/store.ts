@@ -15,10 +15,93 @@ export type ToolCall = { id: string; type: 'function'; function: { name: string;
 export type SessionEvent = { type:'message'|'meta'|'compaction'|'context.checkpoint'|'context.instructions'|'branch'|'summary'|'todo'|'workflow'|'checkpoint'|'checkpoint.restore'|'turn'|'undo'|'redo'|'skill.search'|'skill.load'|'skill.skip'|'question.asked'|'question.replied'|'question.rejected'|'question.cancelled'|'permission.asked'|'permission.resolved'|'permission.cancelled'|'command.receipt'|'tool.call'|'provider.turn'|'provider.usage'|'task.notification'|'task.notification.consumed'|'prompt.queue'|'mutation'|'diff'|'verification'; ts:number; data:any; eventId?:string; version?:1; sequence?:number; durable?:true; category?:EventCategory; kind?:EventKind }
 export type SessionMeta = import('../protocol/api.js').SessionMeta
 export type TurnRecord = { id:string; prompt?:string; beforeSnapshot:string; afterSnapshot?:string; afterProtectedSnapshot?:string; started:number; committed?:number; interruptedAt?:number; beforeMessageCount:number; afterMessageCount?:number; status:'started'|'committed'|'failed'|'interrupted'; recovery?:{reason:'daemon-restart';ownerId:string} }
+// Redacted, in-memory view of a task.notification awaiting delivery: the task
+// identity plus optional child output references and the durable sequence of the
+// notification event being consumed. No prompt or credential content is retained.
+type PendingTaskNotification={
+  taskId:string
+  completedAt:number
+  kind?:string
+  status?:string
+  outputPath?:string
+  childSessionId?:string
+  summary?:string
+  notificationSequence:number
+}
 
 const SESSION_LOCKS = new Map<string, Promise<void>>()
 const SESSION_BUSY = new Set<string>()
 type TurnLease = { lockPath:string; token:string }
+
+// Session state lease policy. Mirrors envNonNegativeInt from src/config/config.ts
+// because the session domain must not import config.
+function envNonNegativeInt(name:string,fallback:number){
+  const raw=process.env[name]
+  if(raw===undefined||raw.trim()==='') return fallback
+  const value=Number(raw)
+  return Number.isSafeInteger(value)&&value>=0 ? value : fallback
+}
+const SESSION_LEASE_INITIAL_WAIT_MS=10
+const SESSION_LEASE_MAX_WAIT_MS=200
+// ~8x the previous fixed 600 ms budget so concurrent session writes on slow
+// mobile/Termux storage stop failing spuriously, while staying well under a
+// user-perceived hang; TERMAGENT_SESSION_LOCK_TIMEOUT_MS overrides it.
+const SESSION_LEASE_DEFAULT_TIMEOUT_MS=5000
+// A lock whose contents cannot be classified (malformed/incomplete payload) may
+// still be mid-write by another process; only aged contents are recoverable.
+const SESSION_LEASE_MALFORMED_FRESH_MS=5000
+// Attempt bound against pathological recreate/delete churn; the wall-clock
+// budget above is the primary bound for waiting on a live owner.
+const SESSION_LEASE_MAX_ATTEMPTS=512
+// Redacted session-state lease contention decision. 'live-owner' means the
+// acquisition gave up waiting on a live owner (budget exhausted); 'failed' means
+// the attempt bound was exhausted without a resolution.
+export type SessionLeaseDecision='acquired'|'recovered-stale'|'recovered-malformed'|'live-owner'|'failed'
+export type SessionLeaseOutcome='acquired'|'recovered-stale'|'recovered-malformed'|'timeout'|'failed'
+// Structured, redacted session lease contention record (LIVE in-memory state,
+// never persisted, never replayed; no prompt text, credentials, or message
+// content — only lease mechanics). Field names keep the batch-1 S2
+// classification surface (sessionId/operation/attempts/waitedMs/outcome/
+// ownerPid/decidedAt) and extend it with hold/diagnostic context (retries,
+// decision, heldMs, jsonlBytes, sequenceState, at).
+export type SessionLeaseContentionRecord={
+  lock:'session'
+  sessionId:string
+  id:string
+  operation:string
+  opKind:string
+  ownerPid?:number
+  ownerIdentity?:string
+  attempts:number
+  retries:number
+  decision:SessionLeaseDecision
+  outcome:SessionLeaseOutcome
+  waitedMs:number
+  heldMs?:number
+  jsonlBytes?:number
+  sequenceState?:{current:number;cached?:number}
+  decidedAt:number
+  at:number
+}
+/** Backwards-compatible alias for the redacted session lease contention record. */
+export type SessionLeaseContention=SessionLeaseContentionRecord
+// Corrupt-JSONL diagnostics are a SEPARATE class from lock contention and are
+// surfaced through their own accessor with their own record type; they are never
+// merged into a contention record.
+export type SessionDataIssueKind='corrupt-jsonl'|'trailing-partial-repair'
+export type SessionDataIssue={
+  sessionId:string
+  kind:SessionDataIssueKind
+  line?:number
+  detail:string
+  jsonlBytes?:number
+  at:number
+}
+type StateLockVerdict =
+  | {kind:'gone';pid?:undefined}
+  | {kind:'wait';reason:'live-owner'|'fresh-malformed';pid?:number}
+  | {kind:'recover-stale';pid:number}
+  | {kind:'recover-malformed';pid?:undefined}
 
 export class SessionStore {
   readonly root:string
@@ -39,6 +122,7 @@ export class SessionStore {
   }
   file(id:string){return path.join(this.root,`${id}.jsonl`)}
   private leases = new Map<string, TurnLease>()
+  private lastAcquisitionAt=0
 
   private async withSessionLock<T>(id:string,fn:()=>Promise<T>):Promise<T>{
     const key=this.file(id)
@@ -67,13 +151,19 @@ export class SessionStore {
         this.leases.set(id,lease)
         return lease
       }catch(error){
-        if((error as {code?:string}).code!=='EEXIST') throw error
+        // EPERM is Windows' create-exclusive "already exists" signal under
+        // concurrency; treat it as contention like EEXIST (see manager core).
+        const code=(error as {code?:string}).code
+        if(code!=='EEXIST'&&code!=='EPERM') throw error
         let owner:any
         try{owner=JSON.parse(await fs.readFile(lockPath,'utf8'))}catch(error){
           if((error as {code?:string}).code==='ENOENT'){continue}
           const info=await fs.stat(lockPath).catch(()=>undefined)
           if(info && Date.now()-info.mtimeMs<5000) throw new Error('Session is busy: another process is acquiring the turn lock')
-          await fs.rm(lockPath,{force:true})
+          // Same recreation guard as below: an aged unparseable lock is only
+          // recovered when it has not been recreated since we probed it.
+          const confirm=await fs.stat(lockPath).catch(()=>undefined)
+          if(!confirm || (info && confirm.mtimeMs===info.mtimeMs && confirm.size===info.size)) await fs.rm(lockPath,{force:true})
           continue
         }
         const pid=Number(owner?.pid)
@@ -81,9 +171,25 @@ export class SessionStore {
           try{process.kill(pid,0); throw new Error('Session is busy: another process is running a turn')}
           catch(error){
             if((error as {code?:string}).code!=='ESRCH') throw error
+            // Compare-before-recover (turn-lease hardening): the owner may
+            // have released and a new acquirer recreated the lock between our
+            // liveness probe and the recovery, so only remove the exact
+            // payload classified as stale.
+            try{
+              const current=JSON.parse(await fs.readFile(lockPath,'utf8'))
+              if(current?.token===owner?.token) await fs.rm(lockPath,{force:true})
+            }catch{}
+            continue
           }
         }
-        await fs.rm(lockPath,{force:true})
+        const info=await fs.stat(lockPath).catch(()=>undefined)
+        if(info && Date.now()-info.mtimeMs<5000) throw new Error('Session is busy: another process is acquiring the turn lock')
+        // Recover an aged malformed lock only if it has not been recreated
+        // since we probed it: a fresh mtime/size means another acquirer owns
+        // it now, and their lock must not be deleted.
+        const confirm=await fs.stat(lockPath).catch(()=>undefined)
+        if(!confirm || (info && confirm.mtimeMs===info.mtimeMs && confirm.size===info.size)) await fs.rm(lockPath,{force:true})
+        continue
       }
     }
     throw new Error('Session is busy: unable to acquire turn lock')
@@ -105,41 +211,151 @@ export class SessionStore {
     return await this.acquireTurnLease(id)
   }
 
-  private async acquireStateLease(id:string):Promise<TurnLease>{
+  // Bounded in-memory contention projection (LIVE state, never persisted):
+  // only the most recent contended acquisition is kept; clean acquisitions do
+  // not overwrite it. Redacted by construction — no message or credential
+  // content, only lease mechanics.
+  private lastContention?:SessionLeaseContentionRecord
+  lastSessionLeaseContention():SessionLeaseContentionRecord|undefined{
+    return this.lastContention?{...this.lastContention}:undefined
+  }
+  // Corrupt-JSONL / trailing-partial diagnostics are a separate class from lock
+  // contention; they are surfaced through their own accessor with their own
+  // record type and never merged into the contention projection.
+  private lastDataIssue?:SessionDataIssue
+  lastSessionDataIssue():SessionDataIssue|undefined{
+    return this.lastDataIssue?{...this.lastDataIssue}:undefined
+  }
+
+  // NOTE(deferred): robust cross-platform process-start identity (pid + process
+  // start time) is deferred to the Windows-port work stream. Stale detection
+  // therefore relies on pid liveness plus the lock file's mtime/started
+  // heuristics; a recycled pid can keep a stale lock looking live until its
+  // contents age past the malformed-fresh recovery threshold.
+  private async acquireStateLease(id:string,operation='state'):Promise<TurnLease>{
     await ensureDir(this.root)
     const lockPath=this.stateLockFile(id)
     const token=crypto.randomBytes(12).toString('hex')
     const payload=JSON.stringify({pid:process.pid,token,started:Date.now()})+'\n'
-    for(let attempt=0;attempt<60;attempt++){
+    const budgetMs=envNonNegativeInt('TERMAGENT_SESSION_LOCK_TIMEOUT_MS',SESSION_LEASE_DEFAULT_TIMEOUT_MS)
+    const deadline=Date.now()+budgetMs
+    let attempts=0
+    let waitedMs=0
+    let waitIndex=0
+    let observedPid:number|undefined
+    let recovery:'stale'|'malformed'|undefined
+    const recordContention=async(decision:SessionLeaseDecision)=>{
+      const decidedAt=Date.now()
+      const outcome:SessionLeaseOutcome=decision==='live-owner'?'timeout':decision
+      let jsonlBytes:number|undefined
+      try{ jsonlBytes=(await fs.stat(this.file(id))).size }catch{ }
+      let sequence=0
+      try{ sequence=await this.currentSequence(id) }catch{ sequence=0 }
+      this.lastContention={
+        lock:'session',
+        sessionId:id,
+        id,
+        operation,
+        opKind:operation,
+        ownerPid:observedPid,
+        ownerIdentity:observedPid!==undefined?`pid:${observedPid}`:undefined,
+        attempts,
+        retries:Math.max(0,attempts-1),
+        decision,
+        outcome,
+        waitedMs,
+        heldMs:this.lastAcquisitionAt>0?Math.max(0,Date.now()-this.lastAcquisitionAt):undefined,
+        jsonlBytes,
+        sequenceState:{current:sequence,cached:this.sequenceCache.get(id)?.sequence},
+        decidedAt,
+        at:decidedAt,
+      }
+    }
+    while(attempts<SESSION_LEASE_MAX_ATTEMPTS){
+      attempts++
       try{
         const handle=await fs.open(lockPath,'wx')
         try{await handle.writeFile(payload,'utf8')}finally{await handle.close()}
+        if(attempts>1){
+          this.lastAcquisitionAt=Date.now()
+          await recordContention(recovery==='stale'?'recovered-stale':recovery==='malformed'?'recovered-malformed':'acquired')
+        }
         return {lockPath,token}
       }catch(error){
-        if((error as {code?:string}).code!=='EEXIST')throw error
-        let owner:any
-        try{owner=JSON.parse(await fs.readFile(lockPath,'utf8'))}catch(error){
-          if((error as {code?:string}).code==='ENOENT')continue
-          const info=await fs.stat(lockPath).catch(()=>undefined)
-          if(info&&Date.now()-info.mtimeMs<5000){await new Promise(r=>setTimeout(r,10));continue}
-          await fs.rm(lockPath,{force:true});continue
+        // EPERM is Windows' create-exclusive "already exists" signal under
+        // concurrency; treat it as contention like EEXIST (see manager core).
+        const code=(error as {code?:string}).code
+        if(code!=='EEXIST'&&code!=='EPERM')throw error
+        const verdict=await this.classifyStateLock(lockPath)
+        observedPid=verdict.pid
+        if(verdict.kind==='gone')continue
+        if(verdict.kind==='wait'){
+          const remaining=deadline-Date.now()
+          if(remaining<=0){
+            // Budget exhausted while a live owner holds the lock: report and
+            // leave the owner's lock untouched. Never delete on timeout.
+            await recordContention('live-owner')
+            const detail=verdict.reason==='live-owner'&&verdict.pid!==undefined?`live owner pid ${verdict.pid} still holds the state lock`:'malformed or incomplete state lock contents'
+            throw new Error(`Session state is busy: unable to acquire state lock after ${attempts} attempt(s) and ${waitedMs} ms wait (${detail})`)
+          }
+          const wait=Math.max(0,Math.min(Math.round(Math.min(SESSION_LEASE_MAX_WAIT_MS,SESSION_LEASE_INITIAL_WAIT_MS*2**waitIndex)*(0.5+Math.random()*0.5)),remaining))
+          waitIndex++
+          if(wait>0){await new Promise(resolve=>setTimeout(resolve,wait));waitedMs+=wait}
+          continue
         }
-        const pid=Number(owner?.pid)
-        if(Number.isInteger(pid)&&pid>0){
-          try{process.kill(pid,0);await new Promise(r=>setTimeout(r,10));continue}catch(error){if((error as {code?:string}).code!=='ESRCH')throw error}
-        }
+        // Stale owner (provable dead pid) or aged malformed/incomplete
+        // contents: recover immediately, then retry the open attempt.
+        recovery=verdict.kind==='recover-stale'?'stale':'malformed'
         await fs.rm(lockPath,{force:true})
+        // Jitter after recovery keeps concurrent recovery loops from deleting
+        // and recreating the same lock in lockstep.
+        await new Promise(resolve=>setTimeout(resolve,1+Math.floor(Math.random()*9)))
       }
     }
-    throw new Error('Session state is busy: unable to acquire state lock')
+    await recordContention('failed')
+    throw new Error(`Session state is busy: unable to acquire state lock after ${attempts} attempt(s) and ${waitedMs} ms wait (acquisition attempts exhausted)`)
+  }
+
+  private async classifyStateLock(lockPath:string):Promise<StateLockVerdict>{
+    let owner:any
+    try{owner=JSON.parse(await fs.readFile(lockPath,'utf8'))}catch(error){
+      if((error as {code?:string}).code==='ENOENT')return {kind:'gone'}
+      return await this.stateLockFreshnessVerdict(lockPath)
+    }
+    const pid=Number(owner?.pid)
+    const started=Number(owner?.started)
+    const complete=Number.isInteger(pid)&&pid>0&&Number.isFinite(started)&&started>0&&typeof owner?.token==='string'&&owner.token.length>0
+    if(!complete)return await this.stateLockFreshnessVerdict(lockPath)
+    try{
+      process.kill(pid,0)
+      return {kind:'wait',reason:'live-owner',pid}
+    }catch(error){
+      if((error as {code?:string}).code==='ESRCH')return {kind:'recover-stale',pid}
+      // EPERM/EACCES or any other unresolved liveness signal means we could not
+      // prove the owner is dead; treat it as live so its lock is never deleted.
+      return {kind:'wait',reason:'live-owner',pid}
+    }
+  }
+
+  private async stateLockFreshnessVerdict(lockPath:string):Promise<StateLockVerdict>{
+    const info=await fs.stat(lockPath).catch(()=>undefined)
+    if(info&&Date.now()-info.mtimeMs<SESSION_LEASE_MALFORMED_FRESH_MS)return {kind:'wait',reason:'fresh-malformed'}
+    return {kind:'recover-malformed'}
   }
   private async releaseStateLease(lease:TurnLease){
+    const heldMs=this.lastAcquisitionAt>0?Math.max(0,Date.now()-this.lastAcquisitionAt):undefined
+    this.lastAcquisitionAt=0
+    const record=this.lastContention
+    if(heldMs!==undefined&&record)record.heldMs=heldMs
     try{
+      // Compare-before-release: only delete the lock file whose payload token
+      // still matches the token we acquired; a foreign or tampered owner's
+      // lock must never be removed by our release path.
       const owner=JSON.parse(await fs.readFile(lease.lockPath,'utf8'))
-      if(owner?.pid===process.pid&&owner?.token===lease.token)await fs.rm(lease.lockPath,{force:true})
+      if(owner?.token===lease.token)await fs.rm(lease.lockPath,{force:true})
     }catch(error){if((error as {code?:string}).code!=='ENOENT')throw error}
   }
-  async withSessionMutation<T>(id:string,fn:()=>Promise<T>):Promise<T>{
+  async withSessionMutation<T>(id:string,fn:()=>Promise<T>,operation:string='mutation'):Promise<T>{
     // Re-entrancy must be scoped to the current async call chain. A process-wide
     // per-session depth counter lets an unrelated concurrent worker mistake an
     // in-flight transaction for its own nested call and skip the lease. That
@@ -147,7 +363,7 @@ export class SessionStore {
     const inherited=this.mutationContext.getStore()
     if(inherited?.has(id))return await fn()
     return await this.withSessionLock(id,async()=>{
-      const lease=await this.acquireStateLease(id)
+      const lease=await this.acquireStateLease(id,operation)
       const active=new Set(inherited??[])
       active.add(id)
       try{return await this.mutationContext.run(active,fn)}finally{await this.releaseStateLease(lease)}
@@ -166,6 +382,10 @@ export class SessionStore {
       try{events.push(JSON.parse(line) as SessionEvent)}
       catch(error){
         if(i===lastNonEmpty)break
+        const info=await fs.stat(this.file(id)).catch(()=>undefined)
+        const issue:SessionDataIssue={sessionId:id,kind:'corrupt-jsonl',line:i+1,detail:'invalid-json-line',at:Date.now()}
+        if(info)issue.jsonlBytes=info.size
+        this.lastDataIssue=issue
         throw new Error(`Corrupt session log at line ${i+1}: ${(error as Error).message}`)
       }
     }
@@ -199,6 +419,11 @@ export class SessionStore {
     if(lastNonEmpty<0) return
     const candidate=lines[lastNonEmpty]
     try{JSON.parse(candidate)}catch{
+      const issue:SessionDataIssue={sessionId:id,kind:text.endsWith('\n')?'corrupt-jsonl':'trailing-partial-repair',line:lastNonEmpty+1,detail:text.endsWith('\n')?'invalid-json-line':'partial-trailing-record',at:Date.now()}
+      let jsonlBytes:number|undefined
+      try{jsonlBytes=(await fs.stat(this.file(id))).size}catch{}
+      issue.jsonlBytes=jsonlBytes
+      this.lastDataIssue=issue
       if(text.endsWith('\n')) throw new Error(`Corrupt trailing session event at line ${lastNonEmpty+1}`)
       const offset=lines.slice(0,lastNonEmpty).reduce((total,line)=>total+line.length+1,0)
       await fs.truncate(this.file(id),offset)
@@ -207,17 +432,55 @@ export class SessionStore {
 
   private async appendCore(id:string,event:SessionEvent){
     await ensureDir(this.root)
-    await this.repairTrailingPartialEvent(id)
-    const sequence=await this.nextDurableSequence(id)
+    // Durable-sequence append optimization (Phase 14I batch 2): the fast path
+    // reuses the sequence cached after our own last append when the file size
+    // still matches, skipping the two full-history JSONL rescans (repair scan
+    // + max-sequence scan) that previously ran per append. The cache is
+    // DERIVED state validated against the file before every use: any external
+    // append, truncation, or cache loss (including after a crash) falls back
+    // to the authoritative full scan, so cross-process correctness, atomic
+    // monotonic sequences, and crash recovery are unchanged. The validation
+    // runs while the state lease is held, so no other writer can move the
+    // file between the size check and the append.
+    const cached=await this.fastNextSequence(id)
+    let sequence:number
+    if(cached===undefined){
+      await this.repairTrailingPartialEvent(id)
+      sequence=await this.nextDurableSequence(id)
+    }else{
+      sequence=cached
+    }
     const enriched=enrichStoredEvent(id,event,sequence)
     await fs.appendFile(this.file(id),JSON.stringify(enriched)+'\n')
+    const size=await this.fileSize(id)
+    if(size===undefined) this.sequenceCache.delete(id)
+    else this.sequenceCache.set(id,{sequence,size})
     this.events?.publishDurable(toDurableEventEnvelope(id,enriched,sequence))
     return enriched
   }
 
+  private sequenceCache=new Map<string,{sequence:number;size:number}>()
+  private async fileSize(id:string):Promise<number|undefined>{
+    try{ const info=await fs.stat(this.file(id)); return info.size }catch{ return undefined }
+  }
+  private async fastNextSequence(id:string):Promise<number|undefined>{
+    const cached=this.sequenceCache.get(id)
+    if(!cached) return undefined
+    const size=await this.fileSize(id)
+    if(size===undefined||size!==cached.size){ this.sequenceCache.delete(id); return undefined }
+    return cached.sequence+1
+  }
+  private async fastCurrentSequence(id:string):Promise<number|undefined>{
+    const cached=this.sequenceCache.get(id)
+    if(!cached) return undefined
+    const size=await this.fileSize(id)
+    if(size===undefined||size!==cached.size){ this.sequenceCache.delete(id); return undefined }
+    return cached.sequence
+  }
+
   private async appendUnlocked(id:string,event:SessionEvent){
     if(this.mutationContext.getStore()?.has(id))return await this.appendCore(id,event)
-    const lease=await this.acquireStateLease(id)
+    const lease=await this.acquireStateLease(id,'append')
     try{return await this.appendCore(id,event)}finally{await this.releaseStateLease(lease)}
   }
 
@@ -226,6 +489,8 @@ export class SessionStore {
     return await this.withSessionLock(id,()=>this.appendUnlocked(id,event))
   }
   async currentSequence(id:string):Promise<import('../protocol/types.js').DurableSequence>{
+    const cached=await this.fastCurrentSequence(id)
+    if(cached!==undefined) return cached as import('../protocol/types.js').DurableSequence
     let events:SessionEvent[]=[]
     try{events=await this.readEventsRaw(id)}catch(error){
       if((error as {code?:string}).code==='ENOENT')return 0 as import('../protocol/types.js').DurableSequence
@@ -501,15 +766,82 @@ export class SessionStore {
     if(expected!==actual) throw new Error(`Session belongs to ${loaded.meta.cwd}; refusing to operate on ${cwd}`)
   }
 
-  async consumeTaskNotifications(id:string){
+  // Task notification consumed-marker payload. Keeps the batch-2 marker shape
+  // ({taskId, completedAt}) backward compatible while preserving child output
+  // references and the durable notification sequence for deliberate retrieval.
+  private taskNotificationMarkerData(notification:{taskId?:unknown;completedAt?:unknown;kind?:unknown;status?:unknown;outputPath?:unknown;childSessionId?:unknown;notificationSequence?:unknown}){
+    const taskId=String(notification.taskId||'')
+    const completedAt=Number(notification.completedAt||Date.now())
+    const data:{taskId:string;completedAt:number;kind?:string;status?:string;outputPath?:string;childSessionId?:string;notificationSequence:number}={taskId,completedAt,notificationSequence:Number(notification.notificationSequence||0)}
+    if(typeof notification.kind==='string')data.kind=notification.kind
+    if(typeof notification.status==='string')data.status=notification.status
+    if(typeof notification.outputPath==='string')data.outputPath=notification.outputPath
+    if(typeof notification.childSessionId==='string')data.childSessionId=notification.childSessionId
+    data.notificationSequence=Number(notification.notificationSequence||0)
+    return data
+  }
+  private async collectPendingTaskNotifications(id:string):Promise<PendingTaskNotification[]>{
+    const loaded=await this.load(id)
+    const consumed=new Set(loaded.events.filter((event:SessionEvent)=>event.type==='task.notification.consumed').map((event:SessionEvent)=>String(event.data?.taskId||'')))
+    const pending:PendingTaskNotification[]=[]
+    for(const event of loaded.events){
+      if(event.type!=='task.notification')continue
+      const item=event.data
+      if(!item||typeof item!=='object')continue
+      const taskId=String((item as {taskId?:unknown}).taskId||'')
+      if(!taskId||consumed.has(taskId))continue
+      pending.push({
+        taskId,
+        completedAt:Number((item as {completedAt?:unknown}).completedAt||Date.now()),
+        kind:typeof (item as {kind?:unknown}).kind==='string'?(item as {kind:string}).kind:undefined,
+        status:typeof (item as {status?:unknown}).status==='string'?(item as {status:string}).status:undefined,
+        outputPath:typeof (item as {outputPath?:unknown}).outputPath==='string'?(item as {outputPath:string}).outputPath:undefined,
+        childSessionId:typeof (item as {childSessionId?:unknown}).childSessionId==='string'?(item as {childSessionId:string}).childSessionId:undefined,
+        summary:typeof (item as {summary?:unknown}).summary==='string'?(item as {summary:string}).summary:undefined,
+        notificationSequence:Number(event.sequence||0),
+      })
+    }
+    return pending
+  }
+  async consumeTaskNotifications(id:string):Promise<PendingTaskNotification[]>{
     return await this.withSessionLock(id,async()=>{
-      const loaded=await this.load(id)
-      const notifications=loaded.events.filter((event:SessionEvent)=>event.type==='task.notification').map(event=>event.data).filter(Boolean)
-      const consumed=new Set(loaded.events.filter((event:SessionEvent)=>event.type==='task.notification.consumed').map((event:SessionEvent)=>String(event.data?.taskId||'')))
-      const pending=notifications.filter((item:any)=>item.taskId&&!consumed.has(String(item.taskId)))
-      for(const item of pending) await this.appendUnlocked(id,{type:'task.notification.consumed',ts:Date.now(),data:{taskId:item.taskId,completedAt:item.completedAt}})
+      const pending=await this.collectPendingTaskNotifications(id)
+      for(const notification of pending) await this.appendUnlocked(id,{type:'task.notification.consumed',ts:Date.now(),data:this.taskNotificationMarkerData(notification)})
       return pending
     })
+  }
+  async pendingTaskNotifications(id:string):Promise<unknown[]>{
+    // Observe-only: no consumed markers, no durable mutation. Reconnect and
+    // restart paths use this to check for undelivered task notifications before
+    // re-entering the deliver pass.
+    return await this.withSessionLock(id,async()=>{
+      const pending=await this.collectPendingTaskNotifications(id)
+      return pending
+    })
+  }
+  async deliverTaskNotifications(id:string,deliver:(notification:unknown)=>Promise<void>):Promise<unknown[]>{
+    // Delivery is at-least-once and never-lost: each pending notification is
+    // handed to the deliver callback first and only after the delivery settles
+    // is the task.notification.consumed marker (carrying the notification
+    // sequence) appended, so a crash between deliver and marker re-delivers on
+    // the next pass. The marker prevents duplicate delivery once it lands.
+    // Dedup semantics: the taskId task.notification.consumed marker set is the
+    // cross-pass deduplication primitive; within a single pass a taskId observed
+    // more than once (duplicate worker completion) is collapsed to one delivery.
+    return await this.withSessionMutation(id,async()=>{
+      const pending=await this.collectPendingTaskNotifications(id)
+      const delivered:unknown[]=[]
+      const deliveredTaskIds=new Set<string>()
+      for(const notification of pending){
+        const taskId=notification.taskId
+        if(deliveredTaskIds.has(taskId))continue
+        deliveredTaskIds.add(taskId)
+        await deliver(notification)
+        delivered.push(notification)
+        await this.appendUnlocked(id,{type:'task.notification.consumed',ts:Date.now(),data:this.taskNotificationMarkerData(notification)})
+      }
+      return delivered
+    },'deliver')
   }
 
   async appendTodo(id:string,items:any[],previous?:any[]){await this.append(id,{type:'todo',ts:Date.now(),data:{items,previous:previous||[]}})}

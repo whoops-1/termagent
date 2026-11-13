@@ -1,11 +1,12 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { resolveHomeDirectory } from './paths.js'
 
 export async function exists(p: string) {
   try { await fs.access(p); return true } catch { return false }
 }
 export async function ensureDir(p: string) { await fs.mkdir(p, { recursive: true }) }
-export function expandHome(p: string) { return p.startsWith('~/') ? path.join(process.env.HOME || process.cwd(), p.slice(2)) : p }
+export function expandHome(p: string) { return p.startsWith('~/') ? path.join(resolveHomeDirectory(), p.slice(2)) : p }
 export function within(root: string, target: string) {
   const r = path.resolve(root) + path.sep
   const t = path.resolve(target)

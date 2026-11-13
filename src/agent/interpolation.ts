@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { resolveShell, spawnPlanFor } from '../util/platform-shell.js'
 
 export async function interpolateCommandTemplate(template:string,args:string[],cwd:string,maxBytes=12000){
   let out=template.replaceAll('$ARGUMENTS',args.join(' '))
@@ -22,6 +23,6 @@ export async function interpolateCommandTemplate(template:string,args:string[],c
   })
   return out
 }
-function runShell(cmd:string,cwd:string,maxBytes:number){return new Promise<string>((resolve,reject)=>{const child=spawn('sh',['-lc',cmd],{cwd,stdio:['ignore','pipe','pipe']});let out='';const collect=(chunk:any)=>{if(out.length<maxBytes*2)out+=String(chunk)};child.stdout?.on('data',collect);child.stderr?.on('data',collect);child.on('error',reject);child.on('close',(code:any)=>resolve((code?`exit ${code}\n`:'')+out.slice(0,maxBytes)))})}
+async function runShell(cmd:string,cwd:string,maxBytes:number){const shell=await resolveShell({script:cmd});const plan=spawnPlanFor(shell,cmd);return new Promise<string>((resolve,reject)=>{const child=spawn(plan.command,plan.args,{cwd,stdio:['ignore','pipe','pipe'],windowsVerbatimArguments:plan.windowsVerbatimArguments});let out='';const collect=(chunk:any)=>{if(out.length<maxBytes*2)out+=String(chunk)};child.stdout?.on('data',collect);child.stderr?.on('data',collect);child.on('error',reject);child.on('close',(code:any)=>resolve((code?`exit ${code}\n`:'')+out.slice(0,maxBytes)))})}
 async function replaceAsync(str:string,re:RegExp,fn:(...args:any[])=>Promise<string>){const matches=[...str.matchAll(re)];let result=str;for(let i=matches.length-1;i>=0;i--){const m=matches[i];const replacement=await fn(...m.slice(1));result=result.slice(0,m.index!)+replacement+result.slice(m.index!+m[0].length)}return result}
 function truncate(s:string,n:number){return s.length<=n?s:s.slice(0,n)+`\n[truncated at ${n} bytes]`}

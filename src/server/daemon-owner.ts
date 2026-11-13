@@ -25,6 +25,11 @@ interface OwnerLockRecord {
   cwd: string
   pid: number
   processStart?: string
+  /**
+   * Recorded when a platform-specific process identity (e.g. /proc starttime)
+   * is unavailable, so the lock still carries durable timestamp metadata.
+   */
+  processStartMs?: number
   mode: DaemonMode
   startedAt: number
 }
@@ -68,7 +73,15 @@ function workspaceId(cwd: string): string {
   return crypto.createHash('sha256').update(cwd).digest('hex').slice(0, 32)
 }
 
-async function processStartIdentity(pid: number): Promise<string | undefined> {
+/**
+ * Platform-conditional process-start identity. Linux exposes a stable
+ * starttime via /proc; on win32 (or any host without /proc data) this returns
+ * undefined and callers must degrade to pid plus recorded timestamp metadata
+ * instead of crashing. Note that without this identity, a reused PID cannot be
+ * distinguished from the original owner on Windows, so liveness checks fail
+ * closed on `process.kill(pid, 0)`.
+ */
+export async function processStartIdentity(pid: number): Promise<string | undefined> {
   if (process.platform !== 'linux') return undefined
   try {
     const stat = await fs.readFile(`/proc/${pid}/stat`, 'utf8')
@@ -131,13 +144,19 @@ async function recordIsStale(record: OwnerLockRecord | undefined, file: string):
 
 async function removeStaleOwner(lockFile: string, metadataFile: string, recoveryFile: string): Promise<boolean> {
   const recoveryToken = crypto.randomBytes(16).toString('hex')
+  const selfIdentity = await processStartIdentity(process.pid)
   let recoveryHandle
   try {
     recoveryHandle = await fs.open(recoveryFile, 'wx', 0o600)
-    await recoveryHandle.writeFile(JSON.stringify({ pid: process.pid, processStart: await processStartIdentity(process.pid), token: recoveryToken }), 'utf8')
+    await recoveryHandle.writeFile(JSON.stringify({
+      pid: process.pid,
+      processStart: selfIdentity,
+      ...(selfIdentity ? {} : { processStartMs: Date.now() }),
+      token: recoveryToken,
+    }), 'utf8')
   } catch (error) {
     if ((error as { code?: string }).code !== 'EEXIST') throw error
-    const guard = await readJson<{ pid: number; processStart?: string }>(recoveryFile)
+    const guard = await readJson<{ pid: number; processStart?: string; processStartMs?: number }>(recoveryFile)
     const guardInfo = await fs.stat(recoveryFile).catch(() => undefined)
     const staleGuard = guard
       ? !(await processIsAlive(guard.pid, guard.processStart))
@@ -206,6 +225,9 @@ export async function acquireDaemonOwner(cwd: string, options: AcquireDaemonOwne
   const metadataFile = path.join(root, `${workspace}.json`)
   const recoveryFile = path.join(root, `${workspace}.recover`)
   const startedAt = Date.now()
+  // Platform-conditional identity capture: undefined on win32 or whenever /proc
+  // data is unavailable, in which case the record degrades to pid + timestamp.
+  const processStart = await processStartIdentity(process.pid).catch(() => undefined)
   const record: OwnerLockRecord = {
     version: 1,
     id: crypto.randomBytes(16).toString('hex'),
@@ -213,7 +235,8 @@ export async function acquireDaemonOwner(cwd: string, options: AcquireDaemonOwne
     workspaceId: workspace,
     cwd: canonical,
     pid: process.pid,
-    processStart: await processStartIdentity(process.pid),
+    processStart,
+    ...(processStart ? {} : { processStartMs: startedAt }),
     mode: options.mode,
     startedAt,
   }

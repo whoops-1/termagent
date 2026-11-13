@@ -5,6 +5,7 @@ import { ToolRegistry } from '../tools/registry.js'
 import { builtinTools } from '../tools/builtin.js'
 import { createProvider } from '../providers/registry.js'
 import { Agent } from '../agent/agent.js'
+import { resolveTaskProviderConfig, classifyProviderAttemptError } from './task-provider.js'
 import { loadInstructions } from '../context/instructions.js'
 import { buildRepositoryMap, formatRepositoryMap } from '../context/repository.js'
 import { retrieveContext } from '../context/retrieval.js'
@@ -21,11 +22,6 @@ import type { TaskActivity } from './manager.js'
 
 const DEFAULT_SHELL_TIMEOUT_MS = 120_000
 const DEFAULT_OUTPUT_BYTES = 20_000
-
-function normalizeProvider(task:TaskRecord){
-  if(!task.provider) throw new Error('Agent task is missing provider configuration')
-  return task.provider
-}
 
 function renderSpecialistText(task:TaskRecord){
   const role=specialistRole(task.specialistRole)
@@ -78,7 +74,7 @@ export async function runTaskWorker(id:string, suppliedManager?:TaskManager){
   try{
     if(task.kind==='shell') return await runShell(task,manager)
     if(task.kind!=='agent') throw new Error(`Unsupported task kind: ${task.kind}`)
-    const providerConfig=normalizeProvider(task)
+    const providerConfig=await resolveTaskProviderConfig(task.provider,{taskRoot:manager.taskRoot()})
     const provider=createProvider(providerConfig)
     provider.setRole?.('subagent')
     provider.setTurnContext?.({userText:task.prompt||'',turnNumber:1})
@@ -207,14 +203,22 @@ export async function runTaskWorker(id:string, suppliedManager?:TaskManager){
     if(finished.status==='exited') await manager.event(task.id,'completed',{exitCode:0,sessionId:session.id,childSessionId:session.id})
   }catch(e){
     const message=e instanceof Error?e.message:String(e)
+    const credentialTerminal=classifyProviderAttemptError(e)==='credential-terminal'
     await Promise.all([activityWrites,outputProgressWrites]).catch(()=>{})
     const current=await manager.get(id).catch(()=>task)
-    const failed=await manager.finish(id,{status:'failed',exitCode:1,error:message,output:(current.output||'')+'\nERROR: '+message,ended:Date.now(),activity:{kind:'turn',label:'Agent failed',detail:compactActivityText(message,180),at:Date.now(),outcome:'error'}})
-    if(failed.status==='failed') await manager.event(id,'failed',{error:message})
+    if(credentialTerminal){
+      const terminalPatch:Partial<TaskRecord>&{terminalCredentialError?:boolean}={terminalCredentialError:true}
+      await manager.update(id,terminalPatch).catch(()=>undefined)
+    }
+    const terminalReason='Provider credential was rejected by the upstream route (401/403 or invalid credential). This attempt is terminal: the same credential is not retried and no replacement agent is spawned.'
+    const failed=await manager.finish(id,{status:'failed',exitCode:1,error:credentialTerminal?terminalReason:message,output:(current.output||'')+'\nERROR: '+(credentialTerminal?'Provider credential rejected: invalid or unauthorized credential for the configured route.':message),ended:Date.now(),activity:{kind:'turn',label:'Agent failed',detail:compactActivityText(credentialTerminal?'credential rejected (terminal)':message,180),at:Date.now(),outcome:'error'}})
+    if(failed.status==='failed') await manager.event(id,'failed',{error:credentialTerminal?'credential-terminal':message})
   }
 }
 
 async function runShell(task:TaskRecord,manager:TaskManager){
   const { runManagedShellTask } = await import('./shell-command.js')
-  await runManagedShellTask(manager,task,process.env.SHELL||'sh',task.timeoutMs||DEFAULT_SHELL_TIMEOUT_MS,DEFAULT_OUTPUT_BYTES,undefined)
+  // Shell resolution is centralized in src/util/platform-shell.ts; passing no
+  // explicit shell keeps POSIX behavior identical and fixes win32 selection.
+  await runManagedShellTask(manager,task,undefined,task.timeoutMs||DEFAULT_SHELL_TIMEOUT_MS,DEFAULT_OUTPUT_BYTES,undefined)
 }

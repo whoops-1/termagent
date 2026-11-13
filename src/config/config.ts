@@ -1,6 +1,7 @@
 import path from 'node:path'
 import { promises as fs } from 'node:fs'
 import { exists } from '../util/fs.js'
+import { resolveHomeDirectory } from '../util/paths.js'
 
 export type ApprovalMode='ask'|'auto'|'deny'
 export interface ProviderVariant{reasoningEffort?:'low'|'medium'|'high'|'max';temperature?:number;maxTokens?:number;extra?:Record<string,unknown>}
@@ -18,7 +19,7 @@ function environmentDefaults():Config{
  return {provider:envProvider,model:process.env.TERMAGENT_MODEL||'',baseUrl:process.env.TERMAGENT_BASE_URL||(envProvider==='anthropic'?'https://api.anthropic.com/v1':envProvider==='gemini'?'https://generativelanguage.googleapis.com':'https://api.openai.com/v1'),apiKeyEnv:process.env.TERMAGENT_API_KEY?'TERMAGENT_API_KEY':envProvider==='anthropic'?'ANTHROPIC_API_KEY':envProvider==='gemini'?'GEMINI_API_KEY':'OPENAI_API_KEY',approvals:(process.env.TERMAGENT_APPROVALS as ApprovalMode)||'ask',maxToolRounds:envNonNegativeInt('TERMAGENT_MAX_TOOL_ROUNDS',50),maxOutputBytes:20000,shellTimeoutMs:120000,maxContextMessages:0,maxContextBytes:0,compactionThreshold:0.82,contextReserveTokens:0,contextRecentTokens:0,repoMapTokens:0,providers:{},mcp:{},plugins:[],fallbackProviders:[],maxContextTokens:envNonNegativeInt('TERMAGENT_CONTEXT_WINDOW',0)||undefined,retryMax:4,streamIdleTimeoutMs:90000,toolOutputMaxLines:2000,toolOutputMaxBytes:50*1024,toolOutputRetentionDays:7,ui:{theme:'termagent',effect:'off',animations:true,motion:'full'},routing:{},smartRouting:{enabled:false,simpleModel:'',strongModel:''},postEditVerification:{enabled:false,tools:['write_file','edit_file','apply_patch']},keybinds:{},permissionRules:[]}
 }
 export async function loadConfig(cwd:string):Promise<Config>{
- const defaults=environmentDefaults(); const candidates=[path.join(cwd,'.termagent','config.json'),path.join(process.env.HOME||cwd,'.termagent','config.json')];let file:Partial<Config>={}
+ const defaults=environmentDefaults(); const candidates=[path.join(cwd,'.termagent','config.json'),path.join(resolveHomeDirectory(),'.termagent','config.json')];let file:Partial<Config>={}
  for(const p of candidates)if(await exists(p)){try{file=JSON.parse(await fs.readFile(p,'utf8'))}catch(e){throw new Error(`Invalid config: ${p}: ${(e as Error).message}`)}break}
  const merged={...defaults,...file}; if(file.ui) merged.ui={...defaults.ui,...file.ui}; if(file.postEditVerification) merged.postEditVerification={...defaults.postEditVerification,...file.postEditVerification}; if(file.providers)merged.providers={...defaults.providers,...file.providers}; if(file.routing)merged.routing={...defaults.routing,...file.routing}; if(file.mcp)merged.mcp={...defaults.mcp,...file.mcp}; return merged
 }
@@ -29,7 +30,7 @@ export function resolveProviderConfig(cfg:Config,name?:string):ProviderProfile{
 }
 
 export async function saveUIPreferences(cwd:string, patch:UIPreferences):Promise<void>{
- const candidates=[path.join(cwd,'.termagent','config.json'),path.join(process.env.HOME||cwd,'.termagent','config.json')];
+ const candidates=[path.join(cwd,'.termagent','config.json'),path.join(resolveHomeDirectory(),'.termagent','config.json')];
  let filePath=candidates[0]!; let raw:Record<string,unknown>={};
  for(const candidate of candidates){ if(await exists(candidate)){ filePath=candidate; raw=JSON.parse(await fs.readFile(candidate,'utf8')) as Record<string,unknown>; break } }
  const current=raw.ui&&typeof raw.ui==='object'&&!Array.isArray(raw.ui)?raw.ui as Record<string,unknown>:{ };

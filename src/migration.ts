@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { expandHome, exists } from './util/fs.js'
+import { resolveHomeDirectory } from './util/paths.js'
 
 const MIGRATION_VERSION = 1
 const GLOBAL_MIGRATION_PATH = () => expandHome('~/.termagent/migrations.json')
@@ -114,7 +115,7 @@ async function readConfigAliases(file: string, baseDir: string): Promise<string[
 
 export async function inspectLegacyLayout(cwd: string): Promise<LegacyLayoutReport> {
   const project = path.resolve(cwd)
-  const home = process.env.HOME || cwd
+  const home = resolveHomeDirectory()
   const projectSkillsRoots = await listSkillRoots([
     path.join(project, '.termagent', 'skills'),
     path.join(project, '.claude', 'skills'),
@@ -259,7 +260,7 @@ async function migrateProjectConfig(cwd: string): Promise<MigrationConfigChange>
   return migrateConfigAt(CONFIG_PATH(cwd), cwd)
 }
 
-async function migrateGlobalConfig(home = process.env.HOME || process.cwd()): Promise<MigrationConfigChange> {
+async function migrateGlobalConfig(home = resolveHomeDirectory()): Promise<MigrationConfigChange> {
   return migrateConfigAt(path.join(home, '.termagent', 'config.json'), home)
 }
 

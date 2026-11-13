@@ -1,8 +1,8 @@
 import type { Provider } from '../providers/openai-compatible.js'
 import type { ProviderConfig } from '../providers/types.js'
 import { SessionStore } from '../session/store.js'
-import { TaskManager, type TaskRecord } from '../tasks/manager.js'
-import { persistedSubagentConfigForTask } from '../tasks/task-provider.js'
+import { TaskManager, assertChildLaunchPermitted, computeLaunchFingerprint, preflightChildProviderSnapshot, type TaskRecord } from '../tasks/manager.js'
+import { subagentProviderSnapshot } from '../tasks/task-provider.js'
 import type { ToolDefinition } from './types.js'
 import { ToolRegistry } from './registry.js'
 import { sessionTodoTool } from './session-todo.js'
@@ -27,7 +27,7 @@ export function taskTool(provider:Provider, store:SessionStore, parentRegistry:T
   return {
     name:'task', risk:'shell',
     description:'Run a focused child coding task with a durable task id. Optional specialist roles restrict tools and behavior. Foreground waits for completion; background returns immediately and notifies the parent when the task finishes. Reusing task_id resumes the same child session, or queues a message when it is already running.',
-    schema:{type:'object',properties:{description:{type:'string',minLength:1},prompt:{type:'string',minLength:1},task_id:{type:'string'},background:{type:'boolean'},scope_paths:{type:'array',items:{type:'string'}},context:{type:'string'},role:{type:'string',enum:specialistRoleNames()}},required:['prompt']},
+    schema:{type:'object',properties:{description:{type:'string',minLength:1},prompt:{type:'string',minLength:1},task_id:{type:'string'},background:{type:'boolean'},scope_paths:{type:'array',items:{type:'string'}},context:{type:'string'},role:{type:'string',enum:specialistRoleNames()},retry_cause:{type:'string',description:'Required to retry an identical child task after it failed: describe the changed cause or configuration.'}},required:['prompt']},
     async execute(args,ctx){
       const prompt=String(args.prompt||'').trim()
       if(!prompt)throw new Error('task prompt must not be empty')
@@ -35,13 +35,15 @@ export function taskTool(provider:Provider, store:SessionStore, parentRegistry:T
       const effectivePrompt=context?`${prompt}\n\nAdditional context from the parent task:\n${context}`:prompt
       const description=String(args.description||prompt.split(/\s+/).slice(0,5).join(' ')).trim().slice(0,120)
       const background=Boolean(args.background)
+      const retryCause=String(args.retry_cause??args.retryCause??'').trim()
       const requestedScopes=Array.isArray(args.scope_paths)?args.scope_paths.map(String).filter(Boolean):[]
       const scopePaths=requestedScopes.length?requestedScopes:(ctx.scopePaths?.length?ctx.scopePaths:['.'])
       const policy=parentRegistry.gate.deriveChildPolicy(parentRegistry.list())
       const role=specialistRole(typeof args.role==='string' ? args.role : 'general')
       const roleAllowedTools=restrictSpecialistTools(role.name,policy.allowedTools)
       if(role.name !== 'general' && roleAllowedTools.length===0) throw new Error(`Specialist role '${role.name}' has no tools permitted by the parent policy.`)
-      const persistedProvider=persistedSubagentConfigForTask(provider,providerConfig)
+      const persistedProvider=await subagentProviderSnapshot(provider,providerConfig,{label:'a child task',taskRoot:manager.taskRoot()})
+      await preflightChildProviderSnapshot(persistedProvider,{label:'a child task',kind:'agent',declaredAdapter:String(provider.config?.provider||providerConfig?.provider||'')})
       let task:TaskRecord
 
       if(args.task_id){
@@ -61,7 +63,12 @@ export function taskTool(provider:Provider, store:SessionStore, parentRegistry:T
         task=await manager.resume(existing.id,effectivePrompt)
         task=await manager.update(task.id,{parentSessionId:existing.parentSessionId||ctx.sessionID,scopePaths:existing.scopePaths||scopePaths,permissionMode:existing.permissionMode||policy.mode,permissionRules:existing.permissionRules||policy.rules,allowedTools:existing.allowedTools||roleAllowedTools,background,provider:existing.provider||persistedProvider,specialistRole:existing.specialistRole||role.name,delegationDepth:existing.delegationDepth??((ctx.delegationDepth||0)+1),parentTaskId:existing.parentTaskId||ctx.taskId})
       } else {
-        task=await manager.createAgent(effectivePrompt,ctx.cwd,persistedProvider,scopePaths,ctx.sessionID,{permissionMode:policy.mode,permissionRules:policy.rules,allowedTools:roleAllowedTools,background,specialistRole:role.name,delegationDepth:(ctx.delegationDepth||0)+1,parentTaskId:ctx.taskId})
+        // 14I-O (item 859): refuse duplicate/no-progress launches before a
+        // child is spawned. A retry is only allowed when the caller states a
+        // materially changed cause.
+        const fingerprint=computeLaunchFingerprint({kind:'agent',prompt:effectivePrompt,scopePaths})
+        await assertChildLaunchPermitted(manager,{parentSessionId:ctx.sessionID,fingerprint,retryCause,label:'child task'})
+        task=await manager.createAgent(effectivePrompt,ctx.cwd,persistedProvider,scopePaths,ctx.sessionID,{permissionMode:policy.mode,permissionRules:policy.rules,allowedTools:roleAllowedTools,background,specialistRole:role.name,delegationDepth:(ctx.delegationDepth||0)+1,parentTaskId:ctx.taskId,launchFingerprint:fingerprint,launchRetryCause:retryCause||undefined})
       }
 
       await manager.spawnWorker(task.id)
